@@ -1,0 +1,42 @@
+// Copyright (c) EfficientMoE.
+// SPDX-License-Identifier: Apache-2.0
+
+// EfficientMoE Team
+
+#pragma once
+
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <list>
+#include <mutex>
+#include <thread>
+
+#include "archer_aio_utils.h"
+
+class ArcherAioThread {
+ public:
+  explicit ArcherAioThread(int thread_id);
+  ~ArcherAioThread();
+
+  void Start();
+  void Stop();
+
+  void Enqueue(AioCallback& callback);
+  void Wait();
+
+ private:
+  void Run();
+
+ private:
+  int thread_id_;
+  std::thread thread_;
+  std::atomic<bool> is_running_;
+
+  std::list<AioCallback> callbacks_;
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::condition_variable done_cv_;
+  std::atomic<int> pending_callbacks_;
+};

@@ -1,0 +1,19 @@
+# Mixtral-8x7B softmax-sum weighted averaged-expert draft.
+
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: softmax
+  args:
+    record_history: true
+
+run:
+  T: 3
+  questions_per_cat: 10
+  max_new_tokens: 512
+
+output:
+  label: mixtral_softmax

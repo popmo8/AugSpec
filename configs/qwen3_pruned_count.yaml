@@ -1,0 +1,22 @@
+# Qwen3-30B-A3B-Base count-weighted, then cumulative-frequency pruned (0.9).
+# Pruning is more impactful on Qwen3 than Mixtral — 128 experts × top-8 is
+# very sparse, so the long tail mostly contributes noise.
+
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: pruned_count
+  args:
+    cumulative_threshold: 0.9
+    record_history: true
+
+run:
+  T: 3
+  questions_per_cat: 10
+  max_new_tokens: 512
+
+output:
+  label: qwen3_pruned_count

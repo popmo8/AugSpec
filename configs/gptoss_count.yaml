@@ -1,0 +1,21 @@
+# GPT-OSS-20B count-weighted averaged-expert draft.
+
+model:
+  id: openai/gpt-oss-20b
+  dtype: bfloat16
+  device_map: auto
+  # reasoning_effort is consumed by GptOssAdapter.post_load(); set it here
+  # in `run` so it survives into the namespace passed to the adapter.
+draft:
+  name: count
+  args:
+    record_history: true
+
+run:
+  T: 3
+  questions_per_cat: 10
+  max_new_tokens: 512
+  reasoning_effort: low
+
+output:
+  label: gptoss_count

@@ -1,0 +1,21 @@
+# venv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.egg-info/
+build/
+dist/
+
+# experiment artefacts
+output/
+cache/
+data/spec_bench/
+moe_infinity/offload_output/
+moe_infinity/coverage-out/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store

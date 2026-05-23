@@ -1,0 +1,19 @@
+# Qwen3-30B-A3B-Base count-weighted averaged-expert draft.
+
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: count
+  args:
+    record_history: true
+
+run:
+  T: 3
+  questions_per_cat: 10
+  max_new_tokens: 512
+
+output:
+  label: qwen3_count

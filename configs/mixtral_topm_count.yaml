@@ -1,0 +1,27 @@
+# Mixtral-8x7B count-weighted averaged-expert draft, top-M kept per cycle.
+#
+# After each verify cycle, only the top-M experts by vote count contribute
+# to the merged expert; the rest are zeroed and the remainder renormalised.
+# M defaults to count_top_k (= 2 for Mixtral). Compared with `pruned_count`
+# this gives a fixed integer fetch budget instead of a cumulative-mass one.
+
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: topm_count
+  args:
+    # count_top_k auto-defaults to model.config.num_experts_per_tok (= 2)
+    # M auto-defaults to count_top_k (= 2). Override here to e.g. 4 to
+    # widen the merge subset.
+    record_history: true
+
+run:
+  T: 5
+  questions_per_cat: 10
+  max_new_tokens: 512
+
+output:
+  label: mixtral_topm_count

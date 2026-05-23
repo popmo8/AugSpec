@@ -1,0 +1,21 @@
+# Mixtral-8x7B random-single-expert mask draft (baseline).
+# Seed varies the random choice; sweep 42 / 123 / 456 via copies of this file.
+
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: random_mask
+  args:
+    # num_experts auto-defaults to the model's per-block expert count
+    seed: 42
+
+run:
+  T: 3
+  questions_per_cat: 10
+  max_new_tokens: 512
+
+output:
+  label: mixtral_random_42
