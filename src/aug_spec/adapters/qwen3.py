@@ -8,6 +8,12 @@ Expert MLP:    `gate_proj` / `up_proj` / `down_proj` (SwiGLU, same shape
 Native top-k:  `config.num_experts_per_tok` (= 8 for A3B)
 Note:          `block.norm_topk_prob` toggles the routing-weight renorm
                (True on A3B; HF default is False — match the block flag).
+
+Backend branching (in `_standard_routing`):
+  * HF backend → `Qwen3MoeSparseMoeBlock` → `_route_hf` (hand-rolled
+                 per-expert loop)
+  * Offload    → `Qwen3MoEBlock`          → `_route_offload`
+                 (uses block.lib.topk_softmax CUDA kernel + dispatch_local)
 """
 
 from __future__ import annotations
@@ -16,6 +22,11 @@ import torch
 import torch.nn.functional as F
 
 from .base import MoEAdapter
+
+
+def _is_offload_block(block) -> bool:
+    """Detect moe_infinity's offloaded Qwen3 MoE block by class name."""
+    return type(block).__name__ == "Qwen3MoEBlock"
 
 
 class Qwen3MoeAdapter(MoEAdapter):
@@ -37,23 +48,39 @@ class Qwen3MoeAdapter(MoEAdapter):
     def default_count_top_k(self, model):
         return getattr(model.config, "num_experts_per_tok", 8)
 
-    def build_weighted_avg(self, block, weights):
-        ref_g = block.experts[0].gate_proj.weight
-        ref_u = block.experts[0].up_proj.weight
-        ref_d = block.experts[0].down_proj.weight
+    def build_weighted_avg(self, block, weights, *, cpu_block=None):
+        """Build the merged dense expert. See base.py for contract.
+
+        On offload backend (`cpu_block` set): stream from CPU into a fp32
+        accumulator on GPU; the offloaded `block.experts[*]` weights are
+        shape-(1,) placeholders.
+        """
+        if cpu_block is not None:
+            source = cpu_block
+            device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            source = block
+            device = block.experts[0].gate_proj.weight.device
+
+        ref_g = source.experts[0].gate_proj.weight
+        ref_u = source.experts[0].up_proj.weight
+        ref_d = source.experts[0].down_proj.weight
         dtype = ref_g.dtype
 
-        g_sum = torch.zeros_like(ref_g, dtype=torch.float32)
-        u_sum = torch.zeros_like(ref_u, dtype=torch.float32)
-        d_sum = torch.zeros_like(ref_d, dtype=torch.float32)
+        g_sum = torch.zeros(ref_g.shape, dtype=torch.float32, device=device)
+        u_sum = torch.zeros(ref_u.shape, dtype=torch.float32, device=device)
+        d_sum = torch.zeros(ref_d.shape, dtype=torch.float32, device=device)
 
-        for e_idx, expert in enumerate(block.experts):
-            w = weights[e_idx]
+        for e_idx, w in enumerate(weights):
             if w == 0.0:
                 continue
-            g_sum.add_(expert.gate_proj.weight.float(), alpha=w)
-            u_sum.add_(expert.up_proj.weight.float(), alpha=w)
-            d_sum.add_(expert.down_proj.weight.float(), alpha=w)
+            g = source.experts[e_idx].gate_proj.weight.to(device, non_blocking=True).float()
+            u = source.experts[e_idx].up_proj.weight.to(device, non_blocking=True).float()
+            d = source.experts[e_idx].down_proj.weight.to(device, non_blocking=True).float()
+            g_sum.add_(g, alpha=w)
+            u_sum.add_(u, alpha=w)
+            d_sum.add_(d, alpha=w)
+            del g, u, d
 
         out = {
             "gate_proj": g_sum.to(dtype),
@@ -72,6 +99,18 @@ class Qwen3MoeAdapter(MoEAdapter):
 
     def _standard_routing(self, block, hs_flat, gate_logits,
                           batch_size, sequence_length, hidden_dim):
+        """Dispatch tokens through real experts. Branches on backend."""
+        if _is_offload_block(block):
+            return self._route_offload(
+                block, hs_flat, gate_logits,
+                batch_size, sequence_length, hidden_dim)
+        return self._route_hf(
+            block, hs_flat, gate_logits,
+            batch_size, sequence_length, hidden_dim)
+
+    def _route_hf(self, block, hs_flat, gate_logits,
+                  batch_size, sequence_length, hidden_dim):
+        """HF-backend routing: hand-rolled per-expert loop."""
         routing_weights = F.softmax(gate_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(
             routing_weights, block.top_k, dim=-1)
@@ -98,6 +137,22 @@ class Qwen3MoeAdapter(MoEAdapter):
             final.index_add_(0, top_x, current_hidden.to(hs_flat.dtype))
         return final.reshape(batch_size, sequence_length, hidden_dim)
 
+    def _route_offload(self, block, hs_flat, gate_logits,
+                       batch_size, sequence_length, hidden_dim):
+        """Offload-backend routing: mirror of Qwen3MoEBlock.forward.
+
+        Uses moe_infinity's `block.lib.topk_softmax` CUDA kernel to
+        build (router_mask, routing_weights_mask) in one go — this is
+        what their validated Qwen3 path uses. Then delegate to
+        `block.expert_executor.dispatch_local`.
+        """
+        router_mask, routing_weights_mask = block.lib.topk_softmax(gate_logits)
+        block.expert_executor.dispatch_local(
+            block.layer_id, hs_flat, router_mask, routing_weights_mask)
+        final = block.expert_executor.wait_dispatch_local()
+        return final.view(
+            batch_size, sequence_length, hidden_dim).to(hs_flat.dtype)
+
     def make_averaged_forward(self, controller, layer_idx, block):
         adapter = self
 
@@ -109,7 +164,11 @@ class Qwen3MoeAdapter(MoEAdapter):
             if controller.in_draft_phase:
                 avg = controller.draft_cache.get(layer_idx)
                 if avg is None:
-                    avg = controller.draft.lazy_build(layer_idx, block, adapter)
+                    cpu_block = (
+                        controller.cpu_blocks.get(layer_idx)
+                        if controller.cpu_blocks else None)
+                    avg = controller.draft.lazy_build(
+                        layer_idx, block, adapter, cpu_block=cpu_block)
                     if avg is not None:
                         controller.draft_cache[layer_idx] = avg
                 if avg is not None:

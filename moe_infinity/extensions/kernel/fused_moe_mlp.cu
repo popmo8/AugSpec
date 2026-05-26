@@ -139,6 +139,11 @@ void fused_moe_ffn_into(torch::Tensor& hidden,     // [M, H]
   // Dispatch: use large-K tile when I >= 3072.
   // K-tile=64 halves k-loop iterations for wide dims (K=4096: 128→64 iters).
   const bool use_large_k = (I >= 3072);
+  // 2026-05-25 debug result: forcing this to `false` (route Mixtral via
+  // Small-K like Qwen3) did NOT fix Mixtral logits — argmax changed from
+  // 'o' to 'that' (different garbage) but top-10 overlap stayed ≤1/10
+  // vs HF reference. So the GEMM K-tile choice is NOT the root cause of
+  // the Mixtral mismatch. Reverted. See phase0_1.md "Mixtral debug" §.
 
   if (use_large_k) {
     // ------------------------------------------------------------------

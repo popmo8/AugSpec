@@ -41,7 +41,20 @@ class MoEAdapter:
 
     def build_weighted_avg(
         self, block: nn.Module, weights: List[float],
+        *, cpu_block: Any = None,
     ) -> Dict[str, torch.Tensor]:
+        """Build `sum_e w_e * expert[e]` for one MoE layer.
+
+        On HF backend: `cpu_block=None`; read directly from
+        `block.experts[e].w*.weight` (real tensors on GPU).
+
+        On offload backend: `cpu_block` is the *corresponding* MoE block
+        on a CPU-resident copy of the model. Stream
+        `cpu_block.experts[e].w*.weight` CPU→GPU per non-zero-weight
+        expert, accumulate into an fp32 buffer on the offloaded block's
+        target device. The returned tensors live on GPU (where draft
+        forward consumes them).
+        """
         raise NotImplementedError
 
     def make_averaged_forward(self, controller, layer_idx: int, block: nn.Module):

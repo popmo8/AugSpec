@@ -386,6 +386,13 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
     expert_node->SetTensorsFromBlob(device);
     // module_->SetTensorsFromIds(expert_node->node->tensor_ids);
 
+    // 2026-05-26 fix: ensure async H2D copy on `stream` completes BEFORE
+    // GPUExecFunc reads param_[] in its own kernel stream. Without this
+    // synchronize, large H2D copies (Mixtral expert = 350 MB) race with
+    // the GEMM and produce garbage output. Qwen3 (expert = 9 MB) copy
+    // finishes faster than the queue handoff so the race never manifests.
+    cudaStreamSynchronize(stream);
+
     // std::cerr << "ExpertDispatcher::GPUFetchFunc: move to device gpu_id "
     //           << gpu_id << " layer_idx " << layer_idx << " expert_idx "
     //           << expert_idx << " node "

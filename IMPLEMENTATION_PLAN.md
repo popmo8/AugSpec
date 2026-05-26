@@ -701,12 +701,51 @@ Wire into both `aug_spec bench` (whole-question scope) and
 ### 10.2 VRAM accounting fields in `summary.json`
 
 The VRAM-matched comparison in PROGRESS.md needs these to be reported.
-Compute at end of run and emit alongside existing `peak_vram_gb`:
+Compute at end of run and emit alongside `peak_vram_gb`.
+
+> **⚠️ CRITICAL — measure VRAM with NVML, NOT `torch.cuda.max_memory_allocated`.**
+>
+> moe_infinity's archer engine uses its own C++ memory pool
+> (`kDeviceMemoryPool`, see [moe_infinity/core/memory/](moe_infinity/core/memory/))
+> via `cudaMalloc` directly — **not** the PyTorch caching allocator.
+> Consequence: `torch.cuda.max_memory_allocated()` only sees torch-side
+> tensors (non-expert weights, KV cache, activations) and **silently
+> reports zero/near-zero for the entire archer expert cache**.
+>
+> Confirmed in Phase 0: a full Mixtral-8x7B forward through the
+> offloaded model reported `peak_vram_gb=0.03` from torch — clearly
+> bogus. The same forward used ~15 GB of VRAM as seen by `nvidia-smi`.
+>
+> **Use `pynvml.nvmlDeviceGetMemoryInfo(handle).used` instead.** This
+> reflects the kernel-driver view of device memory and includes both
+> torch-allocated and archer-allocated bytes.
+>
+> The existing `runtime/loader.py::get_peak_vram_gb()` is broken in
+> offload mode for the same reason — Phase 5 should replace its
+> internals with an NVML-backed sampler (kept as a foreground
+> measurement at end-of-run; the background PCIe profiler in §10.1
+> can sample memory.used in the same thread).
+
+Sketch:
 
 ```python
-def _compute_vram_breakdown(controller, moe, gpu_total_gb=80.0):
-    """Returns dict with the 3 fields the comparison protocol needs."""
+import pynvml
+
+def _nvml_used_gb(device_index: int = 0) -> float:
+    pynvml.nvmlInit()
+    h = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+    info = pynvml.nvmlDeviceGetMemoryInfo(h)
+    return info.used / (1024**3)
+
+def _compute_vram_breakdown(controller, moe, device_index=0):
+    """Returns the 3 fields the comparison protocol needs.
+
+    `peak_used_gb` is captured at end-of-run via NVML to reflect the
+    actual driver-view of memory (including moe_infinity's archer
+    cache, which torch's allocator does not see).
+    """
     # Draft side: sum of bytes in controller.draft_cache across layers.
+    # Safe to use torch tensor sizes here — these ARE our own torch tensors.
     draft_bytes = 0
     for layer_idx, payload in controller.draft_cache.items():
         if isinstance(payload, dict):           # "averaged" cache_kind
@@ -714,34 +753,47 @@ def _compute_vram_breakdown(controller, moe, gpu_total_gb=80.0):
                                for t in payload.values())
         elif torch.is_tensor(payload):          # "masked" cache_kind
             draft_bytes += payload.numel() * payload.element_size()
-    # Target side: archer cache budget.
-    target_cache_bytes = (
-        moe.engine.config.device_memory_ratio * gpu_total_gb * 1024**3
-        if moe is not None else 0)
+    # Target side: declared archer cache budget (from device_memory_ratio).
+    target_cache_bytes = 0
+    if moe is not None:
+        gpu_total = torch.cuda.get_device_properties(device_index).total_memory
+        target_cache_bytes = int(
+            moe.engine.config.device_memory_ratio * gpu_total)
     return {
         "draft_vram_gb": draft_bytes / 1024**3,
-        "target_cache_vram_gb": target_cache_bytes / 1024**3,
-        "expert_total_vram_gb": (draft_bytes + target_cache_bytes) / 1024**3,
+        "target_cache_vram_gb_budget": target_cache_bytes / 1024**3,
+        "expert_total_vram_gb_budget": (draft_bytes + target_cache_bytes) / 1024**3,
+        "peak_used_gb_nvml": _nvml_used_gb(device_index),
     }
 ```
+
+`peak_used_gb_nvml` is **the** authoritative number for the
+VRAM-matched comparison. The `_budget` fields are the declared
+allocations (informative, for sanity-check against `peak_used_gb_nvml`).
 
 Add to `summary.json` (in `cli.py::run_experiment`):
 
 ```json
 {
   ...
-  "peak_vram_gb": 28.3,
   "vram_breakdown": {
     "draft_vram_gb": 11.25,
-    "target_cache_vram_gb": 11.25,
-    "expert_total_vram_gb": 22.5
+    "target_cache_vram_gb_budget": 11.25,
+    "expert_total_vram_gb_budget": 22.5,
+    "peak_used_gb_nvml": 27.6
   },
   ...
 }
 ```
 
-For HF backend: `target_cache_vram_gb = 0`, and `expert_total_vram_gb`
-equals whatever the GPU-resident model occupies for experts.
+The existing top-level `peak_vram_gb` (from `get_peak_vram_gb()` which
+wraps `torch.cuda.max_memory_allocated`) should be **kept** but
+**deprecated for offload mode** — it's still useful on HF backend
+where torch sees everything. Phase 5 should switch this to NVML-backed
+internally so the field stays meaningful on both backends.
+
+For HF backend: `target_cache_vram_gb_budget = 0`, and
+`peak_used_gb_nvml` matches what nvidia-smi reports during the run.
 
 ### 10.3 Acceptance
 - `bench` on HF backend reports ~0 GB transferred (everything resident).

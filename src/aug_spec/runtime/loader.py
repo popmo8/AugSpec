@@ -5,10 +5,13 @@ speculative decoding. The compat shims here patch older trust_remote_code
 models (e.g. DeepSeek-MoE) that call DynamicCache APIs removed in
 transformers >= 4.44.
 
-This module is intentionally backend-neutral: it does plain HF loading.
-When the offload backend lands, a sibling `load_offload(...)` will live
-beside this and use `moe_infinity.MoE(...)`; adapter / draft / controller
-code does not need to know which loader was used.
+`load_offload` is the sibling for the offload backend: it wraps
+`moe_infinity.MoE(...)` and ALSO loads a separate CPU-resident copy of
+the model that the draft path uses as a weight source for
+`adapter.build_weighted_avg`. Two-model load is necessary because
+moe_infinity replaces every offloaded `param.data` with a shape-(1,)
+zero placeholder (see model_offload.py:213-221), so the experts cannot
+be read directly from `moe.model`.
 """
 
 from __future__ import annotations
@@ -140,6 +143,138 @@ def load_model(
     if trust_remote_code:
         _fix_prepare_inputs_for_generation(model)
     return model, tokenizer
+
+
+_ROTARY_DEVICE_PATCH_INSTALLED: bool = False
+
+
+def _install_rotary_device_patches() -> None:
+    """Patch each family's RotaryEmbedding.forward to align position_ids
+    with hidden_states' device before the inner matmul.
+
+    Why: in offload mode, the spec-decoding assist path sometimes passes
+    `position_ids` on a different device than `hidden_states` (typically
+    CPU vs cuda:0). The stock rotary forward does `inv_freq.to(x.device)`
+    but leaves `position_ids` alone, so the `@ position_ids` matmul
+    crashes with a CPU/CUDA mismatch. moe_infinity already patches the
+    LATER `apply_rotary_pos_emb` for the same family of bugs but does
+    not touch the rotary buffer pre-stage — we add this small fix.
+
+    Patched classes (only those whose transformers module imports cleanly;
+    missing ones are silently skipped):
+      * transformers.models.mixtral.modeling_mixtral.MixtralRotaryEmbedding
+      * transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRotaryEmbedding
+
+    Idempotent (safe to call multiple times).
+    """
+    global _ROTARY_DEVICE_PATCH_INSTALLED
+    if _ROTARY_DEVICE_PATCH_INSTALLED:
+        return
+
+    targets = [
+        ("transformers.models.mixtral.modeling_mixtral",
+         "MixtralRotaryEmbedding"),
+        ("transformers.models.qwen3_moe.modeling_qwen3_moe",
+         "Qwen3MoeRotaryEmbedding"),
+    ]
+    import importlib
+
+    def _make_patched(orig_forward):
+        def patched_forward(self, x, position_ids):
+            if position_ids.device != x.device:
+                position_ids = position_ids.to(x.device)
+            return orig_forward(self, x, position_ids)
+        return patched_forward
+
+    for module_name, class_name in targets:
+        try:
+            mod = importlib.import_module(module_name)
+            cls = getattr(mod, class_name)
+            cls.forward = _make_patched(cls.forward)
+        except (ImportError, AttributeError):
+            continue
+
+    _ROTARY_DEVICE_PATCH_INSTALLED = True
+
+
+# Backward-compat alias — old name used in some call sites.
+_install_mixtral_rotary_device_patch = _install_rotary_device_patches
+
+
+def load_offload(
+    model_id: str,
+    offload_path,
+    dtype: torch.dtype = torch.bfloat16,
+    device_memory_ratio: float = 0.15,
+    cache_policy: str = "ondemand",
+    trust_remote_code: bool = True,
+) -> Tuple[nn.Module, Any, Any, nn.Module]:
+    """Load the offloaded MoE model + a CPU-resident weight source.
+
+    Returns
+    -------
+    hf_model    : `moe.model` — the offloaded PreTrainedModel. This is what
+                  the controller / adapter / spec-bench see. Target verify
+                  runs through this.
+    tokenizer   : standard HF tokenizer.
+    moe         : the `moe_infinity.MoE` wrapper. Caller MUST invoke
+                  `moe._configure_hook(input_ids)` once per generation
+                  (or per question) so the archer tracer is set up.
+    cpu_source  : a plain HF model loaded with `device_map="cpu"` and
+                  identical weights. The draft-side merge reads
+                  `cpu_source.model.layers[i].block_sparse_moe.experts[e].w*.weight`
+                  one-at-a-time, streams CPU→GPU, accumulates into a
+                  fp32 buffer, never runs forward. Lives in host RAM
+                  (≈ 26 GB for Mixtral-8x7B bf16).
+
+    Load order matters: cpu_source is loaded FIRST, before
+    `moe_infinity.MoE(...)` activates its empty-init hooks. This guarantees
+    cpu_source's weights are real (not zero placeholders).
+    """
+    from pathlib import Path
+
+    from moe_infinity import MoE
+
+    # Patch every supported family's rotary to handle CPU/CUDA
+    # position_ids mismatch that surfaces in spec-decoding's assistant
+    # path under offload (see _install_rotary_device_patches docstring).
+    _install_rotary_device_patches()
+
+    # 1) CPU-resident weight source (before any moe_infinity activity).
+    cpu_source = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        device_map="cpu",
+        trust_remote_code=trust_remote_code,
+    )
+    cpu_source.eval()
+    for p in cpu_source.parameters():
+        p.requires_grad_(False)
+
+    # 2) The offloaded model (target verify path).
+    Path(offload_path).mkdir(parents=True, exist_ok=True)
+    moe = MoE(model_id, {
+        "offload_path": str(offload_path),
+        "device_memory_ratio": device_memory_ratio,
+    })
+
+    # cache_policy mapping: moe_infinity's ExpertCache.set_cache_policy
+    # accepts "lru" / "priority" / etc.; map our YAML names onto theirs.
+    # "ondemand" → "lru" (vanilla LRU, no predictive pre-pinning).
+    # "caching"  → "priority" (tracer-driven prefetcher = MoE-Caching baseline).
+    if hasattr(moe.engine, "expert_cache") and hasattr(
+            moe.engine.expert_cache, "set_cache_policy"):
+        moe.engine.expert_cache.set_cache_policy(
+            "priority" if cache_policy == "caching" else "lru")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, trust_remote_code=trust_remote_code)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    hf_model = moe.model
+    hf_model.eval()
+    return hf_model, tokenizer, moe, cpu_source
 
 
 def get_model_device(model: nn.Module) -> torch.device:

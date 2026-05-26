@@ -1,0 +1,38 @@
+# Phase 3 smoke test for the offload backend on Qwen3-30B-A3B.
+#
+# Pivot from Mixtral: moe_infinity's Mixtral path produces wrong logits
+# (top-10 overlap=0 vs HF reference, see debug_offload_logits results).
+# Their Qwen3 path is validated by their own demo (sensible output).
+# So we run Phase 3 smoke against Qwen3 to verify aug_spec's offload
+# plumbing end-to-end.
+#
+# Model choice: Qwen3-30B-A3B (the instruct variant). We leverage the
+# offload cache built by tests/scripts/debug_moe_infinity_demo.sh at
+# /work/morrisliu07/aug_spec/cache/offload/qwen3_demo (no 5-min cache
+# rebuild needed). PROGRESS.md uses Qwen3-30B-A3B-Base for production;
+# that path will build its own offload cache on first run.
+
+model:
+  id: Qwen/Qwen3-30B-A3B
+  dtype: bfloat16
+  backend: offload
+  offload:
+    path: /work/morrisliu07/aug_spec/cache/offload/qwen3_demo
+    device_memory_ratio: 0.15
+    cache_policy: ondemand
+
+draft:
+  name: count                       # match HF _smoke.yaml style
+  args:
+    record_history: false
+
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 32
+  warmup: false
+  emit_tokens_csv: false
+
+output:
+  dir: output/_smoke_offload_qwen3
+  label: _smoke_offload_qwen3

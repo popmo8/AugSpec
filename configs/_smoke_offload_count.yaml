@@ -1,0 +1,29 @@
+# A/B test: same as _smoke_offload.yaml but uses `count` draft (matches
+# HF _smoke.yaml). Lets us isolate whether the low AccRate on the
+# offload smoke is a backend bug (would persist here) or a `topm_count`
+# vs smoke-size interaction (would not — AccRate should match HF ~0.64).
+
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  backend: offload
+  offload:
+    path: /work/morrisliu07/aug_spec/cache/offload/mixtral
+    device_memory_ratio: 0.15
+    cache_policy: ondemand
+
+draft:
+  name: count                      # ← matches configs/_smoke.yaml
+  args:
+    record_history: false
+
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 32
+  warmup: false
+  emit_tokens_csv: false
+
+output:
+  dir: output/_smoke_offload_count
+  label: _smoke_offload_count

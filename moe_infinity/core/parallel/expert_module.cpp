@@ -8,8 +8,17 @@
 #include "utils/cuda_utils.h"
 #include "utils/logger.h"
 #include "kernel/fused_moe_mlp.h"
+#include <atomic>
+#include <iostream>
+#include <sstream>
 
-static const int64_t kMaxTokens = 128;
+// Bumped from 128 → 2048 for aug_spec: spec-bench prompts routinely
+// exceed 128 tokens at prefill (Mixtral chat template alone adds ~30
+// tokens of overhead). Workspace cost: 3 × kMaxTokens × max(hidden,
+// intermediate) × dtype_size bytes per cached expert ≈ 184 MB/expert
+// for Mixtral — a few GB total at the default device_memory_ratio=0.15.
+// Acceptable on H100-80GB.
+static const int64_t kMaxTokens = 2048;
 
 /*
 SwitchTransformersDenseActDense::SwitchTransformersDenseActDense(int dtype) {
@@ -379,9 +388,24 @@ void MoEMLP::SetTensorsFromIds(const std::vector<std::uint32_t>& tensor_ids) {
     for (size_t i = 0; i < tensor_ptrs.size(); i++) {
       auto [ptr, tensor_size] = tensor_ptrs[i];
       auto tensor_shape = tensor_shapes[i];
-      void* param_ptr = allocator->allocate(tensor_size);
-      param_[i].set_data(torch::from_blob(param_ptr, tensor_shape,
-                                          DoNothingDeleter<void>{}, options));
+      // 2026-05-26 BUG FIX: the original code did:
+      //   void* param_ptr = allocator->allocate(tensor_size);
+      //   param_[i].set_data(torch::from_blob(param_ptr, ...,
+      //                                       DoNothingDeleter, options));
+      // allocator->allocate returns a c10::DataPtr (RAII smart pointer).
+      // Implicit conversion to void* drops the DataPtr immediately, so
+      // the memory is RETURNED to the caching allocator's free list at
+      // end of statement. param_[i] then points to "freed" memory.
+      // Subsequent torch allocations of the same size bucket recycle that
+      // memory → param_[i] gets silently corrupted between dispatches.
+      // For Mixtral (param ~117 MB, intermediate buffers 56 MB) the
+      // bucket overlap is high → garbage output starting at layer 1.
+      // For Qwen3 (param ~4 MB) the sizes rarely overlap → bug masked.
+      // Fix: allocate via torch::empty so the resulting tensor owns its
+      // storage; set_data preserves that storage reference.
+      param_[i].set_data(torch::empty(tensor_shape, options));
+      void* param_ptr = param_[i].data_ptr();
+      (void)param_ptr;  // silence unused warning
       DLOG_DEBUG("MoEMLP::SetTensorsFromBlob: tensor_ids", tensor_ids[i],
                  "tensor_shape", tensor_shape, "tensor_size", tensor_size,
                  "param_", param_[i].sizes().vec(), "device",
@@ -404,9 +428,11 @@ void MoEMLP::SetTensorsFromIds(const std::vector<std::uint32_t>& tensor_ids) {
     for (size_t i = 0; i < data_shapes.size(); i++) {
       auto data_shape = data_shapes[i];
       auto data_size = torch_shape_size(data_shape, dtype_);
-      void* buffer_ptr = allocator->allocate(data_size);
-      buffer_[i].set_data(torch::from_blob(buffer_ptr, data_shape,
-                                           DoNothingDeleter<void>{}, options));
+      // Same RAII bug as param_ above — torch::from_blob with
+      // DoNothingDeleter on a raw void* from allocator->allocate()
+      // does not retain the c10::DataPtr lifetime. Fix by allocating
+      // a tensor that owns its own storage.
+      buffer_[i].set_data(torch::empty(data_shape, options));
       DLOG_TRACE("MoEMLP::SetTensorsFromBlob: buffer_ tensor", i, "data_shape",
                  data_shape, "data_size", data_size, "device",
                  buffer_[i].device().str());
@@ -492,6 +518,55 @@ void MoEMLP::ForwardHelper(cudaStream_t stream) {
     auto& gate_out = buffer_[2];
     auto& fused_out = buffer_[3];  // silu(gate) * up result
 
+    // ---- DEBUG (2026-05-26): dump first 8 ForwardHelper calls to stderr ---
+    // Tells us:
+    //   (a) Are param_[0/1/2] the correct expert weights (shape/device/sum)?
+    //   (b) Is input shape sensible?
+    //   (c) Is output sane after the GEMM?
+    // Combined with the cudaStreamSynchronize fix in expert_dispatcher.cpp,
+    // we can rule out: param-order bug, race condition, kernel correctness.
+    static std::atomic<int> _dbg_count{0};
+    int _dbg_n = _dbg_count.fetch_add(1);
+    bool _dbg = (_dbg_n < 8);
+    auto _shape_str = [](const torch::Tensor& t) {
+      std::stringstream ss;
+      ss << "[";
+      for (size_t i = 0; i < t.sizes().size(); ++i) {
+        ss << t.size(i) << (i + 1 < t.sizes().size() ? "," : "");
+      }
+      ss << "]";
+      return ss.str();
+    };
+    auto _abs_sum = [stream](const torch::Tensor& t) {
+      // Synchronize the kernel stream before reading so we see post-fetch
+      // values, not pre-fetch garbage.
+      cudaStreamSynchronize(stream);
+      return t.abs().sum().to(torch::kFloat32).item<float>();
+    };
+    if (_dbg) {
+      std::cerr << "[DBG-MoEMLP " << _dbg_n << "] expert_type=" << expert_type_
+                << "\n";
+      std::cerr << "  param[0] " << _shape_str(param_[0])
+                << " dev=" << param_[0].device().str()
+                << " dtype=" << param_[0].dtype()
+                << " abs_sum=" << _abs_sum(param_[0]) << "\n";
+      std::cerr << "  param[1] " << _shape_str(param_[1])
+                << " dev=" << param_[1].device().str()
+                << " abs_sum=" << _abs_sum(param_[1]) << "\n";
+      std::cerr << "  param[2] " << _shape_str(param_[2])
+                << " dev=" << param_[2].device().str()
+                << " abs_sum=" << _abs_sum(param_[2]) << "\n";
+      std::cerr << "  gate_proj=param[0]  up_proj=param["
+                << (expert_type_ == DEEPSEEK_MOE_DENSE_ACT_DENSE ? 1 : 2)
+                << "]  down_proj=param["
+                << (expert_type_ == DEEPSEEK_MOE_DENSE_ACT_DENSE ? 2 : 1)
+                << "]\n";
+      std::cerr << "  input " << _shape_str(input)
+                << " dev=" << input.device().str()
+                << " abs_sum=" << _abs_sum(input) << "\n";
+      std::cerr.flush();
+    }
+
     DLOG_TRACE("MoEMLP::forward: gate_proj", gate_proj.sizes().vec(), "up_proj",
                up_proj.sizes().vec(), "down_proj", down_proj.sizes().vec(),
                "input", input.sizes().vec(), "gate_out", gate_out.sizes().vec(),
@@ -502,6 +577,12 @@ void MoEMLP::ForwardHelper(cudaStream_t stream) {
     // Replaces: matmul(gate), matmul(up), silu, mul, matmul(down).
     fused_moe_ffn_into(input, gate_proj, up_proj, down_proj, gate_out,
                        fused_out, output, stream);
+
+    if (_dbg) {
+      std::cerr << "  output(after GEMM) " << _shape_str(output)
+                << " abs_sum=" << _abs_sum(output) << "\n";
+      std::cerr.flush();
+    }
     return;
   }
   DLOG_FATAL("MoEMLP::forward: expert_type not supported", expert_type_);

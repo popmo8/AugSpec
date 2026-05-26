@@ -16,6 +16,7 @@ class UniformDraft(DraftStrategy):
 
     cache_kind = "averaged"
 
-    def lazy_build(self, layer_idx, block, adapter):
+    def lazy_build(self, layer_idx, block, adapter, *, cpu_block=None):
         n = adapter.num_experts(block)
-        return adapter.build_weighted_avg(block, [1.0 / n] * n)
+        return adapter.build_weighted_avg(
+            block, [1.0 / n] * n, cpu_block=cpu_block)

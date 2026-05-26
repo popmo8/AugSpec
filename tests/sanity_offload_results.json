@@ -1,0 +1,82 @@
+{
+  "ckpt": "mistralai/Mixtral-8x7B-v0.1",
+  "offload_dir": "/work/morrisliu07/aug_spec/cache/offload/mixtral",
+  "device_memory_ratio": 0.15,
+  "started_at": "2026-05-24T00:28:40",
+  "q1": {
+    "hf_model_type": "MixtralForCausalLM",
+    "has_model_attr": true,
+    "first_blocks": [
+      {
+        "layer_idx": 0,
+        "block_type": "SyncMixtralSparseMoeBlock",
+        "has_gate": true,
+        "has_experts": true,
+        "has_expert_executor": true,
+        "has_layer_id": true,
+        "num_experts": 8
+      },
+      {
+        "layer_idx": 1,
+        "block_type": "SyncMixtralSparseMoeBlock",
+        "has_gate": true,
+        "has_experts": true,
+        "has_expert_executor": true,
+        "has_layer_id": true,
+        "num_experts": 8
+      },
+      {
+        "layer_idx": 2,
+        "block_type": "SyncMixtralSparseMoeBlock",
+        "has_gate": true,
+        "has_experts": true,
+        "has_expert_executor": true,
+        "has_layer_id": true,
+        "num_experts": 8
+      }
+    ],
+    "has_model_layers": true,
+    "num_layers": 32,
+    "verdict": "PASS"
+  },
+  "q2": {
+    "cpu_source_type": "MixtralForCausalLM",
+    "host_ram_gb": 88.02592086791992,
+    "block_type": "MixtralSparseMoeBlock",
+    "num_experts": 8,
+    "expert0_w1_shape": [
+      14336,
+      4096
+    ],
+    "expert0_w1_dtype": "torch.bfloat16",
+    "expert0_w1_device": "cpu",
+    "expert0_w1_abs_sum": 507904.0,
+    "expert0_w1_isnan": false,
+    "verdict": "PASS"
+  },
+  "q3": {
+    "expert0_w1_shape": [
+      1
+    ],
+    "expert0_w1_dtype": "torch.bfloat16",
+    "expert0_w1_device": "cpu",
+    "expert0_w1_abs_sum": 0.0,
+    "is_placeholder": true,
+    "verdict": "PASS (placeholder as expected \u2014 direct reads useless for merge)"
+  },
+  "q4": {
+    "device_count": 1,
+    "device_memory_ratio": 0.15,
+    "gpu_0": "NVIDIA H200 139.7 GB",
+    "forward_wall_s": 1.662,
+    "output_shape": [
+      1,
+      8,
+      32000
+    ],
+    "peak_vram_gb": 0.03,
+    "verdict": "PASS \u2014 peak 0.0 GB / 80 GB H100"
+  },
+  "all_pass": true,
+  "finished_at": "2026-05-24T00:30:13"
+}

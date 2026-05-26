@@ -26,14 +26,28 @@ import torch
 
 
 class DraftStrategy:
-    """Abstract draft strategy. Override only what you need."""
+    """Abstract draft strategy. Override only what you need.
+
+    Notes on `cpu_blocks` (passed through `prepopulate`, `refresh`,
+    `lazy_build`):
+
+      * HF backend: `cpu_blocks` is None — `adapter.build_weighted_avg`
+        reads expert weights from `block.experts[e].w*.weight` directly.
+      * Offload backend: `cpu_blocks: Dict[layer_idx, nn.Module]` maps
+        each MoE-layer index to the *corresponding* block on a
+        CPU-resident copy of the model. Drafts forward `cpu_blocks[li]`
+        as `cpu_block=` into `adapter.build_weighted_avg`, which then
+        streams from CPU instead of reading the (placeholder) offloaded
+        weights. See IMPLEMENTATION_PLAN.md §6.
+    """
 
     cache_kind: str = "averaged"  # or "masked"
 
     def reset(self) -> None:
         pass
 
-    def prepopulate(self, adapter, blocks, draft_cache: Dict[int, Any]) -> None:
+    def prepopulate(self, adapter, blocks, draft_cache: Dict[int, Any],
+                    *, cpu_blocks: Optional[Dict[int, Any]] = None) -> None:
         pass
 
     def capture(self, layer_idx: int, router_logits: torch.Tensor) -> None:
@@ -43,10 +57,12 @@ class DraftStrategy:
         """GPT-OSS path passes pre-computed softmax to avoid recomputing it."""
         pass
 
-    def refresh(self, adapter, blocks, draft_cache: Dict[int, Any]) -> None:
+    def refresh(self, adapter, blocks, draft_cache: Dict[int, Any],
+                *, cpu_blocks: Optional[Dict[int, Any]] = None) -> None:
         pass
 
-    def lazy_build(self, layer_idx: int, block, adapter):
+    def lazy_build(self, layer_idx: int, block, adapter,
+                   *, cpu_block: Optional[Any] = None):
         return None
 
 
@@ -160,7 +176,8 @@ class ScoreBasedAvgDraft(DraftStrategy):
         score_vec = self._score_vector_from_softmax(softmax)
         self.target_score[layer_idx] = score_vec.float().detach().cpu()
 
-    def refresh(self, adapter, blocks, draft_cache):
+    def refresh(self, adapter, blocks, draft_cache,
+                *, cpu_blocks: Optional[Dict[int, Any]] = None):
         if not self.target_score:
             return
         layer_to_block = dict(blocks)
@@ -179,7 +196,9 @@ class ScoreBasedAvgDraft(DraftStrategy):
             else:
                 weights = (score_vec.float() / total).tolist()
             weights = self._postprocess_weights(weights)
-            draft_cache[li] = adapter.build_weighted_avg(block, weights)
+            cpu_block = cpu_blocks.get(li) if cpu_blocks else None
+            draft_cache[li] = adapter.build_weighted_avg(
+                block, weights, cpu_block=cpu_block)
 
     def _postprocess_weights(self, weights: List[float]) -> List[float]:
         """Hook called once per layer per cycle, right before

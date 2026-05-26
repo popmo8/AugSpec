@@ -34,7 +34,9 @@ class Controller:
 
     def __init__(self, model: nn.Module,
                  adapter: MoEAdapter,
-                 draft: DraftStrategy):
+                 draft: DraftStrategy,
+                 *,
+                 cpu_source: nn.Module = None):
         self.model = model
         self.adapter = adapter
         self.draft = draft
@@ -44,6 +46,16 @@ class Controller:
             raise RuntimeError(
                 f"No MoE layers found for adapter '{adapter.name}'.")
         self.num_moe_layers = len(self.blocks)
+
+        # cpu_source = a parallel HF model on CPU whose expert weights
+        # are the source for adapter.build_weighted_avg in offload mode.
+        # None on the HF backend (then build_weighted_avg reads from
+        # `model` directly).
+        self.cpu_source: nn.Module = cpu_source
+        self.cpu_blocks: Dict[int, nn.Module] = {}
+        if cpu_source is not None:
+            for layer_idx, cpu_block in adapter.iter_moe(cpu_source):
+                self.cpu_blocks[layer_idx] = cpu_block
 
         self.draft_cache: Dict[int, Any] = {}
         self.update_count: int = 0
@@ -86,7 +98,9 @@ class Controller:
     def update_masks(self) -> None:
         """`on_cycle` hook: refresh the draft cache from the latest
         target-side capture (whatever the draft stores)."""
-        self.draft.refresh(self.adapter, self.blocks, self.draft_cache)
+        self.draft.refresh(
+            self.adapter, self.blocks, self.draft_cache,
+            cpu_blocks=self.cpu_blocks or None)
         self.update_count += 1
 
     def reset(self) -> None:
@@ -97,4 +111,6 @@ class Controller:
         self.draft.reset()
         self.draft_cache.clear()
         self.update_count = 0
-        self.draft.prepopulate(self.adapter, self.blocks, self.draft_cache)
+        self.draft.prepopulate(
+            self.adapter, self.blocks, self.draft_cache,
+            cpu_blocks=self.cpu_blocks or None)

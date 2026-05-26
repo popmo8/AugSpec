@@ -381,6 +381,7 @@ def run_specbench(
     lm_topk: int = LM_TOPK_DEFAULT,
     on_cycle: Optional[Callable[[QuestionResult, CycleStats], None]] = None,
     on_question_start: Optional[Callable[[Dict[str, Any]], None]] = None,
+    moe_wrapper: Optional[Any] = None,
 ) -> SpecBenchResult:
     """Run SpecBench eval with a fixed-T speculative schedule.
 
@@ -438,7 +439,15 @@ def run_specbench(
             tokenizer, [], "Briefly introduce yourself.")
         warm_in = tokenizer(warm_prompt, return_tensors="pt").to(
             get_model_device(target_model))
-        with torch.inference_mode():
+        # Offload backend: archer's expert tracer needs a fresh per-sequence
+        # entry before each generate(). Without this, the tracer state goes
+        # stale and the cache-miss / fetch path may misbehave.
+        if moe_wrapper is not None:
+            moe_wrapper._configure_hook(warm_in["input_ids"])
+        # NOTE: no_grad, NOT inference_mode — moe_infinity's C++ ExpertDispatcher
+        # does in-place index_add_ on output tensors, which crashes under
+        # inference_mode (confirmed in Phase 0 sanity_offload.py).
+        with torch.no_grad():
             target_model.generate(
                 **warm_in, max_new_tokens=8, do_sample=False,
                 assistant_model=draft_model,
@@ -479,13 +488,21 @@ def run_specbench(
                 if on_cycle is not None:
                     on_cycle(_qres, cs)
 
+            # Configure archer per-sequence state before each generate().
+            if moe_wrapper is not None:
+                moe_wrapper._configure_hook(inputs["input_ids"])
+
             t0 = time.perf_counter()
             try:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 with _locked_assist_patch(
                     num_speculative, lm_topk, _on_verify,
-                ):
+                ), torch.no_grad():
+                    # Wrapping target.generate in no_grad — the assist
+                    # API doesn't disable grads itself, and moe_infinity's
+                    # in-place ExpertDispatcher::OutputFunc trips on
+                    # inference-mode tensors. no_grad sidesteps both.
                     out = target_model.generate(
                         **inputs,
                         max_new_tokens=max_new_tokens,
@@ -535,8 +552,10 @@ def run_specbench(
                 if per_q_f is not None:
                     per_q_f.flush()
             except Exception as e:
+                import traceback as _tb
                 print(f"  [WARN] qid={qid} failed: "
                       f"{type(e).__name__}: {e}")
+                _tb.print_exc()
 
             if (qi + 1) % progress_every == 0 or qi + 1 == len(questions):
                 elapsed = time.perf_counter() - t_sweep

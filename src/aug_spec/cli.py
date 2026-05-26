@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -53,7 +54,7 @@ from aug_spec.adapters import adapter_for_config, get_adapter
 from aug_spec.controller import Controller
 from aug_spec.drafts import ScoreBasedAvgDraft, get_draft
 from aug_spec.runtime.loader import (
-    free_model, get_peak_vram_gb, load_model,
+    free_model, get_peak_vram_gb, load_model, load_offload,
 )
 from aug_spec.runtime.phase import shared_model_phase_patch, specbench_callbacks
 from aug_spec.runtime.specbench import run_specbench
@@ -81,6 +82,12 @@ class RunConfig:
     device_map: Any
     trust_remote_code: bool
     adapter_name: Optional[str]
+
+    # backend (default "hf"; "offload" uses moe_infinity + CPU source)
+    backend: str
+    offload_path: Optional[Path]
+    offload_device_memory_ratio: float
+    offload_cache_policy: str
 
     # draft
     draft_name: str
@@ -129,6 +136,28 @@ class RunConfig:
         spec_cache = run_cfg.get("spec_bench_cache")
         spec_cache_path = Path(spec_cache) if spec_cache else None
 
+        # Backend: default "hf" keeps existing configs valid.
+        backend = str(model_cfg.get("backend", "hf")).lower()
+        if backend not in ("hf", "offload"):
+            raise ValueError(
+                f"config: model.backend must be 'hf' or 'offload', "
+                f"got {backend!r}")
+
+        # Parse model.offload.* — only required when backend == "offload".
+        offload_cfg = model_cfg.get("offload") or {}
+        offload_path = (
+            Path(offload_cfg["path"]) if offload_cfg.get("path") else None)
+        offload_dmr = float(offload_cfg.get("device_memory_ratio", 0.15))
+        offload_cp = str(offload_cfg.get("cache_policy", "ondemand")).lower()
+        if backend == "offload":
+            if offload_path is None:
+                raise ValueError(
+                    "config: backend=offload requires model.offload.path")
+            if offload_cp not in ("ondemand", "caching"):
+                raise ValueError(
+                    f"config: model.offload.cache_policy must be "
+                    f"'ondemand' or 'caching', got {offload_cp!r}")
+
         return cls(
             raw=raw,
             config_path=path.resolve(),
@@ -138,6 +167,10 @@ class RunConfig:
             trust_remote_code=bool(model_cfg.get("trust_remote_code", True)),
             adapter_name=(str(model_cfg["adapter"])
                           if model_cfg.get("adapter") else None),
+            backend=backend,
+            offload_path=offload_path,
+            offload_device_memory_ratio=offload_dmr,
+            offload_cache_policy=offload_cp,
             draft_name=str(draft_cfg["name"]),
             draft_args=dict(draft_cfg.get("args") or {}),
             T=int(run_cfg.get("T", 3)),
@@ -165,6 +198,13 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print(f"  aug_spec   : {__version__}")
     print(f"  Config     : {cfg.config_path}")
     print(f"  Model      : {cfg.model_id}  ({cfg.dtype})")
+    print(f"  Backend    : {cfg.backend}", end="")
+    if cfg.backend == "offload":
+        print(f"  (offload_path={cfg.offload_path}, "
+              f"device_memory_ratio={cfg.offload_device_memory_ratio}, "
+              f"cache_policy={cfg.offload_cache_policy})")
+    else:
+        print()
     print(f"  Draft      : {cfg.draft_name}  args={cfg.draft_args}")
     print(f"  T          : {cfg.T}")
     print(f"  Spec-Bench : {cfg.questions_per_cat} q/cat × "
@@ -173,13 +213,28 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print("=" * 70)
 
     # ── load model + adapter ───────────────────────────────────────────
-    print(f"\nLoading {cfg.model_id} (single copy; target == draft) ...")
-    model, tokenizer = load_model(
-        cfg.model_id,
-        dtype=cfg.dtype,
-        device_map=cfg.device_map,
-        trust_remote_code=cfg.trust_remote_code,
-    )
+    moe = None
+    cpu_source = None
+    if cfg.backend == "offload":
+        print(f"\nLoading offload backend ...")
+        print(f"  Step 1/2: CPU-resident source ({cfg.model_id}) ...")
+        print(f"  Step 2/2: moe_infinity.MoE(...) ...")
+        model, tokenizer, moe, cpu_source = load_offload(
+            cfg.model_id,
+            offload_path=cfg.offload_path,
+            dtype=cfg.dtype,
+            device_memory_ratio=cfg.offload_device_memory_ratio,
+            cache_policy=cfg.offload_cache_policy,
+            trust_remote_code=cfg.trust_remote_code,
+        )
+    else:
+        print(f"\nLoading {cfg.model_id} (single copy; target == draft) ...")
+        model, tokenizer = load_model(
+            cfg.model_id,
+            dtype=cfg.dtype,
+            device_map=cfg.device_map,
+            trust_remote_code=cfg.trust_remote_code,
+        )
     model.eval()
 
     if cfg.adapter_name is not None:
@@ -206,7 +261,7 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print(f"  Resolved   : draft={cfg.draft_name}{draft_args}")
 
     # ── run ───────────────────────────────────────────────────────────
-    controller = Controller(model, adapter, draft)
+    controller = Controller(model, adapter, draft, cpu_source=cpu_source)
 
     on_cycle_extra = None
     if isinstance(draft, ScoreBasedAvgDraft):
@@ -230,6 +285,7 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
                 spec_bench_cache=cfg.spec_bench_cache,
                 emit_tokens_csv=cfg.emit_tokens_csv,
                 warmup=cfg.warmup,
+                moe_wrapper=moe,                  # None on hf backend
                 **callbacks,
             )
     finally:
@@ -243,6 +299,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
         "label": cfg.label,
         "model_id": cfg.model_id,
         "adapter": adapter.name,
+        "backend": cfg.backend,
+        "cpu_source_loaded": cpu_source is not None,
         "draft": {"name": cfg.draft_name, "args": draft_args},
         "T": cfg.T,
         "questions_per_cat": cfg.questions_per_cat,
@@ -254,6 +312,12 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
         "overall": result.overall,
         "per_subtask": result.per_subtask,
     }
+    if cfg.backend == "offload":
+        summary["offload"] = {
+            "path": str(cfg.offload_path),
+            "device_memory_ratio": cfg.offload_device_memory_ratio,
+            "cache_policy": cfg.offload_cache_policy,
+        }
     summary_path = cfg.output_dir / "summary.json"
     summary_path.write_text(
         json.dumps(summary, indent=2, ensure_ascii=False))
@@ -340,6 +404,15 @@ def main(argv: Optional[list] = None) -> int:
             return 2
         cfg = RunConfig.from_yaml(args.config)
         run_experiment(cfg)
+        # moe_infinity's C++ background threads (AIO pool, GPU fetch/exec)
+        # don't shut down cleanly on Python exit — the process hangs until
+        # SLURM time-limits it. After offload runs, all output (summary.json,
+        # CSVs) is already written by run_experiment, so we can safely
+        # skip Python's atexit/destructors via os._exit.
+        if cfg.backend == "offload":
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         return 0
 
     parser.print_help()

@@ -1,0 +1,173 @@
+srun: job 211880 queued and waiting for resources
+srun: job 211880 has been allocated resources
+-----------------
+loading CUDA 12.6
+-----------------
+
+NVIDIA H200, 143771 MiB
+
+========================================================================
+  PHASE 0 — sanity_offload.py
+========================================================================
+  CKPT      = mistralai/Mixtral-8x7B-v0.1
+  HF_HOME   = /work/morrisliu07/.cache/huggingface
+  OFFLOAD   = /work/morrisliu07/aug_spec/cache/offload/mixtral
+  RATIO     = 0.15
+  GPUs      = 1
+
+========================================================================
+  Loading CPU-resident source (before any moe_infinity activity)
+========================================================================
+  Loading CPU-resident source: mistralai/Mixtral-8x7B-v0.1 (bf16, device_map=cpu) ...
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading checkpoint shards:   0%|          | 0/19 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 19/19 [00:00<00:00, 214.34it/s]
+    done in 1.3s, host RAM ~ 0.8 GB
+
+========================================================================
+  Loading offloaded MoE wrapper
+========================================================================
+  Loading offloaded MoE wrapper: offload_path=/work/morrisliu07/aug_spec/cache/offload/mixtral, device_memory_ratio=0.15
+Fetching 36 files:   0%|          | 0/36 [00:00<?, ?it/s]Fetching 36 files: 100%|██████████| 36/36 [00:00<00:00, 14394.18it/s]
+[WARNING] FlashAttention is not available in the current environment. Using default attention.
+[20260524 00:28:44.840956Z ][494033 ][INFO  ]Creating I/O thread pool with  28  threads - archer_prio_aio_handle.cpp:175
+[20260524 00:28:44.840969Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  0 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840971Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  1 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840973Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  2 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840973Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  3 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840974Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  4 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840975Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  5 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840975Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  6 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840976Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  7 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840977Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  8 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840977Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  9 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840979Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  10 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840980Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  11 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840981Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  12 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840981Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  13 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840982Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  14 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840983Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  15 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840983Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  16 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840984Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  17 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840984Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  18 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840985Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  19 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840986Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  20 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840986Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  21 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840987Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  22 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840987Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  23 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840988Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  24 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840988Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  25 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840989Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  26 - archer_aio_thread.cpp:12
+[20260524 00:28:44.840990Z ][494033 ][INFO  ]Create ArcherAioThread for thread:  27 - archer_aio_thread.cpp:12
+[20260524 00:28:44.841813Z ][494033 ][INFO  ]Creating pinned memory pool:  112  chunks of  1024  KB - pinned_memory_pool.cpp:16
+[20260524 00:28:44.871466Z ][494033 ][INFO  ]Loading index file from  /work/morrisliu07/aug_spec/cache/offload/mixtral/archer_index - archer_tensor_handle.cpp:48
+[20260524 00:28:44.871838Z ][494033 ][INFO  ]Index file size  995 - archer_tensor_handle.cpp:54
+Failed to set Thread affinity : File exists
+Failed to set Thread affinity : File exists
+[20260524 00:28:44.871972Z ][494033 ][INFO  ]Device count  1 - archer_prefetch_handle.cpp:48
+[20260524 00:28:44.871974Z ][494033 ][INFO  ]Enabled peer access for all devices - archer_prefetch_handle.cpp:71
+Loading model from offload_path ...
+`torch_dtype` is deprecated! Use `dtype` instead!
+MixtralConfig {
+  "architectures": [
+    "MixtralForCausalLM"
+  ],
+  "attention_dropout": 0.0,
+  "bos_token_id": 1,
+  "dtype": "bfloat16",
+  "eos_token_id": 2,
+  "head_dim": null,
+  "hidden_act": "silu",
+  "hidden_size": 4096,
+  "initializer_range": 0.02,
+  "intermediate_size": 14336,
+  "max_position_embeddings": 32768,
+  "model_type": "mixtral",
+  "num_attention_heads": 32,
+  "num_experts_per_tok": 2,
+  "num_hidden_layers": 32,
+  "num_key_value_heads": 8,
+  "num_local_experts": 8,
+  "output_router_logits": false,
+  "rms_norm_eps": 1e-05,
+  "rope_theta": 1000000.0,
+  "router_aux_loss_coef": 0.02,
+  "router_jitter_noise": 0.0,
+  "sliding_window": null,
+  "tie_word_embeddings": false,
+  "transformers_version": "4.57.6",
+  "use_cache": true,
+  "vocab_size": 32000
+}
+
+[20260524 00:28:44.935610Z ][494033 ][INFO  ]Moving dense parameters to CPU - model_topology.cpp:566
+34 left33 left32 left31 left30 left29 left28 left27 left26 left25 left24 left23 left22 left21 left20 left19 left18 left17 left16 left15 left14 left13 left12 left11 left10 left9 left8 left7 left6 left5 left4 left3 left2 left1 left
+finished: 35/35
+[20260524 00:28:47.997707Z ][494033 ][INFO  ]Moving sparse parameters to CPU - model_topology.cpp:577
+255 left254 left253 left252 left251 left250 left249 left248 left247 left246 left245 left244 left243 left242 left241 left240 left239 left238 left237 left236 left235 left234 left233 left232 left231 left230 left229 left228 left227 left226 left225 left224 left223 left222 left221 left220 left219 left218 left217 left216 left215 left214 left213 left212 left211 left210 left209 left208 left207 left206 left205 left204 left203 left202 left201 left200 left199 left198 left197 left196 left195 left194 left193 left192 left191 left190 left189 left188 left187 left186 left185 left184 left183 left182 left181 left180 left179 left178 left177 left176 left175 left174 left173 left172 left171 left170 left169 left168 left167 left166 left165 left164 left163 left162 left161 left160 left159 left158 left157 left156 left155 left154 left153 left152 left151 left150 left149 left148 left147 left146 left145 left144 left143 left142 left141 left140 left139 left138 left137 left136 left135 left134 left133 left132 left131 left130 left129 left128 left127 left126 left125 left124 left123 left122 left121 left120 left119 left118 left117 left116 left115 left114 left113 left112 left111 left110 left109 left108 left107 left106 left105 left104 left103 left102 left101 left100 left99 left98 left97 left96 left95 left94 left93 left92 left91 left90 left89 left88 left87 left86 left85 left84 left83 left82 left81 left80 left79 left78 left77 left76 left75 left74 left73 left72 left71 left70 left69 left68 left67 left66 left65 left64 left63 left62 left61 left60 left59 left58 left57 left56 left55 left54 left53 left52 left51 left50 left49 left48 left47 left46 left45 left44 left43 left42 left41 left40 left39 left38 left37 left36 left35 left34 left33 left32 left31 left30 left29 left28 left27 left26 left25 left24 left23 left22 left21 left20 left19 left18 left17 left16 left15 left14 left13 left12 left11 left10 left9 left8 left7 left6 left5 left4 left3 left2 left1 left
+finished: 256/256
+    done in 87.3s
+
+========================================================================
+  Q1: adapter.iter_moe path still resolves on the offloaded model
+========================================================================
+  hf_model_type: MixtralForCausalLM
+  has_model_attr: True
+  has_model_layers: True
+  num_layers: 32
+  verdict: PASS
+  first_blocks:
+    {'layer_idx': 0, 'block_type': 'SyncMixtralSparseMoeBlock', 'has_gate': True, 'has_experts': True, 'has_expert_executor': True, 'has_layer_id': True, 'num_experts': 8}
+    {'layer_idx': 1, 'block_type': 'SyncMixtralSparseMoeBlock', 'has_gate': True, 'has_experts': True, 'has_expert_executor': True, 'has_layer_id': True, 'num_experts': 8}
+    {'layer_idx': 2, 'block_type': 'SyncMixtralSparseMoeBlock', 'has_gate': True, 'has_experts': True, 'has_expert_executor': True, 'has_layer_id': True, 'num_experts': 8}
+  >>> PASS
+
+========================================================================
+  Q2: CPU-resident weight source has real expert weights
+========================================================================
+  cpu_source_type: MixtralForCausalLM
+  host_ram_gb: 88.02592086791992
+  block_type: MixtralSparseMoeBlock
+  num_experts: 8
+  expert0_w1_shape: [14336, 4096]
+  expert0_w1_dtype: torch.bfloat16
+  expert0_w1_device: cpu
+  expert0_w1_abs_sum: 507904.0
+  expert0_w1_isnan: False
+  verdict: PASS
+  >>> PASS
+
+========================================================================
+  Q3: offloaded moe.model expert weights are shape-(1,) placeholders
+========================================================================
+  expert0_w1_shape: [1]
+  expert0_w1_dtype: torch.bfloat16
+  expert0_w1_device: cpu
+  expert0_w1_abs_sum: 0.0
+  is_placeholder: True
+  verdict: PASS (placeholder as expected — direct reads useless for merge)
+  >>> PASS (placeholder as expected — direct reads useless for merge)
+
+========================================================================
+  Q4: VRAM peak for non-expert + archer cache on single H100
+========================================================================
+  device_count: 1
+  device_memory_ratio: 0.15
+  gpu_0: NVIDIA H200 139.7 GB
+  forward_wall_s: 1.662
+  output_shape: [1, 8, 32000]
+  peak_vram_gb: 0.03
+  verdict: PASS — peak 0.0 GB / 80 GB H100
+  >>> PASS — peak 0.0 GB / 80 GB H100
+
+========================================================================
+  SUMMARY
+========================================================================
+  q1: PASS
+  q2: PASS
+  q3: PASS (placeholder as expected — direct reads useless for merge)
+  q4: PASS — peak 0.0 GB / 80 GB H100
+
+  Results written to /work/morrisliu07/aug_spec/tests/sanity_offload_results.json
+srun: Job step aborted: Waiting up to 62 seconds for job step to finish.
+slurmstepd-hgpn39: error: *** STEP 211880.0 ON hgpn39 CANCELLED AT 2026-05-24T01:28:40 DUE TO TIME LIMIT ***
+srun: error: hgpn39: task 0: Terminated

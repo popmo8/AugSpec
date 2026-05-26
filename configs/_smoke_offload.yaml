@@ -1,0 +1,43 @@
+# Phase 3 smoke test for the offload backend.
+#
+# Goal: confirm that aug_spec run on Mixtral via moe_infinity produces
+# MAT / AccRate within bf16 noise of configs/_smoke.yaml (HF backend).
+#
+# Acceptance criterion (per IMPLEMENTATION_PLAN.md §7.2):
+#   summary.json["overall"]["mean_accept_tokens"] within ±0.1 of
+#   output/_smoke/summary.json's MAT.
+#
+# Reference HF smoke result (output/_smoke/summary.json):
+#   mt_bench:       MAT=2.80  AccRate=0.6207  TPS=7.35
+#   translation:    MAT=2.91  AccRate=0.6562  TPS=7.98
+#   summarization:  MAT=4.00  AccRate=1.0000  TPS=10.22
+#   qa:             MAT=2.58  AccRate=0.5278  TPS=7.21
+#
+# Wall time is allowed to be slower than HF (we now pay PCIe). VRAM
+# (as reported by nvidia-smi during the run) should be dramatically
+# lower than the HF run (~43 GB → ~15-20 GB).
+
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  backend: offload
+  offload:
+    path: /work/morrisliu07/aug_spec/cache/offload/mixtral
+    device_memory_ratio: 0.15
+    cache_policy: ondemand
+
+draft:
+  name: topm_count                 # offload-safe; see next_step.md §2.3
+  args:
+    record_history: false
+
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 32
+  warmup: false                    # smoke = quick sanity, no warmup
+  emit_tokens_csv: false
+
+output:
+  dir: output/_smoke_offload
+  label: _smoke_offload

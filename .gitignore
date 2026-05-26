@@ -14,8 +14,12 @@ cache/
 data/spec_bench/
 moe_infinity/offload_output/
 moe_infinity/coverage-out/
+moe_infinity/build/
 
 # editor / OS
 .vscode/
 .idea/
 .DS_Store
+
+# tests
+tests/example/

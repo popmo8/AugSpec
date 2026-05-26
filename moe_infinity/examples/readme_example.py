@@ -15,7 +15,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--offload_dir",
-    default="/work/u3444343/moe-infinity-qwen3-30b-a3b",
+    default="/work/morrisliu07/aug_spec/tests/example",
     help="Directory for offloading expert weights",
 )
 args = parser.parse_args()

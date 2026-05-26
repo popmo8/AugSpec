@@ -53,12 +53,12 @@ class PrefillCountDraft(CountDraft):
             return
         super().capture_softmax(layer_idx, softmax)
 
-    def refresh(self, adapter, blocks, draft_cache):
+    def refresh(self, adapter, blocks, draft_cache, *, cpu_blocks=None):
         # No per-cycle refresh — the merged expert is built lazily once
         # by `lazy_build` on the first draft forward per layer.
         return
 
-    def lazy_build(self, layer_idx, block, adapter):
+    def lazy_build(self, layer_idx, block, adapter, *, cpu_block=None):
         score_vec = self.target_score.get(layer_idx)
         if score_vec is None:
             # Prefill hasn't captured this layer yet. Shouldn't normally
@@ -74,4 +74,4 @@ class PrefillCountDraft(CountDraft):
             weights = (score_vec.float() / total).tolist()
         # Same hook as ScoreBasedAvgDraft.refresh — subclasses can prune.
         weights = self._postprocess_weights(weights)
-        return adapter.build_weighted_avg(block, weights)
+        return adapter.build_weighted_avg(block, weights, cpu_block=cpu_block)
