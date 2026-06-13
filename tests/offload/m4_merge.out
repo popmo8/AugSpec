@@ -1,0 +1,43 @@
+====================================================================
+M4 probe — merge 三變體計時 + 精度(Qwen3,只載 cpu_source)
+  model      : Qwen/Qwen3-30B-A3B
+  layer_idx  : 0   M(num_merge): 16
+  chunk_rows : 256   n_iters: 10
+  torch CPU threads : 4
+====================================================================
+
+loading cpu_source (device_map='cpu', bf16) ...
+
+  num_experts=128  expert_size=9.44 MB
+
+[(a) gpu_full]
+    數值 vs ref : 逐位元  PASS
+    wall/layer  : median 17.18 ms  (best 16.91)
+    ×48 層估計  : 824.8 ms / merge cycle
+    GPU 暫存峰值: 21.0 MB
+    PCIe H2D    : 151.0 MB (16 expert)
+
+[(c) gpu_chunked]
+    數值 vs ref : 逐位元  PASS
+    wall/layer  : median 25.61 ms  (best 25.34)
+    ×48 層估計  : 1229.1 ms / merge cycle
+    GPU 暫存峰值: 11.8 MB
+    PCIe H2D    : 151.0 MB (16 expert)
+
+[(d) cpu_merge]
+    數值 vs ref : 逐位元  PASS
+    wall/layer  : median 13.56 ms  (best 13.45)
+    ×48 層估計  : 651.1 ms / merge cycle
+    GPU 暫存峰值: 9.0 MB
+    PCIe H2D    : 9.4 MB (1 expert)
+
+====================================================================
+對比表(單層 merge,M=16)
+  variant            wall(ms)   peak(MB)   PCIe(MB)  數值
+  (a) gpu_full          17.18       21.0      151.0  逐位元
+  (c) gpu_chunked       25.61       11.8      151.0  逐位元
+  (d) cpu_merge         13.56        9.0        9.4  逐位元
+
+====================================================================
+RESULT: ALL PASS（三變體數值皆對齊 reference）
+====================================================================

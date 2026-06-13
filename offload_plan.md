@@ -110,6 +110,26 @@ config 不要定稿。
 (c) vs (d) 純比速度，M4 用數字選。直覺：(c) 傳 M× expert size 但 GPU 計算免費；
 (d) 只傳 1× 但 CPU 合成受核數限制（`cpus-per-task=4` 時 (d) 未必贏）。
 
+**M4 實測裁決（Qwen3，M=16，4 核，job 234890）—— 三變體全逐位元對齊
+reference，計時：**
+
+| 變體 | wall/層 | ×48/cycle | GPU 暫存 | PCIe H2D |
+|---|---|---|---|---|
+| (a) gpu_full | 17.2 ms | 825 ms | 21.0 MB | 151 MB |
+| (c) gpu_chunked | 25.6 ms | 1229 ms | 11.8 MB | 151 MB |
+| **(d) cpu_merge** | **13.6 ms** | **651 ms** | **9.0 MB** | **9.4 MB** |
+
+**Qwen3 主線裁決 = (d) CPU merge** —— 四項指標全勝。關鍵：Qwen3
+expert 小（9.4 MB）→ PCIe 是瓶頸 → 少傳 16 倍蓋過 CPU 成本，
+**§1.3 原本「4 核 (d) 未必贏」的預警在小 expert 上被推翻**。
+(c) 分塊在小 expert 上 per-chunk overhead 反而最慢（選項二測對了，
+死守 (c) 會選到最差）。(a) peak 21 MB 沒撐爆（選項二證實 Qwen3 上 (a)
+合法）但仍輸 (d)。
+
+**(d) 在所有 M 都最優**（PCIe 恆 = 1 顆，是下界），不需掃 M。
+**Mixtral 不外推**：expert 352 MB 時 CPU 合 2 顆受記憶體頻寬限制、
+PCIe 省一半未必蓋過，Mixtral 的最優留到亂碼 side-quest 修好後另測。
+
 ### 1.4 prefill vs topm 的空間 / latency 帳
 
 兩者都**不需要額外空間**：
@@ -289,7 +309,22 @@ Spec-Bench 真實 prompt 時持續留意，撞到再啟用 token 分塊方案。
 （§2）+ vendored `model_offload.py` 的 4096 routing buffer（已進
 vendored 源碼）。
 
-#### M3 — `_route_offload` 原型（搬進 adapter 前先單測，Qwen3）
+#### M3 — `_route_offload` 原型（搬進 adapter 前先單測，Qwen3）✅ 全綠（job 234884）
+
+R1–R4 全過。`route_offload_torch`（[m3_route.py](tests/offload/m3_route.py)）
+即 M6a 要搬進 [qwen3.py](src/aug_spec/adapters/qwen3.py) 的版本：自組
+top-k softmax + `norm_topk_prob` renorm 與 C++ kernel **逐位元相同**
+（R2 權重差 0.0），輸出差 5.96e-08（R3）。R1 與原生 forward 差 7.5e-3
+= 原生 `.to(bf16)` 截斷 vs 我們保 fp32，**我們更精確、非錯**。
+
+搬進 adapter 時的兩個收尾（M3 已知、M6a 補上）：
+1. **補 `.to(hs_flat.dtype)`** —— `wait_dispatch_local()` 回傳 fp32，
+   原生 forward 最後會轉回 bf16，搬進去要照做。
+2. **masked draft 的效率優化（非正確性，可延到 M8）**：R4 證明只留
+   一顆 expert 時輸出正確,但自組 mask 仍標 top-k 個 index（7 顆零權重
+   照樣被 dispatch 搬）。要真正「只搬一顆」,`router_mask` 改從
+   `weights_mask != 0` 推（masked 自然剩一顆,verify 自然 8 顆）。
+   對 M6b 正確性無影響（輸出相同→acceptance 相同）,只影響 throughput。
 
 - **做**：`tests/offload/m3_route.py` —— 寫一個 standalone 函式
   `route_offload(block, hs_flat, gate_logits)`：
@@ -309,7 +344,14 @@ vendored 源碼）。
   [qwen3.py](src/aug_spec/adapters/qwen3.py) 的程式碼。Mixtral 版
   （需另處理 top-2 hardcode）等亂碼 side-quest 修好後比照辦理。
 
-#### M4 — CPU-source merge 原型：兩個合規變體計時 + 精度比對
+#### M4 — CPU-source merge 原型：三變體計時 + 精度比對 ✅ 全綠（job 234890）
+
+三變體（(a)/(c)/(d)，§1.3 選項二）全逐位元對齊 reference，**Qwen3 主線
+裁決 = (d) CPU merge**（四項指標全勝，數字見 §1.3）。對 M7 是大簡化：
+(d) 本質就是「現有 `build_weighted_avg(cpu_block)` + `.to(cuda)`」，
+M4 已證逐位元正確，**幾乎不用寫新 merge 程式碼**。一個小優化記下：
+現有 `build_weighted_avg` 迭代全 128 顆 expert（跳過零權重），offload
+版應只迭代 nonzero（M7 接入時改）。
 
 - **做**：`tests/offload/m4_merge.py` ——
   `cpu_source = AutoModelForCausalLM.from_pretrained(..., device_map="cpu")`

@@ -1,0 +1,33 @@
+====================================================================
+M3 probe — _route_offload 原型(Qwen3)
+  model      : Qwen/Qwen3-30B-A3B
+  layer_idx  : 0   seq_len: 4
+====================================================================
+
+loading MoE(...) ...
+warming up engine with a 8-token generate ...
+
+[R1] route_offload_kernel == 原生 Qwen3MoEBlock.forward
+    max|ref - kernel|      : 7.507e-03
+    非逐位元但 < 1e-2(dispatch 浮點合併的 ulp 級差異)
+[R1] PASS
+
+[R2] route_offload_torch 自組 mask == kernel 組的 mask
+    router_mask  shape/dtype: (4, 128) torch.bool
+    weights_mask shape/dtype: (4, 128) torch.bfloat16
+    max|kernel_w - torch_w| : 0.000e+00
+[R2] PASS
+
+[R3] route_offload_torch 輸出 ≈ route_offload_kernel
+    max|kernel - torch|    : 5.960e-08
+[R3] PASS
+
+[R4] masked gate(只留一顆 expert)dispatch 跑得動且輸出有限非零
+    selected experts/token : 8(top_k=8,但只有 e=7 有非零權重)
+    nonzero weight/token   : 1(應為 1)
+    output                 : shape=(4, 2048) dtype=torch.float32
+[R4] PASS
+
+====================================================================
+RESULT: ALL PASS
+====================================================================
