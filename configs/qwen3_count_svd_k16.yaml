@@ -1,0 +1,37 @@
+# Qwen3-30B-A3B-Base — count draft, K=16 cluster-merged experts + SVD (no top-M).
+#
+# Same unfiltered pool as qwen3_count_k16 (every fired expert enters
+# clustering, no top-M cap), but each of the K=16 frequency-slice clusters is
+# merged via Sub-MoE SVD subspace alignment. The draft forward runs the 8
+# heaviest clusters (= Qwen3's native top-8 routing).
+#
+# SVD uses a single cached global basis per layer (built once over all 128
+# experts), so per-cycle cost stays low despite K=16.
+#
+# Ablation neighbours:
+#   qwen3_count_k16           : same, no SVD
+#   qwen3_topm_count_svd_k16  : same, but pool capped at M=64 first
+#   qwen3_topm_count_svd      : K=1 SVD baseline
+
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: count
+  args:
+    # count_top_k auto-defaults to model.config.num_experts_per_tok (= 8)
+    K: 16           # partition all active experts into 16 cluster-merged experts
+    draft_top_k: 8  # run the 8 heaviest clusters in the draft forward
+    use_svd_merge: true
+    svd_rank: 256
+    record_history: true
+
+run:
+  T: 5
+  questions_per_cat: 10
+  max_new_tokens: 512
+
+output:
+  label: qwen3_count_svd_k16

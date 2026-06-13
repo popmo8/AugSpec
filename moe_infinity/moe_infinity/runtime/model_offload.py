@@ -375,10 +375,16 @@ class OffloadEngine(object):
                 )
 
                 if "qwen" in model_name.lower():
+                    # max_tokens sizes MoELayer's preallocated routing
+                    # buffers (moe.h); prefill processes the whole prompt
+                    # in one forward, so this caps prompt length. 1024 was
+                    # too small for Spec-Bench prompts (aug_spec M2 probe,
+                    # job 234626: 1200-token prefill -> buffer overrun,
+                    # device-side assert in lib.topk_softmax).
                     self.prefetch_lib.init_moe_layer(
                         self.num_experts,
                         self.config.num_experts_per_tok,
-                        1024,
+                        4096,
                         self.config.hidden_size,
                         self.config.moe_intermediate_size,
                     )

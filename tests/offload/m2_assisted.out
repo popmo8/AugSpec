@@ -1,0 +1,154 @@
+====================================================================
+M2 probe — assisted generation on offloaded model
+  model               : Qwen/Qwen3-30B-A3B
+  offload_dir         : /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B
+  device_memory_ratio : 0.75
+====================================================================
+
+loading MoE(...) ...
+GPU used after load     : 0.9 GB
+
+[A1] 短 prompt：assisted == plain greedy
+    prompt len = 13 tok
+[A1] FAIL
+    Traceback (most recent call last):
+      File "/work/morrisliu07/aug_spec/tests/offload/m2_assisted.py", line 62, in run
+        fn(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/tests/offload/m2_assisted.py", line 128, in a1_short
+        _compare_one(moe, tokenizer, ids, max_new_tokens, "short")
+      File "/work/morrisliu07/aug_spec/tests/offload/m2_assisted.py", line 111, in _compare_one
+        assisted, t_assist = _generate(moe.model, tokenizer, prompt_ids,
+      File "/work/morrisliu07/aug_spec/tests/offload/m2_assisted.py", line 100, in _generate
+        out = model.generate(ids, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+        return func(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/generation/utils.py", line 2566, in generate
+        result = decoding_method(
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/generation/utils.py", line 3559, in _assisted_decoding
+        candidate_input_ids, candidate_logits = candidate_generator.get_candidates(input_ids)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/generation/candidate_generator.py", line 220, in get_candidates
+        candidate_ids, candidate_logits = self._generate_candidates(generation_args)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/generation/candidate_generator.py", line 319, in _generate_candidates
+        assistant_output = self.assistant_model.generate(**generation_args, **self.assistant_kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+        return func(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/generation/utils.py", line 2566, in generate
+        result = decoding_method(
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/generation/utils.py", line 2786, in _sample
+        outputs = self(**model_inputs, return_dict=True)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+        return self._call_impl(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1884, in _call_impl
+        return inner()
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1832, in inner
+        result = forward_call(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/utils/generic.py", line 918, in wrapper
+        output = func(self, *args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/models/qwen3_moe/modeling_qwen3_moe.py", line 650, in forward
+        outputs: MoeModelOutputWithPast = self.model(
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+        return self._call_impl(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1884, in _call_impl
+        return inner()
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1832, in inner
+        result = forward_call(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/utils/generic.py", line 1072, in wrapper
+        outputs = func(self, *args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/models/qwen3_moe/modeling_qwen3_moe.py", line 484, in forward
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+        return self._call_impl(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1884, in _call_impl
+        return inner()
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1832, in inner
+        result = forward_call(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+        return func(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/modeling_rope_utils.py", line 87, in wrapper
+        return rope_forward(self, x, position_ids)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/models/qwen3_moe/modeling_qwen3_moe.py", line 396, in forward
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+    RuntimeError: Expected all tensors to be on the same device, but got mat2 is on cpu, different from other tensors on cuda:0 (when checking argument in method wrapper_CUDA_bmm)
+
+[A2] 長 prompt（≥1024 tok）：assisted 跑得完且 == plain greedy
+    prompt len = 1200 tok
+[A2] FAIL
+    Traceback (most recent call last):
+      File "/work/morrisliu07/aug_spec/tests/offload/m2_assisted.py", line 62, in run
+        fn(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/tests/offload/m2_assisted.py", line 139, in a2_long
+        _compare_one(moe, tokenizer, ids, max_new_tokens, "long")
+      File "/work/morrisliu07/aug_spec/tests/offload/m2_assisted.py", line 108, in _compare_one
+        plain, t_plain = _generate(moe.model, tokenizer, prompt_ids,
+      File "/work/morrisliu07/aug_spec/tests/offload/m2_assisted.py", line 100, in _generate
+        out = model.generate(ids, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+        return func(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/generation/utils.py", line 2566, in generate
+        result = decoding_method(
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/generation/utils.py", line 2786, in _sample
+        outputs = self(**model_inputs, return_dict=True)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+        return self._call_impl(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1884, in _call_impl
+        return inner()
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1832, in inner
+        result = forward_call(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/utils/generic.py", line 918, in wrapper
+        output = func(self, *args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/models/qwen3_moe/modeling_qwen3_moe.py", line 650, in forward
+        outputs: MoeModelOutputWithPast = self.model(
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+        return self._call_impl(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1884, in _call_impl
+        return inner()
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1832, in inner
+        result = forward_call(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/utils/generic.py", line 1072, in wrapper
+        outputs = func(self, *args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/models/qwen3_moe/modeling_qwen3_moe.py", line 487, in forward
+        hidden_states = decoder_layer(
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/modeling_layers.py", line 94, in __call__
+        return super().__call__(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+        return self._call_impl(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1884, in _call_impl
+        return inner()
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1832, in inner
+        result = forward_call(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/utils/deprecation.py", line 172, in wrapped_func
+        return func(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/transformers/models/qwen3_moe/modeling_qwen3_moe.py", line 359, in forward
+        hidden_states = self.mlp(hidden_states)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+        return self._call_impl(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1884, in _call_impl
+        return inner()
+      File "/work/morrisliu07/aug_spec/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1832, in inner
+        result = forward_call(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/moe_infinity/moe_infinity/models/qwen.py", line 79, in forward
+        self.__prepare_expert_route(hidden_states)
+      File "/work/morrisliu07/aug_spec/moe_infinity/moe_infinity/models/qwen.py", line 40, in __prepare_expert_route
+        router_mask, routing_weights_mask = self.lib.topk_softmax(router_logits)
+    torch.AcceleratorError: CUDA error: invalid argument
+    Search for `cudaErrorInvalidValue' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+    CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+    For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+    Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+[A3] 連續 3 個 prompt、每次重呼叫 _configure_hook
+[A3] FAIL
+    Traceback (most recent call last):
+      File "/work/morrisliu07/aug_spec/tests/offload/m2_assisted.py", line 62, in run
+        fn(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/tests/offload/m2_assisted.py", line 150, in a3_repeat
+        ids = tokenizer(p, return_tensors="pt").input_ids.to("cuda:0")
+    torch.AcceleratorError: CUDA error: device-side assert triggered
+    Search for `cudaErrorAssert' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+    CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+    For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+    Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+====================================================================
+RESULT: 3 FAILED — A1, A2, A3
+====================================================================

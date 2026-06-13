@@ -13,7 +13,7 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
-from .base import MoEAdapter
+from .base import MoEAdapter, _svd_decompose, _svd_remerge, _weighted_sum
 
 
 def _wrap_chat_template_with_reasoning(tokenizer, reasoning_effort: str):
@@ -108,6 +108,32 @@ class GptOssAdapter(MoEAdapter):
         del gate_up_sum, gate_up_bias_sum, down_sum, down_bias_sum
         return out
 
+    def build_svd_basis(self, mlp, rank=256, store_dtype=torch.bfloat16):
+        experts = mlp.experts
+        n = experts.gate_up_proj.shape[0]
+        # Weight matrices get an SVD basis; biases are 1-D (no subspace), so
+        # we keep the static per-expert bias tensors for a per-cycle plain avg.
+        return {
+            "dtype": experts.gate_up_proj.dtype,
+            "gate_up": _svd_decompose(
+                [experts.gate_up_proj[e].float() for e in range(n)],
+                rank, store_dtype),
+            "down": _svd_decompose(
+                [experts.down_proj[e].float() for e in range(n)],
+                rank, store_dtype),
+            "gate_up_bias": [experts.gate_up_proj_bias[e] for e in range(n)],
+            "down_bias":    [experts.down_proj_bias[e] for e in range(n)],
+        }
+
+    def build_svd_from_basis(self, basis, weights):
+        dtype = basis["dtype"]
+        return {
+            "gate_up_proj":      _svd_remerge(basis["gate_up"], weights).to(dtype),
+            "gate_up_proj_bias": _weighted_sum(basis["gate_up_bias"], weights).to(dtype),
+            "down_proj":         _svd_remerge(basis["down"], weights).to(dtype),
+            "down_proj_bias":    _weighted_sum(basis["down_bias"], weights).to(dtype),
+        }
+
     def _run_dense_expert(self, avg, flat):
         alpha = self._alpha
         limit = self._limit
@@ -132,9 +158,17 @@ class GptOssAdapter(MoEAdapter):
                     if avg is not None:
                         controller.draft_cache[layer_idx] = avg
                 if avg is not None:
-                    out = adapter._run_dense_expert(avg, flat)
-                    out = out.reshape(batch_size, sequence_length, hidden_dim)
-                    return out, None
+                    if avg.get("kind") == "multi":
+                        # Run the gate (one linear) for per-token cluster scores.
+                        router = mlp.router
+                        gate_logits = F.linear(flat, router.weight, router.bias)
+                        gate_probs = gate_logits.softmax(dim=-1)
+                        top_k = controller.draft.draft_top_k or router.top_k
+                        out = adapter._route_multi_expert(
+                            avg, gate_probs, flat, top_k)
+                    else:
+                        out = adapter._run_dense_expert(avg, flat)
+                    return out.reshape(batch_size, sequence_length, hidden_dim), None
                 # First cycle, no cache → fall through to mlp.router/experts.
                 router_scores, router_indices = mlp.router(hidden_states)
                 routed_out = mlp.experts(

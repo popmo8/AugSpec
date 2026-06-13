@@ -35,10 +35,14 @@ from .count import CountDraft
 class PrefillCountDraft(CountDraft):
     """Count-weighted merged expert, frozen after the prefill capture."""
 
-    def __init__(self, count_top_k: int):
+    def __init__(self, count_top_k: int,
+                 use_svd_merge: bool = False, svd_rank: int = 256,
+                 K: int = 1, draft_top_k=None):
         # record_history is not supported here — only one effective
         # state per question, no per-cycle evolution to log.
-        super().__init__(count_top_k=count_top_k, record_history=False)
+        super().__init__(count_top_k=count_top_k, record_history=False,
+                         use_svd_merge=use_svd_merge, svd_rank=svd_rank,
+                         K=K, draft_top_k=draft_top_k)
 
     def capture(self, layer_idx, router_logits):
         # Keep only the FIRST capture per layer (= prefill target forward).
@@ -74,4 +78,9 @@ class PrefillCountDraft(CountDraft):
             weights = (score_vec.float() / total).tolist()
         # Same hook as ScoreBasedAvgDraft.refresh — subclasses can prune.
         weights = self._postprocess_weights(weights)
-        return adapter.build_weighted_avg(block, weights)
+        # Reuse the shared merge machinery so K (cluster) and SVD work here
+        # too — the only difference from refresh is we build once, frozen.
+        basis = self._get_svd_basis(adapter, layer_idx, block)
+        if self.K > 1:
+            return self._cluster_and_build(adapter, block, weights, basis)
+        return self._build_one(adapter, block, weights, basis)

@@ -10,7 +10,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .base import MoEAdapter
+from .base import (
+    MoEAdapter,
+    _svd_decompose,
+    _svd_remerge,
+    _topk_substitute_forward,
+)
 
 
 class MixtralAdapter(MoEAdapter):
@@ -57,6 +62,26 @@ class MixtralAdapter(MoEAdapter):
         }
         del w1_sum, w2_sum, w3_sum
         return out
+
+    def build_svd_basis(self, block, rank=256, store_dtype=torch.bfloat16):
+        dtype = block.experts[0].w1.weight.dtype
+        return {
+            "dtype": dtype,
+            "w1": _svd_decompose([e.w1.weight.float() for e in block.experts],
+                                 rank, store_dtype),
+            "w2": _svd_decompose([e.w2.weight.float() for e in block.experts],
+                                 rank, store_dtype),
+            "w3": _svd_decompose([e.w3.weight.float() for e in block.experts],
+                                 rank, store_dtype),
+        }
+
+    def build_svd_from_basis(self, basis, weights):
+        dtype = basis["dtype"]
+        return {
+            "w1": _svd_remerge(basis["w1"], weights).to(dtype),
+            "w2": _svd_remerge(basis["w2"], weights).to(dtype),
+            "w3": _svd_remerge(basis["w3"], weights).to(dtype),
+        }
 
     def _run_dense_expert(self, avg, hs_flat):
         # Mixtral expert: SiLU(w1 · h) ⊙ (w3 · h) → w2(...).
@@ -105,7 +130,13 @@ class MixtralAdapter(MoEAdapter):
                     if avg is not None:
                         controller.draft_cache[layer_idx] = avg
                 if avg is not None:
-                    out = adapter._run_dense_expert(avg, hs_flat)
+                    if avg.get("kind") == "multi":
+                        top_k = controller.draft.draft_top_k or block.top_k
+                        gate_probs = router_logits.softmax(dim=-1)
+                        out = adapter._route_multi_expert(
+                            avg, gate_probs, hs_flat, top_k)
+                    else:
+                        out = adapter._run_dense_expert(avg, hs_flat)
                     return out.reshape(
                         batch_size, sequence_length, hidden_dim), router_logits
                 # First cycle, no cache → fall through to standard routing.
@@ -144,3 +175,16 @@ class MixtralAdapter(MoEAdapter):
             return final, router_logits
 
         return fwd
+
+    def make_substitute_forward(self, controller, layer_idx, block):
+        return _topk_substitute_forward(controller, layer_idx, block)
+
+    def expert_flat_weights(self, block):
+        return [
+            torch.cat([
+                e.w1.weight.detach().flatten().float(),
+                e.w2.weight.detach().flatten().float(),
+                e.w3.weight.detach().flatten().float(),
+            ])
+            for e in block.experts
+        ]

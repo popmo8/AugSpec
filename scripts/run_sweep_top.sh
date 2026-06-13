@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=specmoe_sweep
+#SBATCH --job-name=top_b2
 #SBATCH --partition=normal2
 #SBATCH --account=MST114471
 #SBATCH --time=12:00:00
@@ -7,14 +7,14 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=4
-#SBATCH -o /work/morrisliu07/job_log/specmoe_sweep_%j.log
-#SBATCH -e /work/morrisliu07/job_err/specmoe_sweep_%j.err
+#SBATCH -o /work/morrisliu07/job_log/top1_sweep_%j.log
+#SBATCH -e /work/morrisliu07/job_err/top1_sweep_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=hhliu@arbor.ee.ntu.edu.tw
 #
 # Single-job sweep: edit the CONFIGS list below, then
 #
-#     sbatch scripts/run_sweep.sh
+#     sbatch scripts/run_sweep_top1.sh
 #
 # Every config runs sequentially in the SAME job; on the first failure
 # the rest are skipped (set -e). Pick `--gpus-per-node` at the top to
@@ -29,9 +29,14 @@ REPO_ROOT="/work/morrisliu07/aug_spec"
 #  ✏  Edit me: configs to run in this sweep (in order).
 # ════════════════════════════════════════════════════════════════════════
 CONFIGS=(
-    configs/qwen3_specmoe_N8.yaml
-    configs/qwen3_specmoe_N16.yaml
-    configs/qwen3_specmoe_N32.yaml
+    # configs/gptoss_top8_count.yaml
+    # configs/gptoss_top16_count.yaml
+    # configs/mixtral_top4_count.yaml
+    # configs/mixtral_top6_count.yaml
+    configs/qwen3_top4_count.yaml
+    configs/qwen3_top16_count.yaml
+    configs/qwen3_top32_count.yaml
+    configs/qwen3_top64_count.yaml
 )
 # ════════════════════════════════════════════════════════════════════════
 

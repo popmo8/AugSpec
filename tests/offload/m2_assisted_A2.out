@@ -1,0 +1,22 @@
+====================================================================
+M2 probe — assisted generation on offloaded model
+  model               : Qwen/Qwen3-30B-A3B
+  offload_dir         : /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B
+  device_memory_ratio : 0.75
+  only                : A2
+====================================================================
+
+loading MoE(...) ...
+GPU used after load     : 1.0 GB
+    [workaround] Qwen3MoeForCausalLM.device → 恆為 cuda:0（原生由 placeholder 參數推得 cpu）
+
+[A2] 長 prompt（≥1024 tok）：assisted 跑得完且 == plain greedy
+    prompt len = 1200 tok
+    [long] plain   : 32 tok in 10.0s
+    [long] assisted: 32 tok in 10.6s
+    [long] text    : ' we approach natural language processing. Mixture-of-experts architectures route each token to a small subset of expert '
+[A2] PASS
+
+====================================================================
+RESULT: ALL PASS
+====================================================================

@@ -1,0 +1,21 @@
+====================================================================
+M2 probe — assisted generation on offloaded model
+  model               : Qwen/Qwen3-30B-A3B
+  offload_dir         : /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B
+  device_memory_ratio : 0.75
+  only                : A3
+====================================================================
+
+loading MoE(...) ...
+GPU used after load     : 1.0 GB
+    [workaround] Qwen3MoeForCausalLM.device → 恆為 cuda:0（原生由 placeholder 參數推得 cpu）
+
+[A3] 連續 3 個 prompt、每次重呼叫 _configure_hook
+    [1/3] 32 tok in 11.0s: ' Paris. The capital of the United Kingdom is London. The capital of the United S'
+    [2/3] 32 tok in 9.4s: ' a requested data item is not found in the cache. This can happen for various re'
+    [3/3] 32 tok in 9.5s: ' ( ). A. Connection-oriented and connectionless B. Reliable and unreliable C. Fl'
+[A3] PASS
+
+====================================================================
+RESULT: ALL PASS
+====================================================================

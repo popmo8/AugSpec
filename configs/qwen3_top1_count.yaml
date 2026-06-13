@@ -1,0 +1,29 @@
+# Qwen3-30B-A3B-Base — top-1 expert draft (diagnostic).
+#
+# Uses topm_count with M=1: each cycle, only the single most-voted expert
+# contributes to the draft — no averaging. This isolates routing prediction
+# accuracy from expert interchangeability: if acceptance improves vs
+# topm_count (M=8), the multi-expert averaging is the bottleneck; if it
+# stays flat, routing prediction itself is insufficient.
+#
+# Baseline for comparison:
+#   qwen3_topm_count : MAT=1.40  AccRate=0.135  TPS=4.2  (M=8, default)
+
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: topm_count
+  args:
+    M: 1
+    record_history: true
+
+run:
+  T: 3
+  questions_per_cat: 10
+  max_new_tokens: 512
+
+output:
+  label: qwen3_top1_count

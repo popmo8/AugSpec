@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 from transformers import AutoTokenizer
 
@@ -15,7 +16,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--offload_dir",
-    default="/work/u3444343/moe-infinity-qwen3-30b-a3b",
+    default="/work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B",
     help="Directory for offloading expert weights",
 )
 args = parser.parse_args()
@@ -29,10 +30,15 @@ config = {
 
 model = MoE(args.checkpoint, config)
 
-input_text = "translate English to German: How old are you?"
+input_text = "The capital of France is"
 input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to("cuda:0")
 
 output_ids = model.generate(input_ids)
 output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
 print(output_text)
+
+# moe-infinity's C++ thread pool hangs on shutdown; force exit
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)

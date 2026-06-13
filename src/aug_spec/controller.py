@@ -60,6 +60,8 @@ class Controller:
             factory = self.adapter.make_averaged_forward
         elif self.draft.cache_kind == "masked":
             factory = self.adapter.make_masked_forward
+        elif self.draft.cache_kind == "substitute":
+            factory = self.adapter.make_substitute_forward
         else:
             raise ValueError(
                 f"Unknown draft.cache_kind {self.draft.cache_kind!r}")

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=specmoe_sweep
+#SBATCH --job-name=qwen3_count_k16
 #SBATCH --partition=normal2
 #SBATCH --account=MST114471
 #SBATCH --time=12:00:00
@@ -7,19 +7,24 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=4
-#SBATCH -o /work/morrisliu07/job_log/specmoe_sweep_%j.log
-#SBATCH -e /work/morrisliu07/job_err/specmoe_sweep_%j.err
+#SBATCH -o /work/morrisliu07/job_log/qwen3_count_k16_%j.log
+#SBATCH -e /work/morrisliu07/job_err/qwen3_count_k16_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=hhliu@arbor.ee.ntu.edu.tw
 #
-# Single-job sweep: edit the CONFIGS list below, then
+# SVD subspace merge sweep: runs each model's SVD topm_count against its
+# plain topm_count baseline so results are directly comparable.
 #
-#     sbatch scripts/run_sweep.sh
+# gpus-per-node=2 is required for Mixtral-8x7B and Qwen3-30B-A3B (≥ 94 GB
+# bf16).  GPT-OSS-20B fits on 1 GPU but we keep 2 here for a uniform node.
+# Override at submit time if you only want the GPT-OSS pair:
 #
-# Every config runs sequentially in the SAME job; on the first failure
-# the rest are skipped (set -e). Pick `--gpus-per-node` at the top to
-# match the largest model in the list — Mixtral / Qwen3-30B need 2,
-# pure GPT-OSS sweeps can drop to 1 via `sbatch --gpus-per-node=1 ...`.
+#     sbatch --gpus-per-node=1 --time=4:00:00 scripts/run_sweep_svd.sh
+#
+# Pair layout (baseline → SVD):
+#   mixtral_topm_count     → mixtral_topm_count_svd
+#   gptoss_topm_count      → gptoss_topm_count_svd   (label: gptoss_top8_count)
+#   qwen3_topm_count       → qwen3_topm_count_svd
 
 set -euo pipefail
 
@@ -27,16 +32,22 @@ REPO_ROOT="/work/morrisliu07/aug_spec"
 
 # ════════════════════════════════════════════════════════════════════════
 #  ✏  Edit me: configs to run in this sweep (in order).
+#     Baselines run first so the SVD run's output/*.json can be diffed
+#     immediately after the job finishes.
 # ════════════════════════════════════════════════════════════════════════
 CONFIGS=(
-    configs/qwen3_specmoe_N8.yaml
-    configs/qwen3_specmoe_N16.yaml
-    configs/qwen3_specmoe_N32.yaml
+    # configs/mixtral_topm_count_svd.yaml
+    # configs/gptoss_topm_count_svd.yaml
+    # configs/qwen3_topm_count_svd.yaml
+    # configs/qwen3_topm_count_k16.yaml
+    # configs/qwen3_topm_count_svd_k16.yaml
+    configs/qwen3_count_k16.yaml
+    # configs/qwen3_count_svd_k16.yaml
 )
 # ════════════════════════════════════════════════════════════════════════
 
 if [[ ${#CONFIGS[@]} -eq 0 ]]; then
-    echo "[run_sweep] CONFIGS array is empty. Edit $0 to add configs." >&2
+    echo "[svd_sweep] CONFIGS array is empty. Edit $0 to add configs." >&2
     exit 1
 fi
 
@@ -51,26 +62,25 @@ source "${REPO_ROOT}/.venv/bin/activate"
 
 cd "${REPO_ROOT}"
 
-# Pre-flight: every config must exist before we burn an hour of GPU time
-# discovering a typo in the middle of the list.
+# Pre-flight: every config must exist before we burn GPU time on a typo.
 for cfg in "${CONFIGS[@]}"; do
     if [[ ! -f "${cfg}" ]]; then
-        echo "[run_sweep] not found: ${cfg}" >&2
+        echo "[svd_sweep] not found: ${cfg}" >&2
         exit 1
     fi
 done
 
-echo "[run_sweep] node=$(hostname)  job=${SLURM_JOB_ID:-local}  n=${#CONFIGS[@]}"
-echo "[run_sweep] aug_spec at $(which aug_spec)"
+echo "[svd_sweep] node=$(hostname)  job=${SLURM_JOB_ID:-local}  n=${#CONFIGS[@]}"
+echo "[svd_sweep] aug_spec at $(which aug_spec)"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
 for cfg in "${CONFIGS[@]}"; do
     echo
     echo "========================================================================"
-    echo "[run_sweep] $(date -Iseconds)  cfg=${cfg}"
+    echo "[svd_sweep] $(date -Iseconds)  cfg=${cfg}"
     echo "========================================================================"
     aug_spec run --config "${cfg}"
 done
 
 echo
-echo "[run_sweep] $(date -Iseconds)  all ${#CONFIGS[@]} configs completed"
+echo "[svd_sweep] $(date -Iseconds)  all ${#CONFIGS[@]} configs completed"

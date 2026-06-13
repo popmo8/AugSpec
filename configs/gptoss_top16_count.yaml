@@ -1,0 +1,30 @@
+# GPT-OSS-20B — top-16 expert draft (diagnostic).
+#
+# Uses topm_count with M=16: each cycle, the 16 most-voted experts
+# contribute to the draft — no averaging. This isolates routing prediction
+# accuracy from expert interchangeability: if acceptance remains near-zero
+# (~0.02), the failure is not caused by expert averaging but by something
+# model-specific (e.g. reasoning-mode token distribution mismatch).
+#
+# Baseline for comparison:
+#   gptoss_topm_count : MAT=1.07  AccRate=0.022  TPS=9.4  (M=4, default)
+
+model:
+  id: openai/gpt-oss-20b
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: topm_count
+  args:
+    M: 16
+    record_history: true
+
+run:
+  T: 3
+  questions_per_cat: 10
+  max_new_tokens: 512
+  reasoning_effort: low
+
+output:
+  label: gptoss_top16_count

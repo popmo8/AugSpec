@@ -1,0 +1,28 @@
+# Mixtral-8x7B — top-1 expert draft (diagnostic).
+#
+# Uses topm_count with M=1: each cycle, only the single most-voted expert
+# contributes to the draft — no averaging. This isolates routing prediction
+# accuracy from expert interchangeability: if acceptance improves vs
+# topm_count (M=2), the averaging itself hurts; if not, routing is the issue.
+#
+# Baseline for comparison:
+#   mixtral_topm_count : MAT=4.36  AccRate=0.675  TPS=18.6  (M=2, default)
+
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: topm_count
+  args:
+    M: 4
+    record_history: true
+
+run:
+  T: 5
+  questions_per_cat: 10
+  max_new_tokens: 512
+
+output:
+  label: mixtral_top4_count

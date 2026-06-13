@@ -1,0 +1,36 @@
+# Mixtral-8x7B — top-M count draft with Sub-MoE SVD subspace merging.
+#
+# Instead of direct weighted averaging (Σ w_i W_i), each cycle's merged
+# expert is built via joint SVD on the concatenated top-M expert weights,
+# merging only in the shared V-subspace (Sub-MoE §3.3).  Motivation:
+# Mixtral experts show inter-expert cosine similarities of 0.1–0.3, so
+# direct averaging injects parameter conflict; SVD alignment reduces this.
+#
+# M=2 matches the model's native top-k (num_experts_per_tok=2).
+# svd_rank=256 captures the dominant singular directions without the full
+# 4096-dim cost; raise to 512/1024 for a fidelity vs. speed tradeoff study.
+#
+# Baseline for comparison:
+#   mixtral_topm_count : M=2, no SVD
+
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: topm_count
+  args:
+    # count_top_k auto-defaults to model.config.num_experts_per_tok (= 2)
+    M: 2
+    use_svd_merge: true
+    svd_rank: 256
+    record_history: true
+
+run:
+  T: 5
+  questions_per_cat: 10
+  max_new_tokens: 512
+
+output:
+  label: mixtral_topm_count_svd

@@ -1,0 +1,28 @@
+# Qwen3-30B-A3B-Base SpecMoE: top-k routing + L2-nearest substitution.
+#
+# Same mechanism as mixtral_specmoe, generalised to Qwen3's 128 experts and
+# native top-8 routing. Each draft winner is remapped to its L2-nearest kept
+# expert; the kept mask is the top-N most-voted experts per cycle.
+#
+# Note: the one-time L2 distance precompute is heavier here (128 experts) —
+# it stacks per-expert flattened weights and runs one cdist per layer.
+
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: specmoe
+  args:
+    N: 16             # kept-mask size out of 128 experts
+    route_top_k: 8    # experts routed per token, both phases (= native top-8)
+    # count_top_k defaults to route_top_k
+
+run:
+  T: 5
+  questions_per_cat: 10
+  max_new_tokens: 512
+
+output:
+  label: qwen3_specmoe_N16

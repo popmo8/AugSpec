@@ -1,0 +1,66 @@
+====================================================================
+M1 probe — offload 結構探勘
+  model               : Qwen/Qwen3-30B-A3B
+  offload_dir         : /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B
+  device_memory_ratio : 0.15
+====================================================================
+
+host RSS at start       : 0.8 GB
+loading MoE(...) ...
+host RSS after MoE load : 61.2 GB
+GPU used after MoE load : 0.9 GB
+
+[Q1] MoE(...) 後 block 路徑 / type / forward 簽名
+    MoE layers found       : 48 / 48
+    block type             : moe_infinity.models.qwen.Qwen3MoEBlock
+    forward signature      : (hidden_states)
+    top_k / num_experts    : 8 / 128
+    norm_topk_prob         : True  (M3 要驗 lib.topk_softmax 是否處理了 renorm)
+[Q1] PASS
+
+[Q3] offload 後 expert 與 gate 權重靜止時皆為 (1,) placeholder
+    experts[0].gate_proj.weight      : shape=(1,) dtype=torch.bfloat16 dev=cpu sum=0.000e+00
+    experts[0].up_proj.weight        : shape=(1,) dtype=torch.bfloat16 dev=cpu sum=0.000e+00
+    experts[0].down_proj.weight      : shape=(1,) dtype=torch.bfloat16 dev=cpu sum=0.000e+00
+    gate.weight            : shape=(1,) dtype=torch.bfloat16 dev=cpu
+[Q3] PASS
+
+[EX] expert_executor / lib / engine 介面盤點（M3 / M10 依賴）
+    block.expert_executor    : YES
+    block.lib                : YES
+    block.archer_engine      : YES
+    block.layer_id           : YES
+    block.expert_tensor_ids  : MISSING
+    executor.dispatch_local     : YES
+    executor.wait_dispatch_local: YES
+    lib.topk_softmax           : YES  (qwen3 routing 的 fused kernel)
+    engine.expert_prefetcher    : YES
+    engine.expert_tracer        : YES
+    engine.expert_dispatcher    : YES
+    fetch_experts_lock_cache    : on prefetcher
+    replace_cache_candidates    : on archer_engine
+[EX] PASS
+
+[Q4] 短 generate 跑通（單卡容量 @ 此 device_memory_ratio）
+    generated (16 tok)   : ' Paris. The capital of the United Kingdom is London. The capital of Germany is'
+    GPU used               : 24.3 GB
+    host RSS               : 61.9 GB
+[Q4] PASS
+
+[FW] 單獨呼叫一個 MoE block forward（M3 前提）
+    final                  : shape=(1, 4, 2048) dtype=torch.bfloat16
+    router_logits          : shape=(4, 128)
+[FW] PASS
+
+[Q2] CPU-resident 權重源與 MoE(...) 同進程共存
+    host RSS before        : 61.9 GB
+    loading cpu_source (device_map='cpu', bf16) ...
+    host RSS after         : 63.3 GB  (Δ +1.4 GB)
+    cpu experts[0].gate_proj.weight  : shape=(768, 2048) dtype=torch.bfloat16 dev=cpu absmean=1.796e-02
+    cpu experts[0].up_proj.weight    : shape=(768, 2048) dtype=torch.bfloat16 dev=cpu absmean=1.790e-02
+    cpu experts[0].down_proj.weight  : shape=(2048, 768) dtype=torch.bfloat16 dev=cpu absmean=1.956e-02
+[Q2] PASS
+
+====================================================================
+RESULT: ALL PASS
+====================================================================

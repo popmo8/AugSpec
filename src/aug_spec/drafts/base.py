@@ -28,7 +28,14 @@ import torch
 class DraftStrategy:
     """Abstract draft strategy. Override only what you need."""
 
-    cache_kind: str = "averaged"  # or "masked"
+    cache_kind: str = "averaged"  # or "masked" / "substitute"
+
+    def prepare(self, adapter, blocks) -> None:
+        """One-time setup before any inference (called once by the CLI after
+        the controller is built). Use for static, model-derived precomputation
+        that must not repeat per question — e.g. pairwise expert distances.
+        Default is a no-op."""
+        pass
 
     def reset(self) -> None:
         pass
@@ -60,7 +67,17 @@ class ScoreBasedAvgDraft(DraftStrategy):
     Subclasses override `_score_vector_from_logits(router_logits)` (or
     `_score_vector_from_softmax(softmax)` for GPT-OSS), returning a
     `[num_experts]` fp32 tensor that gets normalised and used as
-    per-expert weights for `adapter.build_weighted_avg`.
+    per-expert weights for the chosen merge method.
+
+    Set `use_svd_merge=True` (and optionally `svd_rank`) to use the
+    Sub-MoE subspace merging strategy instead of naive weighted averaging.
+
+    Set `K>1` to keep K merged experts per layer (a mini-MoE) instead of a
+    single dense expert. Active experts are partitioned into K clusters and
+    each cluster is merged independently; the draft forward then runs the
+    `draft_top_k` heaviest clusters and combines their outputs. This avoids
+    collapsing a large, diverse expert pool (e.g. Qwen3's 128) into one
+    expert. `K=1` reproduces the single-merged-expert behaviour exactly.
     """
 
     cache_kind = "averaged"
@@ -70,9 +87,35 @@ class ScoreBasedAvgDraft(DraftStrategy):
     # scores override to "float". Only consulted when record_history=True.
     history_value_kind: str = "float"
 
-    def __init__(self, record_history: bool = False):
+    def __init__(self, record_history: bool = False,
+                 use_svd_merge: bool = False,
+                 svd_rank: int = 256,
+                 K: int = 1,
+                 draft_top_k: Optional[int] = None):
         # layer_idx → CPU fp32 tensor [num_experts]
         self.target_score: Dict[int, torch.Tensor] = {}
+        self.use_svd_merge = use_svd_merge
+        self.svd_rank = svd_rank
+
+        # layer_idx → cached SVD basis (one joint decomposition over all
+        # experts). Built lazily on first use, then reused every cycle and
+        # across questions — the expert weights are static, so this is NOT
+        # cleared by reset(). Empty unless use_svd_merge is set.
+        self._svd_basis: Dict[int, Any] = {}
+
+        # K: number of merged experts cached per layer.
+        #   K == 1 → single dense expert (a plain Dict[str, Tensor] cache).
+        #   K  > 1 → K cluster-merged experts (a "multi" cache dict).
+        if K < 1:
+            raise ValueError(f"K must be >= 1, got {K!r}")
+        self.K = K
+
+        # draft_top_k: how many of the K clusters the draft forward actually
+        #   runs. None → resolved to the model's native top-k inside each
+        #   adapter forward. Ignored when K == 1.
+        if draft_top_k is not None and draft_top_k < 1:
+            raise ValueError(f"draft_top_k must be >= 1, got {draft_top_k!r}")
+        self.draft_top_k = draft_top_k
 
         # Optional per-cycle history of the raw target-side score vector
         # for each MoE layer, captured BEFORE normalisation. Populated
@@ -179,7 +222,97 @@ class ScoreBasedAvgDraft(DraftStrategy):
             else:
                 weights = (score_vec.float() / total).tolist()
             weights = self._postprocess_weights(weights)
-            draft_cache[li] = adapter.build_weighted_avg(block, weights)
+            basis = self._get_svd_basis(adapter, li, block)
+            if self.K > 1:
+                draft_cache[li] = self._cluster_and_build(
+                    adapter, block, weights, basis)
+            else:
+                draft_cache[li] = self._build_one(adapter, block, weights, basis)
+
+    def _get_svd_basis(self, adapter, layer_idx: int, block):
+        """Return the cached SVD basis for `layer_idx`, building it on first
+        use. Returns None when SVD merging is disabled."""
+        if not self.use_svd_merge:
+            return None
+        basis = self._svd_basis.get(layer_idx)
+        if basis is None:
+            basis = adapter.build_svd_basis(block, rank=self.svd_rank)
+            self._svd_basis[layer_idx] = basis
+        return basis
+
+    def _build_one(self, adapter, block, weights: List[float],
+                   basis) -> Dict[str, torch.Tensor]:
+        """Merge `weights` into a single expert via the configured method.
+
+        When `basis` is given (SVD enabled) the merge reuses the cached
+        decomposition; otherwise it is a plain weighted average.
+        """
+        if basis is not None:
+            return adapter.build_svd_from_basis(basis, weights)
+        return adapter.build_weighted_avg(block, weights)
+
+    def _cluster_and_build(self, adapter, block, weights: List[float],
+                           basis) -> Dict[str, Any]:
+        """Partition active experts into K clusters and merge each one.
+
+        Clustering (frequency-slice): active experts are sorted by weight
+        descending and cut into K contiguous slices, so each cluster groups
+        experts of comparable activation frequency. This is a fast,
+        calibration-free proxy — a stronger functional-similarity metric
+        (e.g. gate-vector clustering) can replace `_assign_clusters` later
+        without touching the rest of the pipeline.
+
+        Returns a "multi" cache dict consumed by `adapter._route_multi_expert`::
+
+            {
+              "kind":     "multi",
+              "experts":  [expert_0, ..., expert_{K'-1}],  # K' = min(K, #active)
+              "weights":  [w_0,      ..., w_{K'-1}],         # cluster mass, sum=1
+              "indices":  [[orig expert ids in cluster 0], ...],  # for gate remap
+            }
+
+        Clusters are ordered by descending mass. `indices[k]` lists the
+        original expert ids in cluster k, so the draft forward can remap a
+        token's gate probabilities onto the K clusters.
+        """
+        n = len(weights)
+        active = [i for i, w in enumerate(weights) if w > 0.0]
+        groups = self._assign_clusters(active, weights)
+
+        experts: List[Dict[str, torch.Tensor]] = []
+        masses: List[float] = []
+        for group in groups:
+            group_mass = sum(weights[i] for i in group)
+            # Renormalise within the cluster so each merge gets weights summing
+            # to 1; the cluster's share of the whole is tracked in `masses`.
+            cluster_weights = [0.0] * n
+            for i in group:
+                cluster_weights[i] = weights[i] / group_mass
+            experts.append(
+                self._build_one(adapter, block, cluster_weights, basis))
+            masses.append(group_mass)
+
+        total = sum(masses)
+        order = sorted(range(len(experts)), key=lambda k: -masses[k])
+        return {
+            "kind":    "multi",
+            "experts": [experts[k] for k in order],
+            "weights": [masses[k] / total for k in order],
+            "indices": [groups[k] for k in order],
+        }
+
+    def _assign_clusters(self, active: List[int],
+                         weights: List[float]) -> List[List[int]]:
+        """Group active expert indices into at most K clusters.
+
+        Frequency-slice strategy: sort by weight descending, then cut into K
+        contiguous, near-equal-size slices. Returns a list of non-empty
+        index groups (fewer than K only when active experts < K).
+        """
+        ordered = sorted(active, key=lambda i: -weights[i])
+        m = len(ordered)
+        k = min(self.K, m)
+        return [ordered[j * m // k:(j + 1) * m // k] for j in range(k)]
 
     def _postprocess_weights(self, weights: List[float]) -> List[float]:
         """Hook called once per layer per cycle, right before

@@ -16,6 +16,7 @@ from .prefill_count import PrefillCountDraft
 from .prefill_topm_count import PrefillTopMCountDraft
 from .random_mask import RandomMaskDraft
 from .softmax import SoftmaxDraft
+from .specmoe import SpecMoeDraft
 from .topm_count import TopMCountDraft
 from .uniform import UniformDraft
 
@@ -29,6 +30,7 @@ _REGISTRY: Dict[str, Type[DraftStrategy]] = {
     "prefill_topm_count": PrefillTopMCountDraft,
     "softmax": SoftmaxDraft,
     "random_mask": RandomMaskDraft,
+    "specmoe": SpecMoeDraft,
 }
 
 
@@ -51,5 +53,6 @@ __all__ = [
     "PrefillTopMCountDraft",
     "SoftmaxDraft",
     "RandomMaskDraft",
+    "SpecMoeDraft",
     "get_draft",
 ]

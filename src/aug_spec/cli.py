@@ -51,7 +51,7 @@ import yaml
 from aug_spec import __version__
 from aug_spec.adapters import adapter_for_config, get_adapter
 from aug_spec.controller import Controller
-from aug_spec.drafts import ScoreBasedAvgDraft, get_draft
+from aug_spec.drafts import ScoreBasedAvgDraft, SpecMoeDraft, get_draft
 from aug_spec.runtime.loader import (
     free_model, get_peak_vram_gb, load_model,
 )
@@ -208,6 +208,9 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     # ── run ───────────────────────────────────────────────────────────
     controller = Controller(model, adapter, draft)
 
+    # One-time, model-derived precomputation (e.g. SpecMoE expert distances).
+    draft.prepare(adapter, controller.blocks)
+
     on_cycle_extra = None
     if isinstance(draft, ScoreBasedAvgDraft):
         on_cycle_extra = draft.make_on_cycle_tagger()  # None if record_history=False
@@ -254,6 +257,25 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
         "overall": result.overall,
         "per_subtask": result.per_subtask,
     }
+
+    # SpecMoE mask-miss telemetry (top-k target winners outside the old mask).
+    if isinstance(draft, SpecMoeDraft):
+        misses = draft.cycle_misses
+        n_cycles = len(misses)
+        mean_miss = (sum(misses) / n_cycles) if n_cycles else 0.0
+        num_layers = controller.num_moe_layers
+        max_miss = num_layers * draft.route_top_k
+        summary["specmoe"] = {
+            "N": draft.N,
+            "route_top_k": draft.route_top_k,
+            "count_top_k": draft.count_top_k,
+            "n_miss_cycles": n_cycles,
+            "mean_mask_miss_per_cycle": mean_miss,
+            "mean_mask_miss_per_layer": (
+                mean_miss / num_layers if num_layers else 0.0),
+            "mask_miss_fraction": mean_miss / max_miss if max_miss else 0.0,
+        }
+
     summary_path = cfg.output_dir / "summary.json"
     summary_path.write_text(
         json.dumps(summary, indent=2, ensure_ascii=False))

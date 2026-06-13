@@ -15,7 +15,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .base import MoEAdapter
+from .base import (
+    MoEAdapter,
+    _svd_decompose,
+    _svd_remerge,
+    _topk_substitute_forward,
+)
 
 
 class Qwen3MoeAdapter(MoEAdapter):
@@ -62,6 +67,29 @@ class Qwen3MoeAdapter(MoEAdapter):
         }
         del g_sum, u_sum, d_sum
         return out
+
+    def build_svd_basis(self, block, rank=256, store_dtype=torch.bfloat16):
+        dtype = block.experts[0].gate_proj.weight.dtype
+        return {
+            "dtype": dtype,
+            "gate_proj": _svd_decompose(
+                [e.gate_proj.weight.float() for e in block.experts],
+                rank, store_dtype),
+            "up_proj": _svd_decompose(
+                [e.up_proj.weight.float() for e in block.experts],
+                rank, store_dtype),
+            "down_proj": _svd_decompose(
+                [e.down_proj.weight.float() for e in block.experts],
+                rank, store_dtype),
+        }
+
+    def build_svd_from_basis(self, basis, weights):
+        dtype = basis["dtype"]
+        return {
+            "gate_proj": _svd_remerge(basis["gate_proj"], weights).to(dtype),
+            "up_proj":   _svd_remerge(basis["up_proj"], weights).to(dtype),
+            "down_proj": _svd_remerge(basis["down_proj"], weights).to(dtype),
+        }
 
     def _run_dense_expert(self, avg, hs_flat):
         # Qwen3MoeMLP: SiLU(gate_proj · h) ⊙ (up_proj · h) → down_proj(...).
@@ -113,7 +141,13 @@ class Qwen3MoeAdapter(MoEAdapter):
                     if avg is not None:
                         controller.draft_cache[layer_idx] = avg
                 if avg is not None:
-                    out = adapter._run_dense_expert(avg, hs_flat)
+                    if avg.get("kind") == "multi":
+                        top_k = controller.draft.draft_top_k or block.top_k
+                        gate_probs = router_logits.softmax(dim=-1)
+                        out = adapter._route_multi_expert(
+                            avg, gate_probs, hs_flat, top_k)
+                    else:
+                        out = adapter._run_dense_expert(avg, hs_flat)
                     return out.reshape(
                         batch_size, sequence_length, hidden_dim), router_logits
                 # First cycle, no cache → fall through to standard routing.
@@ -152,3 +186,16 @@ class Qwen3MoeAdapter(MoEAdapter):
             return final, router_logits
 
         return fwd
+
+    def make_substitute_forward(self, controller, layer_idx, block):
+        return _topk_substitute_forward(controller, layer_idx, block)
+
+    def expert_flat_weights(self, block):
+        return [
+            torch.cat([
+                e.gate_proj.weight.detach().flatten().float(),
+                e.up_proj.weight.detach().flatten().float(),
+                e.down_proj.weight.detach().flatten().float(),
+            ])
+            for e in block.experts
+        ]

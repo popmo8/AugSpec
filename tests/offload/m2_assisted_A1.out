@@ -1,0 +1,22 @@
+====================================================================
+M2 probe — assisted generation on offloaded model
+  model               : Qwen/Qwen3-30B-A3B
+  offload_dir         : /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B
+  device_memory_ratio : 0.75
+  only                : A1
+====================================================================
+
+loading MoE(...) ...
+GPU used after load     : 1.0 GB
+    [workaround] Qwen3MoeForCausalLM.device → 恆為 cuda:0（原生由 placeholder 參數推得 cpu）
+
+[A1] 短 prompt：assisted == plain greedy
+    prompt len = 13 tok
+    [short] plain   : 32 tok in 8.2s
+    [short] assisted: 32 tok in 10.6s
+    [short] text    : ' it uses a sparse combination of sub-networks (experts) to process input data. This sparsity can lead to more efficient '
+[A1] PASS
+
+====================================================================
+RESULT: ALL PASS
+====================================================================
