@@ -1,0 +1,30 @@
+# Comparison run #4 — top-M count, M=32 K=16, offload backend.
+# Our merge-based draft on offload: each cluster merged on CPU from cpu_source
+# and shipped to GPU (M4/M7), verify streams real experts via dispatch_local.
+# Acceptance should match cmp_topm_m32k16_hf within bf16 noise.
+
+model:
+  id: Qwen/Qwen3-30B-A3B
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B
+    device_memory_ratio: 0.75
+
+draft:
+  name: topm_count
+  args:
+    M: 32
+    K: 16
+    draft_top_k: 8
+    use_svd_merge: false
+    record_history: false
+
+run:
+  T: 5
+  questions_per_cat: 5
+  max_new_tokens: 256
+
+output:
+  label: cmp_topm_m32k16_offload
+  dir: output/cmp_topm_m32k16_offload

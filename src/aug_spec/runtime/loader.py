@@ -142,8 +142,97 @@ def load_model(
     return model, tokenizer
 
 
+# ---------------------------------------------------------------------------
+# Offload backend (moe_infinity). Additive — the hf path above is untouched.
+# ---------------------------------------------------------------------------
+
+def _patch_offload_device(model: nn.Module,
+                          device: torch.device) -> None:
+    """Pin `model.device` to `device`.
+
+    moe_infinity leaves every parameter as a shape-(1,) CPU placeholder,
+    materialising the real weight per-forward via module hooks. The default
+    `PreTrainedModel.device` reads it off the first parameter and therefore
+    reports `cpu`. HF assisted generation uses `assistant_model.device` to
+    move `input_ids`, so without this patch speculative decoding moves the
+    ids to CPU and crashes mid-forward (M2 finding, offload_plan.md §2).
+
+    Patches the class (not the instance) because `device` is a read-only
+    property; single-model / single-GPU is assumed (offload_plan.md §2.6).
+    """
+    cls = type(model)
+    cls.device = property(lambda self: device)
+
+
+def load_offload(
+    model_id: str,
+    offload_path: str,
+    device_memory_ratio: float = 0.15,
+    dtype: torch.dtype = torch.bfloat16,
+    trust_remote_code: bool = True,
+    device: Optional[torch.device] = None,
+    load_cpu_source: bool = True,
+) -> Tuple[nn.Module, Any, Any, Optional[nn.Module]]:
+    """Load a MoE model with moe_infinity expert offloading.
+
+    Sibling of `load_model` for the offload backend. Non-expert layers stay
+    on GPU; experts live on host RAM and stream in on demand within a VRAM
+    budget of `device_memory_ratio × GPU_size` (offload_plan.md §1).
+
+    Returns `(model, tokenizer, moe, cpu_source)`:
+      * `model`      — `moe.model`, the offloaded `PreTrainedModel`; target
+                       verify runs through this.
+      * `tokenizer`
+      * `moe`        — the `moe_infinity.MoE` wrapper. **Keep it**: every
+                       `generate(...)` must be preceded by
+                       `moe._configure_hook(input_ids)` to (re)create the
+                       expert-tracer sequence entries (offload_plan.md §2).
+      * `cpu_source` — a CPU-resident copy used **only** as the weight
+                       source for draft-side merging (offload_plan.md §2.7,
+                       merge variant (d) per M4). `None` if
+                       `load_cpu_source=False`. No forward ever runs on it.
+
+    `moe_infinity` is imported lazily so an hf-only environment that never
+    calls this function does not need it installed.
+    """
+    from moe_infinity import MoE  # lazy: hf-only env doesn't need it
+
+    if device is None:
+        device = torch.device("cuda:0")
+
+    moe = MoE(model_id, {
+        "offload_path": offload_path,
+        "device_memory_ratio": device_memory_ratio,
+    })
+    model = moe.model
+    model.eval()
+    _patch_offload_device(model, device)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, trust_remote_code=trust_remote_code)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    cpu_source = None
+    if load_cpu_source:
+        cpu_source = AutoModelForCausalLM.from_pretrained(
+            model_id, device_map="cpu", torch_dtype=dtype,
+            trust_remote_code=trust_remote_code)
+        cpu_source.eval()
+
+    return model, tokenizer, moe, cpu_source
+
+
 def get_model_device(model: nn.Module) -> torch.device:
-    return next(model.parameters()).device
+    dev = next(model.parameters()).device
+    # Offload models hold CPU placeholders, so the param device wrongly reads
+    # cpu; trust the GPU that `load_offload` pinned onto `model.device` (M2/M5).
+    # hf models never hit this branch, so their behaviour is unchanged.
+    if dev.type == "cpu":
+        md = getattr(model, "device", None)
+        if isinstance(md, torch.device):
+            return md
+    return dev
 
 
 def reset_memory_stats() -> None:

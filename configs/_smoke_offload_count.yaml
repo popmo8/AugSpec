@@ -1,0 +1,37 @@
+# Qwen3 count-merge smoke on the OFFLOAD backend (M7 — merge draft + offload).
+#
+# The real M7 milestone: draft-side expert merging now sources weights from the
+# CPU-resident copy (cpu_source) and ships one merged expert to GPU per layer
+# (M4's CPU-merge variant, proven bit-exact vs hf). Exercises the full merge
+# path: capture counts → build_weighted_avg(cpu_block) → move to GPU →
+# _run_dense_expert in the draft phase, while verify still streams real experts
+# through dispatch_local.
+#
+# Pass = MAT / AccRate match _smoke_count (hf backend) within bf16 noise. Since
+# count's acceptance is ~0.4 (not ~0 like random_mask), this is the strong
+# numeric agreement M6b couldn't give.
+#
+# device_memory_ratio=0.75: validating correctness, not the memory budget.
+
+model:
+  id: Qwen/Qwen3-30B-A3B
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B
+    device_memory_ratio: 0.75
+
+draft:
+  name: count
+  args:
+    record_history: false
+
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 32
+  warmup: false
+
+output:
+  label: _smoke_offload_count
+  dir: output/_smoke_offload_count

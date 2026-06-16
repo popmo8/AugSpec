@@ -140,6 +140,14 @@ def _topk_substitute_forward(controller, layer_idx: int, block: nn.Module):
                 dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hs_flat.dtype)
 
+        # Offload: experts are placeholders — run the (remapped) winners
+        # through the archer engine's dispatch instead of the per-expert loop.
+        if hasattr(block, "expert_executor"):
+            final = controller.adapter._dispatch_selected(
+                block, hs_flat, selected, routing_weights)
+            return (final.reshape(batch_size, sequence_length, hidden_dim),
+                    router_logits)
+
         final = torch.zeros(
             (batch_size * sequence_length, hidden_dim),
             dtype=hs_flat.dtype, device=hs_flat.device)

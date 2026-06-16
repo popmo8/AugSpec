@@ -1,0 +1,26 @@
+# Comparison run #3 — top-M count, M=32 K=16, hf backend.
+# Pairs with cmp_topm_m32k16_offload. Our merge-based draft: top-32 active
+# experts partitioned into 16 frequency-slice clusters, draft runs 8 of them.
+
+model:
+  id: Qwen/Qwen3-30B-A3B
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: topm_count
+  args:
+    M: 32             # active-expert pool before clustering
+    K: 16             # partition into 16 cluster-merged experts
+    draft_top_k: 8    # run the 8 heaviest clusters
+    use_svd_merge: false
+    record_history: false
+
+run:
+  T: 5
+  questions_per_cat: 5
+  max_new_tokens: 256
+
+output:
+  label: cmp_topm_m32k16_hf
+  dir: output/cmp_topm_m32k16_hf

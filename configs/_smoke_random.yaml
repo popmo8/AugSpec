@@ -1,0 +1,27 @@
+# Qwen3 random-mask smoke on the hf backend — CONTROL for _smoke_offload_random.
+#
+# random_mask acceptance is intentionally low (~0.2); the point of M6b is that
+# the offload backend lands at the SAME (low) number, validating the pipeline
+# (not the draft quality). Same model / draft / seed as the offload config so
+# the two are directly comparable.
+
+model:
+  id: Qwen/Qwen3-30B-A3B
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: random_mask
+  args:
+    # num_experts auto-defaults to the model's per-block expert count (128)
+    seed: 42
+
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 32
+  warmup: false
+
+output:
+  label: _smoke_random
+  dir: output/_smoke_random

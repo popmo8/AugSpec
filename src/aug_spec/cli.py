@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -53,7 +54,7 @@ from aug_spec.adapters import adapter_for_config, get_adapter
 from aug_spec.controller import Controller
 from aug_spec.drafts import ScoreBasedAvgDraft, SpecMoeDraft, get_draft
 from aug_spec.runtime.loader import (
-    free_model, get_peak_vram_gb, load_model,
+    free_model, get_peak_vram_gb, load_model, load_offload,
 )
 from aug_spec.runtime.phase import shared_model_phase_patch, specbench_callbacks
 from aug_spec.runtime.specbench import run_specbench
@@ -81,6 +82,9 @@ class RunConfig:
     device_map: Any
     trust_remote_code: bool
     adapter_name: Optional[str]
+    backend: str                         # "hf" (default) | "offload"
+    offload_path: Optional[str]          # offload backend: expert dir
+    device_memory_ratio: float           # offload backend: expert cache cap
 
     # draft
     draft_name: str
@@ -105,6 +109,7 @@ class RunConfig:
             raw: Dict[str, Any] = yaml.safe_load(f) or {}
 
         model_cfg = raw.get("model") or {}
+        offload_cfg = model_cfg.get("offload") or {}
         draft_cfg = raw.get("draft") or {}
         run_cfg = raw.get("run") or {}
         out_cfg = raw.get("output") or {}
@@ -138,6 +143,11 @@ class RunConfig:
             trust_remote_code=bool(model_cfg.get("trust_remote_code", True)),
             adapter_name=(str(model_cfg["adapter"])
                           if model_cfg.get("adapter") else None),
+            backend=str(model_cfg.get("backend", "hf")).lower(),
+            offload_path=(str(offload_cfg["path"])
+                          if offload_cfg.get("path") else None),
+            device_memory_ratio=float(
+                offload_cfg.get("device_memory_ratio", 0.15)),
             draft_name=str(draft_cfg["name"]),
             draft_args=dict(draft_cfg.get("args") or {}),
             T=int(run_cfg.get("T", 3)),
@@ -173,13 +183,34 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print("=" * 70)
 
     # ── load model + adapter ───────────────────────────────────────────
-    print(f"\nLoading {cfg.model_id} (single copy; target == draft) ...")
-    model, tokenizer = load_model(
-        cfg.model_id,
-        dtype=cfg.dtype,
-        device_map=cfg.device_map,
-        trust_remote_code=cfg.trust_remote_code,
-    )
+    # `moe` is the moe_infinity wrapper on the offload backend (None on hf);
+    # its `_configure_hook` must run before every generate — wired below as
+    # run_specbench's `before_generate`.
+    moe = None
+    cpu_source = None
+    if cfg.backend == "offload":
+        if not cfg.offload_path:
+            raise ValueError(
+                "config: model.offload.path is required for backend=offload")
+        print(f"\nLoading {cfg.model_id} via moe_infinity offload "
+              f"(device_memory_ratio={cfg.device_memory_ratio}) ...")
+        # cpu_source = host-resident weights for draft-side merging (M7).
+        # Merge runs on CPU and ships one expert to GPU (offload-safe for any
+        # merge draft); masked drafts (random_mask) never touch it.
+        model, tokenizer, moe, cpu_source = load_offload(
+            cfg.model_id, cfg.offload_path,
+            device_memory_ratio=cfg.device_memory_ratio,
+            dtype=cfg.dtype, trust_remote_code=cfg.trust_remote_code,
+            load_cpu_source=True,
+        )
+    else:
+        print(f"\nLoading {cfg.model_id} (single copy; target == draft) ...")
+        model, tokenizer = load_model(
+            cfg.model_id,
+            dtype=cfg.dtype,
+            device_map=cfg.device_map,
+            trust_remote_code=cfg.trust_remote_code,
+        )
     model.eval()
 
     if cfg.adapter_name is not None:
@@ -206,7 +237,7 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print(f"  Resolved   : draft={cfg.draft_name}{draft_args}")
 
     # ── run ───────────────────────────────────────────────────────────
-    controller = Controller(model, adapter, draft)
+    controller = Controller(model, adapter, draft, cpu_source=cpu_source)
 
     # One-time, model-derived precomputation (e.g. SpecMoE expert distances).
     draft.prepare(adapter, controller.blocks)
@@ -219,6 +250,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     controller.install()
     try:
         callbacks = specbench_callbacks(controller, on_cycle_extra=on_cycle_extra)
+        if moe is not None:
+            callbacks["before_generate"] = moe._configure_hook
         with shared_model_phase_patch(controller):
             result = run_specbench(
                 target_model=model,
@@ -312,6 +345,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
 
     # Release VRAM before returning (so callers can chain).
     free_model(model)
+    if cpu_source is not None:
+        free_model(cpu_source)
     gc.collect()
 
     return summary
@@ -362,6 +397,12 @@ def main(argv: Optional[list] = None) -> int:
             return 2
         cfg = RunConfig.from_yaml(args.config)
         run_experiment(cfg)
+        if cfg.backend == "offload":
+            # moe_infinity's C++ thread pool hangs on interpreter shutdown;
+            # force-exit after outputs are written (same as examples/*.py).
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         return 0
 
     parser.print_help()

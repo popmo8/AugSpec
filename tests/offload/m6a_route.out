@@ -1,0 +1,33 @@
+====================================================================
+M6a probe — route_offload 搬進 adapter 後重驗(Qwen3)
+====================================================================
+
+calling load_offload(...) ...
+
+[A1] _is_offload_block True;_route_offload == 原生 forward
+    max|ref - route_offload| : 6.641e-01
+[A1] FAIL
+    Traceback (most recent call last):
+      File "/work/morrisliu07/aug_spec/tests/offload/m6a_route.py", line 43, in run
+        fn(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/tests/offload/m6a_route.py", line 83, in a1_route
+        assert torch.equal(ref, mine) or d < 1e-2, f"差異 {d:.3e} 過大"
+    AssertionError: 差異 6.641e-01 過大
+
+[A2] 經 _standard_routing 分流(verify 用法)== 原生 forward
+    max|ref - standard_routing| : 1.422e+00
+[A2] FAIL
+    Traceback (most recent call last):
+      File "/work/morrisliu07/aug_spec/tests/offload/m6a_route.py", line 43, in run
+        fn(*args, **kwargs)
+      File "/work/morrisliu07/aug_spec/tests/offload/m6a_route.py", line 98, in a2_standard_routing
+        assert torch.equal(ref.view(seq_len, hidden), mine) or d < 1e-2, \
+    AssertionError: 分流後差異 1.422e+00 過大
+
+[A3] masked gate(只留一顆 expert)經 adapter 跑得動且有限非零
+    output : shape=(4, 2048) dtype=torch.bfloat16
+[A3] PASS
+
+====================================================================
+RESULT: 2 FAILED — A1, A2
+====================================================================

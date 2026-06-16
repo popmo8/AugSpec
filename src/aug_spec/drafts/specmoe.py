@@ -73,8 +73,11 @@ class SpecMoeDraft(DraftStrategy):
         if self._expert_dist:
             return
         for li, block in blocks:
+            # Offload: block.experts are placeholders — read real weights from
+            # the CPU source the controller attached (hf: src is block itself).
+            src = getattr(block, "_cpu_merge_source", block)
             self._expert_dist[li] = _pairwise_l2(
-                adapter.expert_flat_weights(block))
+                adapter.expert_flat_weights(src))
         first = next(iter(self._expert_dist.values()))
         self.num_experts = first.shape[0]
         if self.N > self.num_experts:

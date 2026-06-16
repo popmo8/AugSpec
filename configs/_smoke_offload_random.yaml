@@ -1,0 +1,36 @@
+# Qwen3 random-mask smoke on the OFFLOAD backend (M6b — first end-to-end).
+#
+# Exercises the whole new path: config backend dispatch → load_offload →
+# adapter offload routing (dispatch_local) → phase patch → specbench →
+# _configure_hook wiring. random_mask is chosen because it reads NO expert
+# weights (no cpu_source / no merge) — it tests the plumbing, nothing else.
+#
+# Pass = MAT / AccRate match _smoke_random (hf backend) within bf16 noise:
+# both backends should be equally (badly) random (~0.2). A big gap means the
+# offload verify path is computing something different.
+#
+# device_memory_ratio=0.75: M6b validates the pipeline, not the memory budget.
+# 0.75 isolates capacity as a variable; the strict 0.15x budget is M7+/M9.
+
+model:
+  id: Qwen/Qwen3-30B-A3B
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B
+    device_memory_ratio: 0.75
+
+draft:
+  name: random_mask
+  args:
+    seed: 42
+
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 32
+  warmup: false
+
+output:
+  label: _smoke_offload_random
+  dir: output/_smoke_offload_random

@@ -22,6 +22,21 @@ from .base import (
     _topk_substitute_forward,
 )
 
+# moe_infinity is an optional dependency: an hf-only environment must still
+# be able to import this adapter. When absent, _is_offload_block is always
+# False and only the hf expert-loop path runs.
+try:
+    from moe_infinity.models.qwen import Qwen3MoEBlock as _Qwen3OffloadBlock
+except ImportError:
+    _Qwen3OffloadBlock = None
+
+
+def _is_offload_block(block) -> bool:
+    """True when `block` is moe_infinity's offloaded Qwen3 MoE block, whose
+    experts are placeholders and must be routed through the archer engine's
+    `dispatch_local` rather than the hf expert loop."""
+    return _Qwen3OffloadBlock is not None and isinstance(block, _Qwen3OffloadBlock)
+
 
 class Qwen3MoeAdapter(MoEAdapter):
     name = "qwen3_moe"
@@ -43,19 +58,29 @@ class Qwen3MoeAdapter(MoEAdapter):
         return getattr(model.config, "num_experts_per_tok", 8)
 
     def build_weighted_avg(self, block, weights):
-        ref_g = block.experts[0].gate_proj.weight
-        ref_u = block.experts[0].up_proj.weight
-        ref_d = block.experts[0].down_proj.weight
+        # Offload backend: `block.experts` are placeholders, so merge from the
+        # CPU-resident source the controller attached, then move the result to
+        # GPU (M4's "(d) CPU merge" — fp32 accumulate on host, ship one expert).
+        # hf backend: src is block itself and _merge_device is None, so the
+        # accumulation runs on-GPU and nothing moves — behaviour unchanged.
+        src = getattr(block, "_cpu_merge_source", block)
+        merge_device = getattr(block, "_merge_device", None)
+
+        ref_g = src.experts[0].gate_proj.weight
+        ref_u = src.experts[0].up_proj.weight
+        ref_d = src.experts[0].down_proj.weight
         dtype = ref_g.dtype
 
         g_sum = torch.zeros_like(ref_g, dtype=torch.float32)
         u_sum = torch.zeros_like(ref_u, dtype=torch.float32)
         d_sum = torch.zeros_like(ref_d, dtype=torch.float32)
 
-        for e_idx, expert in enumerate(block.experts):
-            w = weights[e_idx]
+        # Iterate weights (not experts) so zero-weight experts cost nothing —
+        # on offload that skips touching the placeholder/source module entirely.
+        for e_idx, w in enumerate(weights):
             if w == 0.0:
                 continue
+            expert = src.experts[e_idx]
             g_sum.add_(expert.gate_proj.weight.float(), alpha=w)
             u_sum.add_(expert.up_proj.weight.float(), alpha=w)
             d_sum.add_(expert.down_proj.weight.float(), alpha=w)
@@ -66,6 +91,8 @@ class Qwen3MoeAdapter(MoEAdapter):
             "down_proj": d_sum.to(dtype),
         }
         del g_sum, u_sum, d_sum
+        if merge_device is not None:
+            out = {k: v.to(merge_device) for k, v in out.items()}
         return out
 
     def build_svd_basis(self, block, rank=256, store_dtype=torch.bfloat16):
@@ -98,8 +125,67 @@ class Qwen3MoeAdapter(MoEAdapter):
         hidden = F.silu(gate) * up
         return F.linear(hidden, avg["down_proj"])
 
+    def _route_offload(self, block, hs_flat, gate_logits):
+        """Offload-backend verify routing (replaces the hf expert loop —
+        offloaded experts are placeholders). Builds per-token
+        (num_tokens, num_experts) masks and hands them to the archer
+        engine's batched `dispatch_local`, which fetches each needed
+        expert on demand and returns the weighted-combined result.
+
+        The top-k softmax + `norm_topk_prob` renorm here reproduces
+        moe_infinity's fused `lib.topk_softmax` bit-for-bit (validated in
+        M3, offload_plan.md). Accepting `gate_logits` (rather than calling
+        the kernel) is what lets masked drafts feed -inf'd logits through —
+        the kernel is fixed top-k and won't take a mask.
+        """
+        routing_weights = F.softmax(gate_logits, dim=1, dtype=torch.float)
+        topk_w, topk_idx = torch.topk(routing_weights, block.top_k, dim=-1)
+        if getattr(block, "norm_topk_prob", True):
+            topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+        topk_w = topk_w.to(hs_flat.dtype)
+
+        num_tokens = gate_logits.shape[0]
+        router_mask = torch.zeros(
+            num_tokens, block.num_experts,
+            dtype=torch.bool, device=hs_flat.device)
+        router_mask.scatter_(1, topk_idx, True)
+        weights_mask = torch.zeros(
+            num_tokens, block.num_experts,
+            dtype=hs_flat.dtype, device=hs_flat.device)
+        weights_mask.scatter_add_(1, topk_idx, topk_w)
+
+        block.expert_executor.dispatch_local(
+            block.layer_id, hs_flat, router_mask, weights_mask)
+        out = block.expert_executor.wait_dispatch_local()
+        return out.to(hs_flat.dtype)   # wait returns fp32; match hf .to(dtype)
+
+    def _dispatch_selected(self, block, hs_flat, selected, weights):
+        """Offload expert execution from explicit per-token (selected, weights)
+        — used by the SpecMoE substitute forward, whose `selected` is remapped
+        (winner → L2-nearest kept expert) rather than the gate's top-k. Builds
+        the (num_tokens, num_experts) masks and dispatches; `scatter_add_` on
+        weights correctly sums the case where two winners remap to one expert
+        (matches the hf loop's index_add_). Returns (num_tokens, hidden)."""
+        num_tokens = selected.shape[0]
+        router_mask = torch.zeros(
+            num_tokens, block.num_experts,
+            dtype=torch.bool, device=hs_flat.device)
+        router_mask.scatter_(1, selected, True)
+        weights_mask = torch.zeros(
+            num_tokens, block.num_experts,
+            dtype=hs_flat.dtype, device=hs_flat.device)
+        weights_mask.scatter_add_(1, selected, weights.to(hs_flat.dtype))
+        block.expert_executor.dispatch_local(
+            block.layer_id, hs_flat, router_mask, weights_mask)
+        return block.expert_executor.wait_dispatch_local().to(hs_flat.dtype)
+
     def _standard_routing(self, block, hs_flat, gate_logits,
                           batch_size, sequence_length, hidden_dim):
+        if _is_offload_block(block):
+            out = self._route_offload(block, hs_flat, gate_logits)
+            return out.reshape(batch_size, sequence_length, hidden_dim)
+
+        # ── hf backend: per-expert loop (experts hold real weights) ──
         routing_weights = F.softmax(gate_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(
             routing_weights, block.top_k, dim=-1)

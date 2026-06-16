@@ -1,0 +1,28 @@
+# Comparison run #2 — SpecMoE N=16, offload backend.
+# First end-to-end of SpecMoE on offload (substitute forward via dispatch_local;
+# L2 distances precomputed from cpu_source). Acceptance should match
+# cmp_specmoe_N16_hf within bf16 noise. device_memory_ratio=0.75 (acceptance is
+# ratio-independent; 0.75 keeps the cache large so it runs faster).
+
+model:
+  id: Qwen/Qwen3-30B-A3B
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B
+    device_memory_ratio: 0.75
+
+draft:
+  name: specmoe
+  args:
+    N: 16
+    route_top_k: 8
+
+run:
+  T: 5
+  questions_per_cat: 5
+  max_new_tokens: 256
+
+output:
+  label: cmp_specmoe_N16_offload
+  dir: output/cmp_specmoe_N16_offload

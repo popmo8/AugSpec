@@ -1,0 +1,28 @@
+====================================================================
+M5 probe — load_offload()
+  model               : Qwen/Qwen3-30B-A3B
+  device_memory_ratio : 0.15
+====================================================================
+
+calling load_offload(...) ...
+
+[L1] 回傳形狀:(model, tokenizer, moe, cpu_source)
+    model type   : Qwen3MoeForCausalLM
+    cpu_source   : Qwen3MoeForCausalLM
+[L1] PASS
+
+[L2] device patch:model.device == cuda:0
+    model.device : cuda:0
+[L2] PASS
+
+[L3] model.generate 跑通(手動 _configure_hook,aug_spec 用法)
+    generated    : ' Paris. The capital of the United Kingdom is London. The capital of Germany is'
+[L3] PASS
+
+[L4] cpu_source expert 是真實權重(非 placeholder)
+    experts[0].gate_proj : shape=(768, 2048) dtype=torch.bfloat16 dev=cpu absmean=1.796e-02
+[L4] PASS
+
+====================================================================
+RESULT: ALL PASS
+====================================================================

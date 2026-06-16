@@ -34,7 +34,8 @@ class Controller:
 
     def __init__(self, model: nn.Module,
                  adapter: MoEAdapter,
-                 draft: DraftStrategy):
+                 draft: DraftStrategy,
+                 cpu_source: nn.Module = None):
         self.model = model
         self.adapter = adapter
         self.draft = draft
@@ -44,6 +45,18 @@ class Controller:
             raise RuntimeError(
                 f"No MoE layers found for adapter '{adapter.name}'.")
         self.num_moe_layers = len(self.blocks)
+
+        # Offload backend: the model's experts are placeholders, so draft-side
+        # merging must read weights from a CPU-resident copy. Attach each
+        # layer's CPU block + the target GPU onto the offload block; the
+        # adapter's build_weighted_avg picks them up (hf backend passes
+        # cpu_source=None and this is skipped).
+        if cpu_source is not None:
+            cpu_blocks = dict(adapter.iter_moe(cpu_source))
+            device = getattr(model, "device", None)
+            for li, block in self.blocks:
+                block._cpu_merge_source = cpu_blocks[li]
+                block._merge_device = device
 
         self.draft_cache: Dict[int, Any] = {}
         self.update_count: int = 0

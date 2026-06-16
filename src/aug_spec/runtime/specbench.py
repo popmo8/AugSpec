@@ -381,11 +381,17 @@ def run_specbench(
     lm_topk: int = LM_TOPK_DEFAULT,
     on_cycle: Optional[Callable[[QuestionResult, CycleStats], None]] = None,
     on_question_start: Optional[Callable[[Dict[str, Any]], None]] = None,
+    before_generate: Optional[Callable[[Any], None]] = None,
 ) -> SpecBenchResult:
     """Run SpecBench eval with a fixed-T speculative schedule.
 
     See module docstring for the full pipeline. Returns a `SpecBenchResult`
     with `per_question`, `per_subtask`, and `overall` aggregates.
+
+    `before_generate(input_ids)` (optional) runs immediately before every
+    `target_model.generate(...)` call (warmup + each question). The offload
+    backend wires `moe._configure_hook` here — moe_infinity needs fresh
+    expert-tracer sequence entries per generation. No-op (None) on hf.
     """
     target_model.generation_config.num_assistant_tokens = num_speculative
     target_model.generation_config.num_assistant_tokens_schedule = "constant"
@@ -438,7 +444,14 @@ def run_specbench(
             tokenizer, [], "Briefly introduce yourself.")
         warm_in = tokenizer(warm_prompt, return_tensors="pt").to(
             get_model_device(target_model))
-        with torch.inference_mode():
+        # no_grad (not inference_mode): the offload backend's dispatcher does an
+        # in-place index_add_ on hidden_states inside its C++ thread; under
+        # inference_mode those are "inference tensors" and the in-place update
+        # aborts. The main loop already runs generate under plain no_grad, so
+        # warmup must match. (hf is unaffected either way.)
+        with torch.no_grad():
+            if before_generate is not None:
+                before_generate(warm_in["input_ids"])
             target_model.generate(
                 **warm_in, max_new_tokens=8, do_sample=False,
                 assistant_model=draft_model,
@@ -483,6 +496,8 @@ def run_specbench(
             try:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+                if before_generate is not None:
+                    before_generate(inputs["input_ids"])
                 with _locked_assist_patch(
                     num_speculative, lm_topk, _on_verify,
                 ):
