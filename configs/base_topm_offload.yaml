@@ -1,0 +1,30 @@
+# 四方對比（Base 模型）#4 — top-M count M=32 K=16, offload backend, cpp_merge.
+# M9b GPU resident merge: merge_experts_local reads verify-resident experts at
+# zero PCIe (bit-exact with CPU merge, C2). Pairs with base_topm_hf for
+# acceptance, with base_specmoe_offload for the latency/TPS comparison.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    device_memory_ratio: 0.75
+    merge_offload: true
+
+draft:
+  name: topm_count
+  args:
+    M: 32
+    K: 16
+    draft_top_k: 8
+    use_svd_merge: false
+    record_history: false
+
+run:
+  T: 5
+  questions_per_cat: 3
+  max_new_tokens: 256
+
+output:
+  label: base_topm_offload
+  dir: output/base_topm_offload

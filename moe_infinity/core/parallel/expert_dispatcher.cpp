@@ -200,6 +200,87 @@ void ExpertDispatcher::RegisterExpert(
   }
 }
 
+std::vector<torch::Tensor> ExpertDispatcher::GetResidentExpertWeights(
+    int layer_idx, int expert_idx, int gpu_id) {
+  std::vector<torch::Tensor> out;
+  if (expert_idx < 0 || expert_idx >= static_cast<int>(experts_.size())) {
+    return out;
+  }
+  if (layer_idx < 0 ||
+      layer_idx >= static_cast<int>(experts_[expert_idx].size())) {
+    return out;
+  }
+  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+  auto expert_node = experts_[expert_idx][layer_idx];
+  if (expert_node == nullptr || expert_node->node == nullptr) {
+    return out;
+  }
+  // Only return weights when the expert is actually GPU-resident; a non-cuda
+  // device means it was evicted / never fetched -> report a miss (empty).
+  if (!expert_node->node->device.is_cuda()) {
+    return out;
+  }
+  for (auto tid : expert_node->node->tensor_ids) {
+    auto it = kTensorIndex->find(tid);
+    if (it == kTensorIndex->end() || !it->second.tensor.defined() ||
+        !it->second.tensor.device().is_cuda()) {
+      return {};  // partially resident -> treat as miss
+    }
+    out.push_back(it->second.tensor);
+  }
+  return out;
+}
+
+std::vector<torch::Tensor> ExpertDispatcher::MergeExpertsLocal(
+    int layer_idx, const std::vector<int>& expert_ids,
+    const std::vector<double>& weights, int gpu_id) {
+  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+  auto device = torch::Device(torch::kCUDA, gpu_id);
+  std::vector<torch::Tensor> acc;          // fp32 accumulators per weight matrix
+  c10::ScalarType out_dtype = torch::kBFloat16;
+  bool sized = false;
+
+  for (size_t k = 0; k < expert_ids.size(); ++k) {
+    int e = expert_ids[k];
+    double w = weights[k];
+    if (w == 0.0) continue;
+    if (e < 0 || e >= static_cast<int>(experts_.size())) continue;
+    if (layer_idx < 0 ||
+        layer_idx >= static_cast<int>(experts_[e].size())) {
+      continue;
+    }
+    auto expert_node = experts_[e][layer_idx];
+    if (expert_node == nullptr || expert_node->node == nullptr) continue;
+
+    auto& tids = expert_node->node->tensor_ids;
+    if (!sized) {
+      acc.resize(tids.size());
+      sized = true;
+    }
+    for (size_t i = 0; i < tids.size() && i < acc.size(); ++i) {
+      auto it = kTensorIndex->find(tids[i]);
+      if (it == kTensorIndex->end() || !it->second.tensor.defined()) continue;
+      torch::Tensor t = it->second.tensor;
+      // Resident -> read in place (zero PCIe). Cold -> transient host->GPU copy
+      // that is freed when `tg` leaves scope; the cache is never touched.
+      torch::Tensor tg = t.device().is_cuda() ? t : t.to(device);
+      if (!acc[i].defined()) {
+        acc[i] = torch::zeros(
+            tg.sizes(),
+            torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        out_dtype = t.scalar_type();
+      }
+      acc[i].add_(tg.to(torch::kFloat32), w);
+    }
+  }
+
+  std::vector<torch::Tensor> out;
+  for (auto& a : acc) {
+    if (a.defined()) out.push_back(a.to(out_dtype));
+  }
+  return out;
+}
+
 void ExpertDispatcher::NotifyFetchStart() {
   for (int i = 0; i < kNumDevices(); ++i) {
     // std::unique_lock<std::mutex> lock(input_mutex_[i]);
@@ -315,9 +396,21 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
               gpu_id, " cache size ", cache_sizes_[gpu_id], " incache count ",
               cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
               " expert_idx ", expert_idx);
+        }
+        // aug_spec deadlock fix: FindExpertEvict above is lock-free, so a
+        // GPUExecFunc->OutputFunc notify_all (which frees an expert) can fire
+        // between the null-check and a plain cache_cv_.wait(lock) -> lost
+        // wakeup -> the fetch thread blocks forever (observed: SpecMoE offload
+        // hangs mid-run under heavy draft-dispatch cache churn). Use a *timed*
+        // wait in a retry loop instead: every 2 ms we re-poll FindExpertEvict,
+        // so even a missed notify cannot hang -- an expert becomes evictable as
+        // soon as any in-flight exec finishes and unlocks its node->mutex. The
+        // loop also replaces the old single-retry that could fall through with
+        // a null node into the DLOG_FATAL below.
+        while (evict_expert_node == nullptr) {
           {
             std::unique_lock<std::mutex> lock(cache_mutex_[gpu_id]);
-            cache_cv_[gpu_id].wait(lock);
+            cache_cv_[gpu_id].wait_for(lock, std::chrono::milliseconds(2));
           }
           evict_expert_node = FindExpertEvict(gpu_id);
         }

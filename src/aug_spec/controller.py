@@ -35,7 +35,8 @@ class Controller:
     def __init__(self, model: nn.Module,
                  adapter: MoEAdapter,
                  draft: DraftStrategy,
-                 cpu_source: nn.Module = None):
+                 cpu_source: nn.Module = None,
+                 merge_offload: bool = False):
         self.model = model
         self.adapter = adapter
         self.draft = draft
@@ -57,6 +58,19 @@ class Controller:
             for li, block in self.blocks:
                 block._cpu_merge_source = cpu_blocks[li]
                 block._merge_device = device
+                # M9b: when enabled, build_weighted_avg merges GPU-resident
+                # experts via the archer dispatcher (zero PCIe for the experts
+                # verify just fetched) instead of CPU-merging cpu_source.
+                block._merge_offload = merge_offload
+
+        # Offload-merge engine: the isolated home for offload-merge
+        # optimisations (merge↔PCIe overlap, post-draft flush, ...). Built only
+        # for merge_offload runs; None everywhere else so shared hooks no-op.
+        self.merge_engine = None
+        if merge_offload and cpu_source is not None:
+            from aug_spec.runtime.offload_merge import OffloadMergeEngine
+            self.merge_engine = OffloadMergeEngine(adapter, model)
+            self.merge_engine.attach(self.blocks)
 
         self.draft_cache: Dict[int, Any] = {}
         self.update_count: int = 0

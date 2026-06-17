@@ -1,0 +1,15 @@
+======================================================================
+C2 — merge_experts_local vs CPU merge
+======================================================================
+  L47 resident 數: 29
+  L0 resident 數: 44（cold 測試用 non-resident）
+  resident merge: L47 experts=[11, 15]
+  [resident] gate_proj: exact=True match_frac=1.0000 max_abs_diff=0.00000 allclose=True
+  [resident] up_proj: exact=True match_frac=1.0000 max_abs_diff=0.00000 allclose=True
+  [resident] down_proj: exact=True match_frac=1.0000 max_abs_diff=0.00000 allclose=True
+  cold merge: L0 experts=[1, 2]
+  [cold] gate_proj: exact=True match_frac=1.0000 max_abs_diff=0.00000 allclose=True
+  [cold] up_proj: exact=True match_frac=1.0000 max_abs_diff=0.00000 allclose=True
+  [cold] down_proj: exact=True match_frac=1.0000 max_abs_diff=0.00000 allclose=True
+
+RESULT: PASS

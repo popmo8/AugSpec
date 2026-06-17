@@ -9,7 +9,14 @@
 #include "utils/logger.h"
 #include "kernel/fused_moe_mlp.h"
 
-static const int64_t kMaxTokens = 128;
+// Max tokens routed to one expert in a single MoEMLP::forward. Caps the
+// input/output staging buffers below; the CUTLASS GEMM in launch_fused_moe_ffn
+// is M-dynamic, so this is purely a staging-buffer size + guard, not a kernel
+// correctness bound. Raised 128 -> 2048 for aug_spec/M9b: a better draft
+// (cpp_merge) lets HF assisted generation ramp num_assistant_tokens past 128,
+// so the verify forward's per-expert batch can exceed the old cap (observed
+// 170). Buffer cost ~25 MB/module, negligible vs the expert cache.
+static const int64_t kMaxTokens = 2048;
 
 /*
 SwitchTransformersDenseActDense::SwitchTransformersDenseActDense(int dtype) {

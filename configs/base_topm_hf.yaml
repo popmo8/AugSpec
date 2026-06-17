@@ -1,0 +1,24 @@
+# 四方對比（Base 模型）#3 — top-M count M=32 K=16, hf backend.
+# model = Qwen3-30B-A3B-Base, qpc=3, max_new_tokens=256.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: topm_count
+  args:
+    M: 32
+    K: 16
+    draft_top_k: 8
+    use_svd_merge: false
+    record_history: false
+
+run:
+  T: 5
+  questions_per_cat: 3
+  max_new_tokens: 256
+
+output:
+  label: base_topm_hf
+  dir: output/base_topm_hf

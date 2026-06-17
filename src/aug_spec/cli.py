@@ -85,6 +85,8 @@ class RunConfig:
     backend: str                         # "hf" (default) | "offload"
     offload_path: Optional[str]          # offload backend: expert dir
     device_memory_ratio: float           # offload backend: expert cache cap
+    merge_offload: bool                  # offload: GPU resident-merge + opts
+                                         # via archer dispatcher (M9b)
 
     # draft
     draft_name: str
@@ -148,6 +150,9 @@ class RunConfig:
                           if offload_cfg.get("path") else None),
             device_memory_ratio=float(
                 offload_cfg.get("device_memory_ratio", 0.15)),
+            merge_offload=bool(
+                offload_cfg.get("merge_offload",
+                                offload_cfg.get("cpp_merge", False))),
             draft_name=str(draft_cfg["name"]),
             draft_args=dict(draft_cfg.get("args") or {}),
             T=int(run_cfg.get("T", 3)),
@@ -237,7 +242,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print(f"  Resolved   : draft={cfg.draft_name}{draft_args}")
 
     # ── run ───────────────────────────────────────────────────────────
-    controller = Controller(model, adapter, draft, cpu_source=cpu_source)
+    controller = Controller(model, adapter, draft, cpu_source=cpu_source,
+                            merge_offload=cfg.merge_offload)
 
     # One-time, model-derived precomputation (e.g. SpecMoE expert distances).
     draft.prepare(adapter, controller.blocks)

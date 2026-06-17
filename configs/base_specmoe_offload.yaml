@@ -1,0 +1,25 @@
+# 四方對比（Base 模型）#2 — SpecMoE N=16, offload backend.
+# Pairs with base_specmoe_hf (acceptance should match within bf16 noise).
+# device_memory_ratio=0.75 (acceptance ratio-independent; large cache = faster).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    device_memory_ratio: 0.75
+
+draft:
+  name: specmoe
+  args:
+    N: 16
+    route_top_k: 8
+
+run:
+  T: 5
+  questions_per_cat: 3
+  max_new_tokens: 256
+
+output:
+  label: base_specmoe_offload
+  dir: output/base_specmoe_offload

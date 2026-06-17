@@ -1,0 +1,28 @@
+# Smoke — 驗證 OffloadMergeEngine 重構後 merge_offload 路徑端到端可跑（byte-identical
+# 預期）。極小設定：qpc=1, max_new_tokens=32。topm + merge_offload on Base offload.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    device_memory_ratio: 0.75
+    merge_offload: true
+
+draft:
+  name: topm_count
+  args:
+    M: 32
+    K: 16
+    draft_top_k: 8
+    use_svd_merge: false
+    record_history: false
+
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 32
+
+output:
+  label: smoke_merge_offload
+  dir: output/smoke_merge_offload

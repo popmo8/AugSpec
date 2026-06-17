@@ -84,6 +84,29 @@ class ExpertDispatcher : public base::noncopyable {
   std::vector<CallResult> WaitExpert() { return Wait(); }
   torch::Tensor WaitHiddenStates();
 
+  // aug_spec / M9b: read-only access to an expert's GPU-resident weight
+  // tensors (the ones a recent verify fetched). Returns the weight tensors
+  // (gate_proj, up_proj, down_proj order for Qwen3) only when the expert is
+  // currently resident on `gpu_id`; returns an empty vector otherwise so the
+  // Python caller can detect a miss. Must be called in a dispatch-quiescent
+  // window (between wait_expert and the next dispatch) — the background fetch
+  // thread is then idle on an empty input queue, so no eviction races.
+  std::vector<torch::Tensor> GetResidentExpertWeights(int layer_idx,
+                                                      int expert_idx,
+                                                      int gpu_id);
+
+  // aug_spec / M9b: weighted merge of `expert_ids` (with `weights`) on layer
+  // `layer_idx` into a single dense expert, returned as {gate_proj, up_proj,
+  // down_proj} GPU tensors in the model weight dtype, fp32-accumulated.
+  // GPU-resident sources (a recent verify fetched them) are read in place with
+  // zero PCIe; non-resident sources are copied host->GPU transiently just for
+  // this merge and freed on return — the dispatcher cache is never mutated, so
+  // no eviction bookkeeping / races. Accumulation order follows `expert_ids`
+  // (caller passes ascending nonzero indices to mirror the CPU-merge order).
+  std::vector<torch::Tensor> MergeExpertsLocal(
+      int layer_idx, const std::vector<int>& expert_ids,
+      const std::vector<double>& weights, int gpu_id);
+
  private:
   void Enqueue(CallArgs& args);
   std::vector<CallResult> Wait();

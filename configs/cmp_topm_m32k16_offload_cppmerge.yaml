@@ -1,0 +1,34 @@
+# M9b — top-M count M=32 K=16, offload backend, GPU resident merge (cpp_merge).
+# Identical to cmp_topm_m32k16_offload except merge runs on-GPU through the
+# archer dispatcher (merge_experts_local): experts a recent verify left
+# resident cost zero PCIe; the CPU-merge per-cycle cost (M9a: ~1554 ms M=32)
+# is removed from the critical path. A/B partner = cmp_topm_m32k16_offload
+# (CPU merge). Acceptance must stay bit-identical (merge is bit-exact, C2);
+# the win is TPS.
+
+model:
+  id: Qwen/Qwen3-30B-A3B
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B
+    device_memory_ratio: 0.75
+    merge_offload: true
+
+draft:
+  name: topm_count
+  args:
+    M: 32
+    K: 16
+    draft_top_k: 8
+    use_svd_merge: false
+    record_history: false
+
+run:
+  T: 5
+  questions_per_cat: 5
+  max_new_tokens: 256
+
+output:
+  label: cmp_topm_m32k16_offload_cppmerge
+  dir: output/cmp_topm_m32k16_offload_cppmerge

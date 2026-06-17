@@ -58,6 +58,20 @@ class Qwen3MoeAdapter(MoEAdapter):
         return getattr(model.config, "num_experts_per_tok", 8)
 
     def build_weighted_avg(self, block, weights):
+        # M9b GPU merge: merge the experts directly on GPU through the archer
+        # dispatcher. Sources a recent verify left resident cost zero PCIe; any
+        # non-resident source is copied host->GPU transiently inside the engine
+        # (the dispatcher cache is untouched). Bit-exact with the CPU path (C2),
+        # so the M7 precision baseline still holds.
+        if getattr(block, "_merge_offload", False) and hasattr(block, "expert_executor"):
+            nz_idx = [i for i, w in enumerate(weights) if w != 0.0]
+            if nz_idx:  # empty would crash the C++ side; CPU path handles it
+                nz_w = [float(weights[i]) for i in nz_idx]
+                out = block.expert_executor.expert_dispatcher.merge_experts_local(
+                    block.layer_id, nz_idx, nz_w, 0)
+                return {"gate_proj": out[0], "up_proj": out[1],
+                        "down_proj": out[2]}
+
         # Offload backend: `block.experts` are placeholders, so merge from the
         # CPU-resident source the controller attached, then move the result to
         # GPU (M4's "(d) CPU merge" — fp32 accumulate on host, ship one expert).
@@ -157,6 +171,14 @@ class Qwen3MoeAdapter(MoEAdapter):
         block.expert_executor.dispatch_local(
             block.layer_id, hs_flat, router_mask, weights_mask)
         out = block.expert_executor.wait_dispatch_local()
+
+        # This layer's experts are now GPU-resident (post-dispatch, pre-evict):
+        # the offload-merge engine's window to merge-while-resident / overlap
+        # with the next layer's fetch. No-op unless merge_offload built one.
+        engine = getattr(block, "_merge_engine", None)
+        if engine is not None:
+            engine.on_verify_layer(block.layer_id, block)
+
         return out.to(hs_flat.dtype)   # wait returns fp32; match hf .to(dtype)
 
     def _dispatch_selected(self, block, hs_flat, selected, weights):

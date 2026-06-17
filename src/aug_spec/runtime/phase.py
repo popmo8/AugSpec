@@ -50,6 +50,12 @@ def shared_model_phase_patch(controller: Any):
             return orig_get(self, input_ids)
         finally:
             controller.in_draft_phase = False
+            # draft→verify transition: offload-merge engine may flush the
+            # merged experts here to reclaim workspace for verify (§1.4).
+            # No-op unless merge_offload built an engine.
+            engine = getattr(controller, "merge_engine", None)
+            if engine is not None:
+                engine.on_draft_end()
 
     AssistedCandidateGenerator.get_candidates = patched_get
     try:

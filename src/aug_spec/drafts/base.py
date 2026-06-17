@@ -249,6 +249,13 @@ class ScoreBasedAvgDraft(DraftStrategy):
         """
         if basis is not None:
             return adapter.build_svd_from_basis(basis, weights)
+        # Offload-merge engine owns the merge when merge_offload built one
+        # (tagged onto the block by the controller); otherwise the plain
+        # adapter merge. Shell: engine.build delegates to build_weighted_avg,
+        # so this is behaviour-preserving.
+        engine = getattr(block, "_merge_engine", None)
+        if engine is not None:
+            return engine.build(block, weights)
         return adapter.build_weighted_avg(block, weights)
 
     def _cluster_and_build(self, adapter, block, weights: List[float],
