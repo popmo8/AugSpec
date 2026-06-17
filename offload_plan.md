@@ -81,59 +81,92 @@ config 註解寫出換算式。archer 不走 torch allocator（C++ `DeviceMemory
 driver 層峰值稽核（M9），驗收 peak ≤ 0.2x + 工作區。KV cache / activations 排除在外
 （兩邊同 target 同 T，入帳只稀釋訊號）。
 
-### 1.3 merge 實作與成本（Qwen3 主線 = CPU merge）
+### 1.3 merge 實作與成本（裁決 = GPU merge，piggyback on verify）
 
 **精度基準**：offload merge 必須與 hf backend 的
 [`build_weighted_avg`](src/aug_spec/adapters/mixtral.py#L40)（fp32 累加、最後捨入
 一次到 bf16）**逐位元相同**，否則 M7「±0.1 對 hf backend」驗收會混進無法歸因的差異。
 
-**裁決 = CPU merge**（host fp32 合完、只把結果搬 GPU）。成本以 K、r 表示：CPU merge
-每 cycle 上傳 **K 顆/層** = K·expert_size·L；GPU merge 要拉全部 **E 顆來源** =
-E·expert_size·L → **CPU/GPU PCIe 比 = K/E = 1/r**（r=8 → CPU 只搬 1/8）。贏的原理：
-merge 是 memory-bound、瓶頸在 PCIe，CPU 在 DDR 內讀來源、只讓結果過 PCIe。M4（job
-234890）實測 merge primitive（Qwen3、16 來源→1 顆）逐位元對齊 reference、13.6 ms、
-上傳 9.4 MB，CPU 完勝。**⚠ production K=16 的 per-cycle 數字尚未實測**（上傳
-K·expert_size·L = 7.25 GB、full re-merge 要讀全 E 顆）—— M7 跑的是 count（K=1），
-轉 K=16 需重測 acceptance + timing。**⚠ Mixtral 不外推**（expert 352 MB、CPU 合受
-記憶體頻寬限制）→ 最優留到亂碼 side-quest 修好後另測（§1 待決）。
+**裁決翻轉（M9a v2，job 239173 實測，M=2 / Qwen3）**：原本裁 CPU merge，前提是
+「GPU merge 要自己把全部 E 顆來源拉過 PCIe（E·expert_size·L），CPU 只搬 K 顆結果 →
+PCIe 比 K/E = 1/r」。**這個前提是錯的**：verify 階段 target 走 on-demand routing，本來
+就會把 active experts fetch 上 GPU。要 merge 的來源在「剛 verify 完那一刻」是
+hot-resident 的 → **GPU merge 的邊際 PCIe = 0 bytes**（白嫖 verify 自己付費的搬運），
+只剩純 GPU 計算。前提失效 → 結論翻面 → **走 GPU merge**。
 
-**latency：merge 計算可藏在 verify 底下，但上傳量隨 K 變重**。CPU merge 的重活（讀
-E 顆來源、加權求和）在 CPU + DDR，與 GPU verify 的計算 + PCIe fetch **資源正交** →
-結構上可重疊（逐層 pipeline，counts 變化慢、甚至能用上個 cycle 的）。critical path
-只剩 **K 顆上傳**：K=1 時 0.45 GB/cycle 可忽略，**K=16 時 7.25 GB/cycle（仍是 GPU-merge
-的 1/r，但已非可忽略、與 verify fetch 同搶 PCIe）**。壓 per-cycle 成本主要靠 **refresh
-節流**（每 k cycle 才 merge、成本 ÷k；counts 變化慢）；full re-merge 是否塞得進 verify
-牆鐘由 M8 量。（舊「重疊救不了 topm」是 GPU-merge 前提：merge 本身即 PCIe 流量、與
-verify fetch 搶同條；CPU merge 把 compute 移走、只剩 1/r 上傳，前提失效。）
+實測五個基礎數字（median，n_tokens=5）:
+
+| 量 | 數字 | 意義 |
+|---|---|---|
+| `T_expert_fwd` | 0.069 ms | 單顆 expert dense forward（GPU） |
+| `T_layer_fwd` | 8.12 ms | 整個 MoE block forward（gate+dispatch+8 verify expert，**不含 attention**） |
+| `T_cpu_merge` | 2.21 ms | CPU merge 2→1（host 累加、結果留 CPU） |
+| `T_gpu_merge` | 0.12 ms | GPU merge 2→1（來源已在 GPU、不含 PCIe） |
+| `T_pcie` | 0.753 ms | 單顆 expert H2D（9.4 MB → 12.5 GB/s） |
+
+三條路線 per merged-expert（M=2）成本對比:
+
+| 路線 | PCIe | merge | 合計 |
+|---|---|---|---|
+| **GPU merge（來源已 verify-resident）** | **0** | 0.12 | **0.12 ms** |
+| GPU merge（來源要冷搬） | 2×0.753 | 0.12 | 1.63 ms |
+| CPU merge | 0.753（搬結果） | 2.21 | 2.96 ms |
+
+GPU merge 即使在冷搬情況都贏 CPU merge（1.63 < 2.96）；在真實的 verify-resident 情況
+更是 **0.12 ms、零邊際 PCIe**。
+
+**latency：merge 完全免費（piggyback on verify）**。GPU-merge 用的是兩樣免費資源：
+(i) verify 已付費搬上來、尚未 evict 的 expert（**零額外 PCIe bytes**），(ii) verify 是
+PCIe-bound、GPU ~90% 閒置（見 §1.4），merge 的 GPU 計算（topm k16 = 16×0.12 ≈ 1.92 ms/層）
+藏進那塊閒置裡。→ **draft 建構的邊際牆鐘 ≈ 0**。實作關鍵：要在 archer evict 前抓到
+resident 權重（M9b 的核心難點）。**⚠ Mixtral 不外推**（expert 352 MB、GPU 合也吃頻寬）
+→ 最優留到亂碼 side-quest 修好後另測（§1 待決）。
 
 ### 1.4 verify 階段的記憶體回收（phase-exclusive memory）
 
 **觀察**：merged expert 在 verify 階段是死的（verify 走真 expert routing、不碰
 merged）→ draft 一結束即可整批 flush，釋出整包 draft residency = K·expert_size·L
 （Qwen3 K=16 → **7.25 GB**）的**預算內**空間，整個 verify 都能用。peak 不變、不違反
-0.2x —— 這塊大到足以在 verify 期間當大型 expert cache / prefetch buffer。
+0.2x —— 這塊大到足以在 verify 期間當大型 expert 工作區 / double-buffer（用途見下）。
 
-**對 SpecMoE 的結構性不對稱（賣點）**：我們常駐物在 draft / verify 的「有用占用者」
-會翻面，而兩階段時間互斥 → 同一塊預算服務兩用途；SpecMoE 的 pinned expert 在 verify
-當 cache、兩階段都有用，無法回收。
+**對 SpecMoE 的結構性不對稱（賣點 1：VRAM）**：我們常駐物在 draft / verify 的「有用
+占用者」會翻面，而兩階段時間互斥 → 同一塊預算服務兩用途；SpecMoE 的 pinned expert 在
+verify 當 cache、兩階段都有用，無法回收。
 
 | | draft 佔用 | verify 那塊 slot |
 |---|---|---|
 | Ours | merged expert（有用）| 死的 → **可回收** |
 | SpecMoE | pinned experts | 當 cache（有用）→ 不可回收 |
 
-**拿回收空間做 prefetch buffer（時間收益待量、不預設）**：本 fork 把 moe_infinity 的
-tracer 預測式 prefetch 註解掉了（[mixtral.py:71-86](moe_infinity/moe_infinity/models/mixtral.py#L71)）、現為純 on-demand。用釋出空間當 buffer 重啟
-預測式 prefetch、填 verify 的串行氣泡。但收益被兩件事 gate：
-- verify 若是 PCIe-bandwidth-bound（§1.3：系統瓶頸在 PCIe），預抓只重排、搬不掉
-  同量位元組 → 省的僅限氣泡（≈ 每層 attention+gate compute，已被背景 thread 遮一部分），
-  有閒置 PCIe 才有肉。**目前無 verify PCIe 利用率數據 → 由 M9 profile 後才能定主打。**
-- 下一層 routing 在當層算完前未知 → 無法預抓「正確那幾顆」，只能預測（tracer，或拿
-  draft 階段 merged-expert hidden states 跑 gate 當預測訊號）。抓全部 E=128 顆（實際
-  只 route 到一小撮）= 流量爆數倍（7.25 GB 空間塞得下，純 bandwidth 浪費），排除。
+**回收空間的真正用途 = 保持 PCIe 不 stall（賣點 2：verify 牆鐘也贏）**。先把
+prefetch 想清楚：M9a v2 顯示 verify 是**硬 PCIe-bound**（每層 ~120 active expert ×
+0.753 ms ≈ 90 ms PCIe vs T_layer_fwd 8.12 ms GPU，PCIe 是 GPU 的 ~9 倍）。在這個
+regime 下：
 
-**結論**：記憶體不對稱是乾淨賣點（免費、預算內、可寫進論文）；prefetch 的時間收益
-不預設，待 M9 量 verify PCIe 利用率再決定要不要做、做哪種預測。
+- **預測式 prefetch 不是 latency 賣點**：PCIe 已 100% 滿載、無閒置可榨；預抓只重排、
+  搬不掉同量 bytes。牆鐘下限 = Σ(active expert bytes) ÷ 頻寬，動不了。最多藏掉 GPU
+  compute 泡泡 ≈ 10%/層（且要正確預測下一層 routing，當層算完前未知）。→ **prefetch
+  降級為非主打**。
+
+- **buffer headroom 才是賣點**：把它當「大 double-buffer 工作區」，不是當預測 cache。
+  producer-consumer 模型——PCIe 是 producer（90 ms/層）、GPU 是 consumer（10 ms/層）、
+  expert slot 是 buffer：
+  - **SpecMoE**：每層僅 16 顆 expert 空間（§1.2 帳下其 pinned 預算）。slot 滿了 → 必須
+    **等 GPU 算完、消費掉、騰出 slot** 才能 fetch 下一批 → fetch→compute 序列化，
+    compute 期間 **PCIe stall（閒置）** → 有效頻寬 < peak → 牆鐘 = PCIe_total + GPU_total。
+  - **Ours**：draft flush 後的 7.25 GB + 預算內 headroom 給足 slot → GPU 在算已搬好的
+    expert 時 PCIe 同時灌下一批，**不必等 GPU 算完** → PCIe 永遠滿載 → 牆鐘 =
+    PCIe_total（byte floor），GPU compute 全藏進 PCIe 陰影。
+  - 牆的**高度**一樣（總 bytes），但 SpecMoE 撞不到底（buffer 太小逼 stall）、我們撞得到
+    底。幅度上限 ≈ GPU compute 佔比（~10%/層），實際數字 M9a/M9b 量。
+
+**本 fork 已把 tracer 預測式 prefetch 註解掉**（[mixtral.py:71-86](moe_infinity/moe_infinity/models/mixtral.py#L71)）、現為純 on-demand；
+M9b 不重啟預測式 prefetch，而是把回收空間用於**加大 archer 工作區 / double-buffer
+streaming**，目標是讓 PCIe 不 stall（上面的賣點 2）。
+
+**結論**：記憶體不對稱是兩個賣點——(1) VRAM 免費、預算內、可寫進論文；(2) 同樣的
+bytes 我們把 PCIe 餵得更滿、verify 牆鐘低於 SpecMoE。**真正的大頭仍是 §1.3 的「draft
+建構歸零」**（見下方 M9b 的 TPS 反轉動機）。
 
 ---
 
@@ -309,12 +342,13 @@ top-k softmax + `norm_topk_prob` renorm 與 C++ kernel **逐位元相同**
 
 #### M4 — CPU-source merge 原型：三變體計時 + 精度比對 ✅ 全綠（job 234890）
 
-三變體（(a)/(c)/(d)）全逐位元對齊 reference，**Qwen3 主線
-裁決 = (d) CPU merge**（四項指標全勝，數字見 §1.3）。對 M7 是大簡化：
-(d) 本質就是「現有 `build_weighted_avg(cpu_block)` + `.to(cuda)`」，
-M4 已證逐位元正確，**幾乎不用寫新 merge 程式碼**。一個小優化記下：
-現有 `build_weighted_avg` 迭代全 128 顆 expert（跳過零權重），offload
-版應只迭代 nonzero（M7 接入時改）。
+三變體（(a)/(c)/(d)）全逐位元對齊 reference。M4 當時裁 (d) CPU merge，
+**但該裁決已被 M9a（job 239173）推翻 → 改 GPU merge（§1.3 已更新）**：
+M4 的前提是「GPU merge 要自己拉全 E 顆來源過 PCIe」，M9a 指出 verify 本來就
+fetch 上來了 → GPU merge 零邊際 PCIe、0.12 ms 完勝。M4 的 (d) 程式碼
+（`build_weighted_avg(cpu_block) + .to(cuda)`）保留為 GPU-merge 拿不到 archer
+resident handle 時的退路（§1.3 冷搬列 / M9b 風險）。一個小優化仍成立：
+現有 `build_weighted_avg` 迭代全 128 顆 expert（跳過零權重），應只迭代 nonzero。
 
 - **做**：`tests/offload/m4_merge.py` ——
   `cpu_source = AutoModelForCausalLM.from_pretrained(..., device_map="cpu")`
@@ -458,61 +492,69 @@ offload acceptance 表)。
 | # | 內容 | 驗收 |
 |---|---|---|
 | M8 | `drafts/none.py` + `aug_spec bench` 子命令（純 generate 迴圈） | `bench` 在 hf 與 offload 都跑得動、報 tokens/sec |
-| M9a | **三資源時間線 profiling**（GPU inference / CPU merge / PCIe 的 busy/idle/overlap）+ 0.2x 預算稽核（NVML peak）；評估能否做成 §1.3/§1.4 的量化分析 | 三資源 busy/idle/overlap 有數字；§1.3「CPU merge 藏在 verify 底下」、§1.4「verify PCIe 閒置率」可定量；peak ≤ 0.2x（詳見下方 M9a） |
-| M9b | 據 M9a 把 **CPU/GPU 平行化**（背景 thread 預合下一 cycle merge）+ **expert prefetch**（回收的 7.25 GB 當 buffer）寫進程式碼 | overlap 後 end-to-end throughput 提升、prefetch 填 verify 氣泡（詳見下方 M9b） |
+| M9a | **五基礎時間量測**（expert/layer forward、cpu/gpu merge、單顆 PCIe）✅ job 239173；據此翻轉 §1.3 裁決（→ GPU merge）+ 0.2x 預算稽核（NVML peak） | 五數字到手、§1.3 改 GPU-merge、§1.4 改 buffer-saturation、peak ≤ 0.2x（詳見下方 M9a） |
+| M9b | 把 **GPU-merge-during-verify**（在 archer evict 前抓 resident 權重就地合）+ **PCIe 不 stall 的 double-buffer 工作區** 寫進程式碼；目標 = draft 建構成本歸零、topm 接受率優勢反映到 TPS | GPU-merge 路徑跑通、draft 建構從 ~1554 ms（CPU merge）降到藏進 verify GPU 閒置、topm offload TPS 反超 SpecMoE（詳見下方 M9b） |
 | M10 | `cache_policy`（ondemand/caching）、specmoe 的 `replace_cache_candidates` hook（§1.2 帳下 SpecMoE = N=1）、`configs/baselines/` 等量產 configs；topm 的 **refresh 節流 ablation**（每 k cycle 才 merge，§1.3） | 四方對比表（OnDemand / Caching / SpecMoE / Ours）跑完，數字進 PROGRESS.md |
 
-#### M9a — 三資源時間線 profiling + 量化評估
+#### M9a — 五基礎時間量測（✅ job 239173）
 
-§1.3 主張「CPU merge 與 GPU verify 資源正交、可重疊」、§1.4 主張「verify 階段
-7.25 GB 可回收當 prefetch buffer」——兩者的**時間收益都標『待量』**。M9a 把這兩個
-口頭主張變成數字,並評估能否寫成 §1.3/§1.4 那樣的量化分析（roofline-style,可進論文）。
+原規劃想量「三資源 busy/idle/overlap」,但現狀同步、overlap=0,量 overlap 無意義。
+改量**五個基礎單位成本**（[m9a_profile.py](tests/offload/m9a_profile.py)）,用來推導 §1.3/§1.4 的裁決:
 
-**三個要 profile 的資源**（一個 spec-decoding cycle 內）:
-
-| 資源 | 在做什麼 | 量法 |
+| 量 | 數字（M=2） | 量法 |
 |---|---|---|
-| **GPU inference** | draft 的 dense merged-expert forward + verify 的 `dispatch_local` | `torch.cuda.Event` 夾 draft / verify 段 |
-| **CPU expert merging** | `build_weighted_avg(cpu_source)`（refresh 觸發） | `time.perf_counter` 夾 refresh |
-| **PCIe** | merged expert H2D 上傳 + verify 的 archer expert fetch（+ 未來 prefetch） | NVML `pcie.tx/rx` 取樣 + archer fetch 計時 |
+| `T_expert_fwd` 單顆 expert forward | 0.069 ms | `_run_dense_expert` × n_iter median |
+| `T_layer_fwd` MoE block forward | 8.12 ms | hook 夾 `mlp` pre/post,full forward |
+| `T_cpu_merge` CPU merge 2→1 | 2.21 ms | `build_weighted_avg(cpu_block)`,結果留 CPU |
+| `T_gpu_merge` GPU merge 2→1 | 0.12 ms | 來源預上傳 GPU,GPU 累加（不計 PCIe） |
+| `T_pcie` 單顆 expert H2D | 0.753 ms | `.to(cuda)` × 3 矩陣（9.4 MB → 12.5 GB/s） |
 
-**做**:給每個運算打 start/end 時間戳,在 ~10 個 cycle 內收集,算出每資源的 **busy /
-idle 時間**與**兩兩 overlap**。關鍵兩個比值:
-1. **CPU merge busy / GPU verify busy** —— < 1 表示 CPU merge 能完全藏在 verify 底下
-   （§1.3 主張成立的量化條件）。
-2. **verify 期間 PCIe idle 比例** —— 有閒置才值得 prefetch（§1.4 的「有閒置 PCIe 才有肉」
-   的直接答案）。
+**三個推論**（已寫進 §1.3 / §1.4）:
 
-**評估產出**:一張像 §1.3/§1.4 的時間線分解表 + 結論「(a) CPU merge 可藏多少 %、
-(b) verify PCIe 閒置率多少 → M9b 該做哪些重疊、prefetch 值不值得」。順帶吃掉原 M9 的
-0.2x 預算稽核（NVML driver peak 進 summary,所有系統 ≤ 0.2x + 工作區）。
+1. **§1.3 翻轉 → GPU merge**:GPU merge（0.12 ms,來源 verify-resident、零邊際 PCIe）
+   完勝 CPU merge（2.96 ms）。原 CPU-merge 裁決的前提「GPU merge 要拉全 E 顆」被
+   「verify 本來就 fetch 上來了」推翻。
+2. **§1.4 verify 是硬 PCIe-bound**:每層 ~120 active expert × 0.753 = 90 ms PCIe vs
+   8.12 ms GPU,PCIe 是 GPU 的 ~9 倍。→ prefetch 不是 latency 賣點（無閒置 PCIe）;
+   buffer headroom 用來「保持 PCIe 不 stall」才是賣點。
+3. **draft 建構可藏**:merge 的 GPU 計算（topm k16 = 16×0.12 ≈ 1.92 ms/層）遠小於
+   verify 每層 90 ms 的 PCIe → 完全藏進 verify 的 GPU 閒置。
 
-**風險**:archer 的 fetch 在 C++ thread,Python 端時間戳抓不到引擎內部 → PCIe busy 可能
-只能靠 NVML 取樣間接估（取樣頻率 vs cycle 長度要對得上）。先確認取樣解析度夠不夠。
+**動機數據（四方對比,job 238115,qpc=5）—— M9b 要修的就是這個反轉**:
 
-#### M9b — CPU/GPU 平行化 + expert prefetch（據 M9a 數字才做）
+| | MAT | AccRate | TPS |
+|---|---|---|---|
+| SpecMoE N=16 offload | 2.17 | 0.235 | **2.29** |
+| topM m32k16 offload | **2.42** | **0.287** | **0.647** |
 
-**前提**:M9a 顯示有閒置可榨（CPU merge 藏得進 verify、或 verify PCIe 有閒置）。沒肉就
-不做（§1.4 已言明 prefetch 收益不預設）。
+topM 接受率明顯更好,TPS 卻爛 3.5 倍 —— 因為現行 draft 走 **CPU merge（M=32 量到
+1554 ms/cycle）**,把接受率優勢整個吃掉。M9b 把 draft 建構成本歸零後,2.42 的接受率
+應反映成 TPS 反超。
 
-1. **CPU/GPU 平行化（把 §1.3「結構上可重疊」變現實）**:起一個 CPU worker thread,
-   verify 一結束就**不阻塞地**用當前 counts 預合下一 cycle 的 merged expert（甚至逐層
-   pipeline:第 ℓ 層 verify 跑時合第 ℓ 層的下一版）；draft phase 開始前 join + H2D。把
-   §1.3 的 651 ms merge 從 critical path 移到 GPU 計算的影子裡。
-   - **正確性關鍵**:merge 結果必須在下個 draft 用到前 ready;counts 變化慢,容許用
-     上個 cycle 的（§1.3 已備此論點）。
-2. **expert prefetch（用 §1.4 回收的 7.25 GB buffer）**:draft 一結束 flush merged
-   residency,把那塊當 prefetch buffer,在 verify 時預抓下一層 expert。預測訊號:
-   moe_infinity 的 tracer（本 fork 已註解,要重啟）或拿 draft 階段 merged-expert hidden
-   states 跑 gate 當預測。填 verify 的串行氣泡（每層 attention+gate compute）。
+#### M9b — GPU-merge-during-verify + PCIe 不 stall 工作區
 
-**驗收**:(1) 平行化後 end-to-end tokens/sec 對比 M9a 的同步版有提升;(2) prefetch 開/關
-的 verify 牆鐘差（填掉多少氣泡）。兩者都對比 SpecMoE,坐實「三資源解耦」是我們相對
-SpecMoE 的結構性 throughput 優勢（SpecMoE 的 draft 在 GPU、無 CPU merge 可重疊、pinned
-expert 無法回收當 prefetch buffer——§1.4 的不對稱表）。
+**目標**:把 draft 建構成本從 ~1554 ms（CPU merge）降到藏進 verify 的 GPU 閒置,讓
+topm 的接受率優勢（2.42 vs 2.17）反映到 TPS。**不做** prefetch-pipeline（§1.4：
+PCIe-bound 下只省 ~10% 泡泡、且要預測下一層 routing,非主打）。
 
-**風險**:thread 同步的正確性（merge race、用錯版本的 counts）;prefetch 預測準確度低時
-純浪費 PCIe（§1.4 已排除「抓全部 E=128」）。M9a 沒肉就整個 M9b 不做。
+1. **GPU-merge-during-verify（§1.3 的實作）**:verify 逐層 `dispatch_local` 後、archer
+   evict 該層 expert **之前**,在 GPU 上就地把 active experts 加權合成該層的 merged
+   draft expert。用的是 verify 已搬上來的權重（零額外 PCIe）+ GPU 閒置（1.92 ms/層）。
+   - **核心難點**:archer 的 expert 物化/釋放在 C++ hook 內、Python 端要在「resident
+     窗口」抓到權重。先盤 archer 是否暴露 resident expert handle;不行則退而求其次——
+     verify 後立刻用 cpu_source GPU-merge（仍零 verify-fetch、但來源要冷搬 1.63 ms/顆,
+     見 §1.3 冷搬列,仍遠優於 CPU merge）。
+2. **PCIe 不 stall 的 double-buffer 工作區（§1.4 賣點 2 的實作）**:draft flush merged
+   residency 後,把回收的 7.25 GB 併入 archer 工作區,讓 verify 的 on-demand fetch 能
+   連續 streaming（GPU 算當前 expert 時 PCIe 灌下一批,不等 GPU 騰 slot）。對照
+   SpecMoE 的 16-slot 受限 buffer。
+
+**驗收**:(1) GPU-merge 路徑數值對齊 hf backend（±0.1,沿用 M7 驗收）;(2) draft 建構
+牆鐘從 1554 ms 降到藏進 verify;(3) **topm offload TPS 反超 SpecMoE offload**（目前
+0.647 → 目標 > 2.29）;(4) 加大工作區後 verify 牆鐘較 16-slot 版下降（坐實 §1.4 賣點 2）。
+
+**風險**:archer 不暴露 resident handle → 退冷搬路徑（仍贏 CPU merge）;GPU-merge 的
+數值與 hf 對不齊 → 查 fp32 累加順序（M3/M7 已建立 bit-exact 基準）。
 
 ---
 

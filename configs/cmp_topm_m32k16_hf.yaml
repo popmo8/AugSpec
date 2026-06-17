@@ -18,9 +18,9 @@ draft:
 
 run:
   T: 5
-  questions_per_cat: 5
-  max_new_tokens: 256
+  questions_per_cat: 10
+  max_new_tokens: 512
 
 output:
-  label: cmp_topm_m32k16_hf
-  dir: output/cmp_topm_m32k16_hf
+  label: cmp_topm_m32k16_hf_10
+  dir: output/cmp_topm_m32k16_hf_10
