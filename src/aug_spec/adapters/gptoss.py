@@ -165,7 +165,7 @@ class GptOssAdapter(MoEAdapter):
                         gate_probs = gate_logits.softmax(dim=-1)
                         top_k = controller.draft.draft_top_k or router.top_k
                         out = adapter._route_multi_expert(
-                            avg, gate_probs, flat, top_k)
+                            avg, gate_probs, flat, top_k, mlp)
                     else:
                         out = adapter._run_dense_expert(avg, flat)
                     return out.reshape(batch_size, sequence_length, hidden_dim), None

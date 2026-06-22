@@ -99,6 +99,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_resident_expert_weights",
            &ExpertDispatcher::GetResidentExpertWeights)
       .def("merge_experts_local", &ExpertDispatcher::MergeExpertsLocal)
+      .def("dispatch_merged_local", &ExpertDispatcher::DispatchMergedLocal)
       .def("flush_cache", &ExpertDispatcher::FlushCache)
       .def("evict_layer", &ExpertDispatcher::EvictLayer)
       .def("set_pinned", &ExpertDispatcher::SetPinned)

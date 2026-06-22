@@ -17,6 +17,8 @@ import torch.nn.functional as F
 
 from .base import (
     MoEAdapter,
+    _bmm_swiglu,
+    _stack_swiglu_weights,
     _svd_decompose,
     _svd_remerge,
     _topk_substitute_forward,
@@ -139,6 +141,20 @@ class Qwen3MoeAdapter(MoEAdapter):
         hidden = F.silu(gate) * up
         return F.linear(hidden, avg["down_proj"])
 
+    def _dense_experts_batched(self, cache, experts, hs_flat):
+        # Same SwiGLU as _run_dense_expert, batched over all K merged experts.
+        gw, uw, dw = _stack_swiglu_weights(
+            cache, experts, "gate_proj", "up_proj", "down_proj")
+        return _bmm_swiglu(hs_flat, gw, uw, dw)
+
+    def _merged_tensor_lists(self, experts):
+        # Tensor-id order = [gate, up, down], matching MergeExpertsLocal's
+        # output and what MoEMLP::forward expects for this expert type.
+        # .contiguous() guards the device-to-device memcpy in SetTensorsDirect
+        # (no-op for the freshly merged weights, which already are contiguous).
+        return [[e["gate_proj"].contiguous(), e["up_proj"].contiguous(),
+                 e["down_proj"].contiguous()] for e in experts]
+
     def _route_offload(self, block, hs_flat, gate_logits):
         """Offload-backend verify routing (replaces the hf expert loop —
         offloaded experts are placeholders). Builds per-token
@@ -253,7 +269,7 @@ class Qwen3MoeAdapter(MoEAdapter):
                         top_k = controller.draft.draft_top_k or block.top_k
                         gate_probs = router_logits.softmax(dim=-1)
                         out = adapter._route_multi_expert(
-                            avg, gate_probs, hs_flat, top_k)
+                            avg, gate_probs, hs_flat, top_k, block)
                     else:
                         out = adapter._run_dense_expert(avg, hs_flat)
                     return out.reshape(

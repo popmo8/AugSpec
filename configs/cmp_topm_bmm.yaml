@@ -1,0 +1,18 @@
+# topM merged draft via Python torch.bmm (AUG_MERGED_BACKEND=bmm), with the
+# full offload-merge machinery: P1 flush + P2 evict + P3 during-verify merge,
+# @ b=0.2. Matches cmp_opt_specmoe's qpc/mnt for a like-for-like row.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true     # P2 evict + P3 during-verify merge
+    flush_on_draft_end: true      # P1 flush
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, use_svd_merge: false, record_history: false}
+run: {T: 5, questions_per_cat: 5, max_new_tokens: 512}
+output: {label: cmp_topm_bmm, dir: output/cmp_topm_bmm}

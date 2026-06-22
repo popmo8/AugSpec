@@ -107,6 +107,18 @@ class ExpertDispatcher : public base::noncopyable {
       int layer_idx, const std::vector<int>& expert_ids,
       const std::vector<double>& weights, int gpu_id);
 
+  // aug_spec: run K merged dense draft experts through the SAME MoEMLP::forward
+  // kernel the archer dispatch uses, so the merged-expert draft and the SpecMoE
+  // (substitute) draft share one expert-execution engine — the comparison then
+  // isolates the algorithm, not the kernel. `merged` holds K experts, each a
+  // {gate, up, down} GPU-tensor list in tensor-id order (as MergeExpertsLocal
+  // returns). `weight` is [T, K]: token t routes to cluster k with this combine
+  // weight (0 = not selected). Synchronous (merged are resident, no fetch); the
+  // archer worker threads are idle during the draft so modules_[gpu_id] is free.
+  torch::Tensor DispatchMergedLocal(
+      torch::Tensor hidden_states, torch::Tensor weight,
+      const std::vector<std::vector<torch::Tensor>>& merged, int gpu_id);
+
   // aug_spec / verify_merge_plan.md P1: evict every GPU-resident expert on
   // `gpu_id` back to host and reset the sparse-cache budget to full. Cheap —
   // the host copies are the offload source, so this just frees the GPU mirrors

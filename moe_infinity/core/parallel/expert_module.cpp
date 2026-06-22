@@ -367,19 +367,36 @@ MoEMLP::MoEMLP(int dtype, int expert_type) {
 void MoEMLP::SetTensorsFromIds(const std::vector<std::uint32_t>& tensor_ids) {
   std::vector<std::tuple<void*, int64_t>> tensor_ptrs;
   std::vector<std::vector<int64_t>> tensor_shapes;
+  for (auto& id : tensor_ids) {
+    auto tensor = kTensorIndex->find(id)->second.tensor;
+    auto tensor_shape = tensor.sizes().vec();
+    tensor_ptrs.push_back(
+        std::make_tuple(tensor.data_ptr(), torch_shape_size(tensor_shape, dtype_)));
+    tensor_shapes.push_back(tensor_shape);
+  }
+  SetTensorsFromPtrs(tensor_ptrs, tensor_shapes);
+}
+
+void MoEMLP::SetTensorsDirect(const std::vector<torch::Tensor>& tensors) {
+  std::vector<std::tuple<void*, int64_t>> tensor_ptrs;
+  std::vector<std::vector<int64_t>> tensor_shapes;
+  for (auto& t : tensors) {
+    auto tensor_shape = t.sizes().vec();
+    tensor_ptrs.push_back(
+        std::make_tuple(t.data_ptr(), torch_shape_size(tensor_shape, dtype_)));
+    tensor_shapes.push_back(tensor_shape);
+  }
+  SetTensorsFromPtrs(tensor_ptrs, tensor_shapes);
+}
+
+void MoEMLP::SetTensorsFromPtrs(
+    const std::vector<std::tuple<void*, int64_t>>& tensor_ptrs,
+    const std::vector<std::vector<int64_t>>& tensor_shapes) {
   std::vector<std::vector<int64_t>> data_shapes;
   int device = at::cuda::current_device();
   auto options = torch::TensorOptions()
                      .dtype(dtype_to_torch(dtype_))
                      .device(CUDA_DEVICE(device));
-  for (auto& id : tensor_ids) {
-    auto tensor = kTensorIndex->find(id)->second.tensor;
-    auto tensor_shape = tensor.sizes().vec();
-    auto tensor_ptr = tensor.data_ptr();
-    auto tensor_size = torch_shape_size(tensor_shape, dtype_);
-    tensor_ptrs.push_back(std::make_tuple(tensor_ptr, tensor_size));
-    tensor_shapes.push_back(tensor_shape);
-  }
   if (!param_init_) {
     // auto allocator = CudaDeviceCachingAllocator::instance(device);
     auto allocator = c10::DeviceCachingAllocator::get(device);
@@ -389,7 +406,7 @@ void MoEMLP::SetTensorsFromIds(const std::vector<std::uint32_t>& tensor_ids) {
       void* param_ptr = allocator->allocate(tensor_size);
       param_[i].set_data(torch::from_blob(param_ptr, tensor_shape,
                                           DoNothingDeleter<void>{}, options));
-      DLOG_DEBUG("MoEMLP::SetTensorsFromBlob: tensor_ids", tensor_ids[i],
+      DLOG_DEBUG("MoEMLP::SetTensorsFromPtrs: param", i,
                  "tensor_shape", tensor_shape, "tensor_size", tensor_size,
                  "param_", param_[i].sizes().vec(), "device",
                  param_[i].device().str());
@@ -426,7 +443,6 @@ void MoEMLP::SetTensorsFromIds(const std::vector<std::uint32_t>& tensor_ids) {
 
   for (size_t i = 0; i < tensor_ptrs.size(); i++) {
     auto [ptr, tensor_size] = tensor_ptrs[i];
-    auto tensor_shape = tensor_shapes[i];
     CUDA_CHECK(cudaMemcpy(param_[i].data_ptr(), ptr, tensor_size,
                           cudaMemcpyDeviceToDevice));
   }

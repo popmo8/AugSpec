@@ -1,0 +1,18 @@
+# Control: identical to cmp_opt_topm (P2+P3, NO P1 flush) but bmm backend on the
+# NEW binary. Isolates "new C++ binary" vs "P1 flush" as the cause of the
+# Enqueue try_lock crash — if this completes like cmp_opt_topm did, the binary
+# is exonerated and P1 flush is the trigger.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true     # P2 evict + P3 during-verify merge (NO P1 flush)
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, use_svd_merge: false, record_history: false}
+run: {T: 5, questions_per_cat: 5, max_new_tokens: 512}
+output: {label: cmp_topm_bmm_ctrl, dir: output/cmp_topm_bmm_ctrl}

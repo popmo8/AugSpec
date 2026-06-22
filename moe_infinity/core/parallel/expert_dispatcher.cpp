@@ -282,6 +282,40 @@ std::vector<torch::Tensor> ExpertDispatcher::MergeExpertsLocal(
   return out;
 }
 
+torch::Tensor ExpertDispatcher::DispatchMergedLocal(
+    torch::Tensor hidden_states, torch::Tensor weight,
+    const std::vector<std::vector<torch::Tensor>>& merged, int gpu_id) {
+  cudaSetDevice(gpu_id);
+  auto device = CUDA_DEVICE(gpu_id);
+  const int64_t T = hidden_states.size(0);
+  const int64_t D = hidden_states.size(1);
+  const int K = static_cast<int>(merged.size());
+
+  auto final_hidden = torch::zeros(
+      {T, D}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+
+  // Run on the current stream — synchronous (merged are resident, no fetch);
+  // MoEMLP::forward syncs it each call, so the K experts run sequentially on
+  // modules_[gpu_id] and all the torch ops below stay ordered on one stream.
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(gpu_id).stream();
+
+  for (int k = 0; k < K; ++k) {
+    auto w_k = weight.select(1, k);                       // [T]
+    auto token_idx = (w_k > 0).nonzero().squeeze(-1);     // [t_k]
+    if (token_idx.numel() == 0) continue;
+    auto input = hidden_states.index_select(0, token_idx).to(device);
+
+    modules_[gpu_id]->SetTensorsDirect(merged[k]);
+    auto output = modules_[gpu_id]->forward(input, stream);   // [t_k, D]
+
+    auto scale = w_k.index_select(0, token_idx).unsqueeze(-1);  // [t_k, 1]
+    final_hidden.index_add_(
+        0, token_idx, (output.to(torch::kFloat32) * scale.to(torch::kFloat32)));
+  }
+
+  return final_hidden.to(hidden_states.dtype());
+}
+
 void ExpertDispatcher::FlushCache(int gpu_id) {
   std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
   for (auto key : cached_experts_[gpu_id]) {

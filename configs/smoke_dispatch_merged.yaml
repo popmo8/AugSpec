@@ -1,0 +1,17 @@
+# Smoke: topM merged draft via dispatch_merged_local (B, same-engine path).
+# Short run — verify it doesn't crash and acceptance is sane (a wrong
+# gate/up/down order would collapse acceptance to ~0).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, use_svd_merge: false, record_history: false}
+run: {T: 5, questions_per_cat: 1, max_new_tokens: 64}
+output: {label: smoke_dispatch_merged, dir: output/smoke_dispatch_merged}
