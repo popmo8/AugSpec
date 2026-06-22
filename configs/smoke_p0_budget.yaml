@@ -1,0 +1,31 @@
+# P0 smoke — 驗證 vram_budget_ratio → device_memory_ratio 推導 + NVML audit + guard。
+# b=0.2（論文預算）：device ratio 應推成 ~0.085；merge_offload 的 merged experts
+# 可能把總 VRAM 推過預算 → guard 應 WARN（同時驗證 guard 會動 + §0.1 的漏帳發現）。
+# 極小設定 qpc=1, mnt=32。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2      # ← P0：可用 VRAM = 0.2 × 模型大小
+    merge_offload: true
+    vram_guard: true
+
+draft:
+  name: topm_count
+  args:
+    M: 32
+    K: 16
+    draft_top_k: 8
+    use_svd_merge: false
+    record_history: false
+
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 32
+
+output:
+  label: smoke_p0_budget
+  dir: output/smoke_p0_budget

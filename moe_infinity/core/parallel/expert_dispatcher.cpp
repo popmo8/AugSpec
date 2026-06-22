@@ -38,6 +38,7 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
       gpu_overload_(kNumDevices(), false),
       exec_queue_(kNumDevices()),
       cached_experts_(kNumDevices()),
+      pinned_(kNumDevices()),
       modules_(kNumDevices(), nullptr) {
   main_thread_stop_flag_.store(false);
 
@@ -281,6 +282,78 @@ std::vector<torch::Tensor> ExpertDispatcher::MergeExpertsLocal(
   return out;
 }
 
+void ExpertDispatcher::FlushCache(int gpu_id) {
+  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+  for (auto key : cached_experts_[gpu_id]) {
+    int64_t layer_idx = static_cast<int64_t>(key >> 32);
+    int64_t expert_idx = static_cast<int64_t>(key & 0xFFFFFFFF);
+    if (expert_idx < 0 || expert_idx >= static_cast<int64_t>(experts_.size())) {
+      continue;
+    }
+    if (layer_idx < 0 ||
+        layer_idx >= static_cast<int64_t>(experts_[expert_idx].size())) {
+      continue;
+    }
+    auto expert_node = experts_[expert_idx][layer_idx];
+    if (expert_node == nullptr || expert_node->node == nullptr) continue;
+    if (expert_node->node->device.is_cuda()) {
+      // Host copy is the offload source — this just frees the GPU mirror.
+      expert_node->node->SetDevice(expert_node->node->default_host);
+    }
+  }
+  cached_experts_[gpu_id].clear();
+  cache_sizes_[gpu_id] =
+      kTopologyHandle->GetSparseCacheLimit(CUDA_DEVICE(gpu_id));
+}
+
+void ExpertDispatcher::EvictLayer(int layer_idx, int gpu_id) {
+  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+  std::vector<uint64_t> to_evict;
+  for (auto key : cached_experts_[gpu_id]) {
+    if (static_cast<int>(key >> 32) == layer_idx) {
+      to_evict.push_back(key);
+    }
+  }
+  for (auto key : to_evict) {
+    int64_t expert_idx = static_cast<int64_t>(key & 0xFFFFFFFF);
+    if (expert_idx < 0 || expert_idx >= static_cast<int64_t>(experts_.size())) {
+      continue;
+    }
+    auto expert_node = experts_[expert_idx][layer_idx];
+    if (expert_node == nullptr || expert_node->node == nullptr) continue;
+    if (expert_node->node->device.is_cuda()) {
+      // Host copy is the offload source — frees the GPU mirror, no D2H.
+      expert_node->node->SetDevice(expert_node->node->default_host);
+      cache_sizes_[gpu_id] += expert_node->node->byte_size;
+    }
+    cached_experts_[gpu_id].erase(key);
+  }
+}
+
+void ExpertDispatcher::SetPinned(int layer_idx,
+                                const std::vector<int>& expert_ids,
+                                int gpu_id) {
+  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+  // Drop this layer's old pins, then install the new kept-N set.
+  for (auto it = pinned_[gpu_id].begin(); it != pinned_[gpu_id].end();) {
+    if (static_cast<int>(*it >> 32) == layer_idx) {
+      it = pinned_[gpu_id].erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (int e : expert_ids) {
+    uint64_t key = (static_cast<uint64_t>(layer_idx) << 32) +
+                   static_cast<uint64_t>(e);
+    pinned_[gpu_id].insert(key);
+  }
+}
+
+void ExpertDispatcher::ClearPinned(int gpu_id) {
+  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+  pinned_[gpu_id].clear();
+}
+
 void ExpertDispatcher::NotifyFetchStart() {
   for (int i = 0; i < kNumDevices(); ++i) {
     // std::unique_lock<std::mutex> lock(input_mutex_[i]);
@@ -309,6 +382,11 @@ ExpertNodePtr ExpertDispatcher::FindExpertEvict(int gpu_id) {
   ExpertNodePtr evict_expert_node = nullptr;
 
   for (auto& key : cached_experts_[gpu_id]) {
+    // aug_spec / specmoe_pin_plan.md: never evict a pinned expert (the SpecMoE
+    // kept-N draft set). FindExpertEvict is the batch_size==1 (draft-step)
+    // eviction path, so skipping pinned here keeps the kept-N resident across
+    // draft steps → the draft reads them at 0 PCIe.
+    if (pinned_[gpu_id].count(key) > 0) continue;
     auto layer_idx = key >> 32;
     auto expert_idx = key & 0xFFFFFFFF;
     auto node = experts_[expert_idx][layer_idx]->node;

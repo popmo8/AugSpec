@@ -382,6 +382,8 @@ def run_specbench(
     on_cycle: Optional[Callable[[QuestionResult, CycleStats], None]] = None,
     on_question_start: Optional[Callable[[Dict[str, Any]], None]] = None,
     before_generate: Optional[Callable[[Any], None]] = None,
+    vram_limit_bytes: Optional[int] = None,
+    vram_guard: bool = False,
 ) -> SpecBenchResult:
     """Run SpecBench eval with a fixed-T speculative schedule.
 
@@ -396,6 +398,32 @@ def run_specbench(
     target_model.generation_config.num_assistant_tokens = num_speculative
     target_model.generation_config.num_assistant_tokens_schedule = "constant"
     draft_model.generation_config.assistant_confidence_threshold = 0
+
+    # VRAM budget audit + guard (verify_merge_plan.md §0.1). Driver-level total
+    # GPU memory (includes archer's cudaMalloc pool, which torch peak misses) is
+    # sampled per verify cycle: track the run peak, and warn once if it crosses
+    # the budget (×1.05 slack). This only DETECTS a breach — it never enforces;
+    # the budget is held structurally (archer cache cap + flush). No-op when
+    # vram_limit_bytes is None (hf backend / no budget set).
+    from aug_spec.runtime.loader import get_gpu_used_bytes
+    _vram_peak = [0]
+    _vram_warned = [False]
+
+    def _vram_sample(phase: str = "") -> None:
+        if vram_limit_bytes is None:
+            return
+        used = get_gpu_used_bytes(0)
+        if used < 0:
+            return
+        if used > _vram_peak[0]:
+            _vram_peak[0] = used
+        if (vram_guard and not _vram_warned[0]
+                and used > vram_limit_bytes * 1.05):
+            _vram_warned[0] = True
+            print(f"  [vram_guard] WARNING used={used / 1e9:.2f}GB > "
+                  f"limit={vram_limit_bytes / 1e9:.2f}GB ×1.05 (phase={phase}) — "
+                  f"total VRAM over budget (e.g. merged not flushed / leak). "
+                  f"Audit only; not enforced.", flush=True)
 
     cache_dir = (spec_bench_cache if spec_bench_cache is not None
                  else Path.cwd() / "data" / "spec_bench")
@@ -491,6 +519,7 @@ def run_specbench(
                     _write_tokens_row(tokens_writer, _qid, _cat, cs)
                 if on_cycle is not None:
                     on_cycle(_qres, cs)
+                _vram_sample("verify_cycle")
 
             t0 = time.perf_counter()
             try:
@@ -590,6 +619,11 @@ def run_specbench(
                 })
 
     _print_final_table(label, per_subtask)
+    if vram_limit_bytes is not None and _vram_peak[0] > 0:
+        over = _vram_peak[0] > vram_limit_bytes
+        print(f"\n  [vram] peak={_vram_peak[0] / 1e9:.2f}GB  "
+              f"limit={vram_limit_bytes / 1e9:.2f}GB  "
+              f"{'OVER BUDGET ⚠' if over else 'within budget ✓'}")
     if output_dir is not None:
         print(f"\n  → CSVs saved to {output_dir}")
 

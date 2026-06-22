@@ -46,14 +46,18 @@ def shared_model_phase_patch(controller: Any):
 
     def patched_get(self, input_ids):
         controller.in_draft_phase = True
+        # verify→draft transition: offload-merge engine may flush the archer
+        # expert cache here (idle during the merged-dense draft) to free budget
+        # for the merged experts (§1.4 phase-exclusive). No-op unless flush.
+        engine = getattr(controller, "merge_engine", None)
+        if engine is not None:
+            engine.on_draft_start()
         try:
             return orig_get(self, input_ids)
         finally:
             controller.in_draft_phase = False
-            # draft→verify transition: offload-merge engine may flush the
-            # merged experts here to reclaim workspace for verify (§1.4).
-            # No-op unless merge_offload built an engine.
-            engine = getattr(controller, "merge_engine", None)
+            # draft→verify transition: flush the merged experts (dead during
+            # verify) to hand the budget back to the verify cache.
             if engine is not None:
                 engine.on_draft_end()
 

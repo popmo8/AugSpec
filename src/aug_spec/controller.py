@@ -36,7 +36,10 @@ class Controller:
                  adapter: MoEAdapter,
                  draft: DraftStrategy,
                  cpu_source: nn.Module = None,
-                 merge_offload: bool = False):
+                 merge_offload: bool = False,
+                 merge_during_verify: bool = False,
+                 flush_on_draft_end: bool = False,
+                 merge_overlap: bool = False):
         self.model = model
         self.adapter = adapter
         self.draft = draft
@@ -69,7 +72,10 @@ class Controller:
         self.merge_engine = None
         if merge_offload and cpu_source is not None:
             from aug_spec.runtime.offload_merge import OffloadMergeEngine
-            self.merge_engine = OffloadMergeEngine(adapter, model)
+            self.merge_engine = OffloadMergeEngine(
+                adapter, model, during_verify=merge_during_verify,
+                flush=flush_on_draft_end, overlap=merge_overlap)
+            self.merge_engine.controller = self   # on_verify_layer → draft/cache
             self.merge_engine.attach(self.blocks)
 
         self.draft_cache: Dict[int, Any] = {}

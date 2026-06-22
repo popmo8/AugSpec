@@ -107,6 +107,35 @@ class ExpertDispatcher : public base::noncopyable {
       int layer_idx, const std::vector<int>& expert_ids,
       const std::vector<double>& weights, int gpu_id);
 
+  // aug_spec / verify_merge_plan.md P1: evict every GPU-resident expert on
+  // `gpu_id` back to host and reset the sparse-cache budget to full. Cheap —
+  // the host copies are the offload source, so this just frees the GPU mirrors
+  // (no D2H). Called at draft start (the merged-dense draft never touches the
+  // archer cache, so it is idle) to make the budget room phase-exclusive with
+  // the merged experts (§1.4). Must be called dispatch-quiescent (between
+  // verify and draft), like the read/merge methods above.
+  void FlushCache(int gpu_id);
+
+  // aug_spec / verify_merge_plan.md P2+P3: evict every GPU-resident expert of
+  // layer `layer_idx` back to host. Called right after on_verify_layer merges
+  // the layer (experts still resident, dispatch-quiescent between layers). By
+  // freeing each layer once verify+merge are done with it, the sparse cache
+  // never fills → the overload evict-after-use path never triggers → the
+  // per-layer merge reads resident experts with no concurrent-eviction race
+  // (the P3 crash), and the footprint stays ~1 layer (low peak). Caller must
+  // sync the merge's GPU reads before this frees the source memory.
+  void EvictLayer(int layer_idx, int gpu_id);
+
+  // aug_spec / specmoe_pin_plan.md: mark layer `layer_idx`'s `expert_ids` as
+  // pinned (the SpecMoE kept-N draft set) so FindExpertEvict never evicts them.
+  // SetPinned replaces the whole pinned set for that layer; ClearPinned drops
+  // all pins (the experts then evict normally). The kept-N get cached by the
+  // draft's own dispatch (batch_size==1 → FindExpertEvict path, which now skips
+  // pinned to make room from the non-pinned verify experts). Quiescent-window
+  // calls (refresh, between verify and draft).
+  void SetPinned(int layer_idx, const std::vector<int>& expert_ids, int gpu_id);
+  void ClearPinned(int gpu_id);
+
  private:
   void Enqueue(CallArgs& args);
   std::vector<CallResult> Wait();
@@ -166,6 +195,7 @@ class ExpertDispatcher : public base::noncopyable {
 
   std::vector<int64_t> cache_sizes_;
   std::vector<std::unordered_set<uint64_t>> cached_experts_;
+  std::vector<std::unordered_set<uint64_t>> pinned_;   // specmoe kept-N (no evict)
 
   int cache_capacity_ = 0;
 

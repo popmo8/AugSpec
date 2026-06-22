@@ -45,7 +45,7 @@ class SpecMoeDraft(DraftStrategy):
     cache_kind = "substitute"
 
     def __init__(self, N: int, route_top_k: int = 1,
-                 count_top_k: Optional[int] = None):
+                 count_top_k: Optional[int] = None, pin: bool = False):
         if N < 1:
             raise ValueError(f"N must be >= 1, got {N!r}")
         if route_top_k < 1:
@@ -54,6 +54,11 @@ class SpecMoeDraft(DraftStrategy):
         self.route_top_k = route_top_k
         self.count_top_k = count_top_k if count_top_k is not None else route_top_k
         self._scorer = make_count_scorer(count_top_k=self.count_top_k)
+        # specmoe_pin_plan.md: pin the kept-N in GPU (offload) so the draft reads
+        # them resident (0 PCIe) — the faithful SpecMoE memory behaviour. The
+        # kept-N then occupy ~N×L×expert of the archer pool (no merged-reserve;
+        # they ARE experts in the pool). No-op on hf / when pin=False.
+        self.pin = pin
 
         # layer_idx → CPU fp32 count vector captured in the target phase
         self.target_score: Dict[int, torch.Tensor] = {}
@@ -115,12 +120,22 @@ class SpecMoeDraft(DraftStrategy):
             cycle_miss += int((~old_mask[top]).sum().item())
         self.cycle_misses.append(cycle_miss)
 
+        layer_to_block = dict(blocks)
         for li, score_vec in self.target_score.items():
             top_n = torch.topk(score_vec, self.N).indices
             mask = torch.zeros(self.num_experts, dtype=torch.bool)
             mask[top_n] = True
             self._draft_mask[li] = mask
             draft_cache[li] = self._build_substitute_table(li, mask)
+            # specmoe_pin_plan.md: pin this layer's kept-N so the draft reads
+            # them resident (FindExpertEvict skips pinned). Offload-only; the
+            # draft's batch_size==1 dispatch then fetches + keeps them.
+            if self.pin:
+                block = layer_to_block[li]
+                ex = getattr(block, "expert_executor", None)
+                disp = getattr(ex, "expert_dispatcher", None) if ex else None
+                if disp is not None:
+                    disp.set_pinned(li, top_n.tolist(), 0)
 
     def _build_substitute_table(self, layer_idx: int,
                                 mask: torch.Tensor) -> torch.Tensor:

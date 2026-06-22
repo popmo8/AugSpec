@@ -54,8 +54,17 @@ from aug_spec.adapters import adapter_for_config, get_adapter
 from aug_spec.controller import Controller
 from aug_spec.drafts import ScoreBasedAvgDraft, SpecMoeDraft, get_draft
 from aug_spec.runtime.loader import (
-    free_model, get_peak_vram_gb, load_model, load_offload,
+    compute_merged_bytes, compute_model_vram_bytes, free_model,
+    get_peak_vram_gb, load_model, load_offload,
 )
+
+# Drafts that cache merged dense experts (ScoreBasedAvgDraft family). Used to
+# reserve the merged residency out of the VRAM budget. SpecMoE / random_mask
+# hold no merged, so they reserve nothing.
+_MERGE_DRAFTS = frozenset({
+    "count", "topm_count", "softmax",
+    "prefill_count", "prefill_topm_count", "uniform",
+})
 from aug_spec.runtime.phase import shared_model_phase_patch, specbench_callbacks
 from aug_spec.runtime.specbench import run_specbench
 
@@ -84,9 +93,18 @@ class RunConfig:
     adapter_name: Optional[str]
     backend: str                         # "hf" (default) | "offload"
     offload_path: Optional[str]          # offload backend: expert dir
-    device_memory_ratio: float           # offload backend: expert cache cap
+    device_memory_ratio: float           # offload: archer pool / GPU (escape hatch)
+    vram_budget_ratio: Optional[float]   # offload: usable VRAM / model VRAM (P0);
+                                         # overrides device_memory_ratio when set
+    vram_guard: bool                     # offload: per-cycle VRAM-over-budget warn
     merge_offload: bool                  # offload: GPU resident-merge + opts
                                          # via archer dispatcher (M9b)
+    merge_during_verify: bool            # offload-merge: per-layer merge during
+                                         # verify (P3) vs after-verify refresh
+    flush_on_draft_end: bool             # offload-merge: phase-exclusive flush
+                                         # (archer@draft-start, merged@draft-end, P1)
+    merge_overlap: bool                  # offload-merge: merge on side stream,
+                                         # overlap with next-layer fetch (P4)
 
     # draft
     draft_name: str
@@ -150,9 +168,19 @@ class RunConfig:
                           if offload_cfg.get("path") else None),
             device_memory_ratio=float(
                 offload_cfg.get("device_memory_ratio", 0.15)),
+            vram_budget_ratio=(float(offload_cfg["vram_budget_ratio"])
+                               if offload_cfg.get("vram_budget_ratio") is not None
+                               else None),
+            vram_guard=bool(offload_cfg.get("vram_guard", True)),
             merge_offload=bool(
                 offload_cfg.get("merge_offload",
                                 offload_cfg.get("cpp_merge", False))),
+            merge_during_verify=bool(
+                offload_cfg.get("merge_during_verify", False)),
+            flush_on_draft_end=bool(
+                offload_cfg.get("flush_on_draft_end", False)),
+            merge_overlap=bool(
+                offload_cfg.get("merge_overlap", False)),
             draft_name=str(draft_cfg["name"]),
             draft_args=dict(draft_cfg.get("args") or {}),
             T=int(run_cfg.get("T", 3)),
@@ -193,18 +221,53 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     # run_specbench's `before_generate`.
     moe = None
     cpu_source = None
+    usable_vram_bytes: Optional[int] = None    # VRAM budget audit/guard limit
     if cfg.backend == "offload":
         if not cfg.offload_path:
             raise ValueError(
                 "config: model.offload.path is required for backend=offload")
+        # VRAM budget (P0, verify_merge_plan.md §0): vram_budget_ratio expresses
+        # the usable VRAM as a fraction of the full-model footprint (GPU-indep,
+        # matches thesis 0.2x). Derive the archer device_memory_ratio from it;
+        # fall back to the raw device_memory_ratio escape hatch when unset.
+        gpu_total = torch.cuda.get_device_properties(0).total_memory
+        if cfg.vram_budget_ratio is not None:
+            model_vram = compute_model_vram_bytes(
+                cfg.model_id, cfg.dtype, cfg.trust_remote_code)
+            usable_vram_bytes = int(cfg.vram_budget_ratio * model_vram)
+            # Reserve the fixed merged-expert residency out of the budget so the
+            # archer pool shrinks to leave room — total (archer pool + merged)
+            # stays within 0.2x, an honest scarce-VRAM sim (verify_merge_plan.md
+            # P1/P2). Only merge drafts on the offload-merge engine hold merged.
+            merged_bytes = 0
+            if cfg.merge_offload and cfg.draft_name in _MERGE_DRAFTS:
+                K = int(cfg.draft_args.get("K", 1))
+                merged_bytes = compute_merged_bytes(
+                    cfg.model_id, K, cfg.dtype, cfg.trust_remote_code)
+            pool_bytes = usable_vram_bytes - merged_bytes
+            if pool_bytes <= 0:
+                raise ValueError(
+                    f"budget too small: merged reserve "
+                    f"{merged_bytes / 1e9:.1f}GB ≥ usable "
+                    f"{usable_vram_bytes / 1e9:.1f}GB (lower K or raise b)")
+            device_memory_ratio = pool_bytes / gpu_total
+            print(f"\n  [budget] vram_budget_ratio={cfg.vram_budget_ratio} × "
+                  f"model_vram={model_vram / 1e9:.1f}GB = "
+                  f"usable {usable_vram_bytes / 1e9:.2f}GB; "
+                  f"reserve merged {merged_bytes / 1e9:.2f}GB → "
+                  f"archer pool {pool_bytes / 1e9:.2f}GB → "
+                  f"device_memory_ratio={device_memory_ratio:.4f}")
+        else:
+            device_memory_ratio = cfg.device_memory_ratio
+            usable_vram_bytes = int(device_memory_ratio * gpu_total)
         print(f"\nLoading {cfg.model_id} via moe_infinity offload "
-              f"(device_memory_ratio={cfg.device_memory_ratio}) ...")
+              f"(device_memory_ratio={device_memory_ratio:.4f}) ...")
         # cpu_source = host-resident weights for draft-side merging (M7).
         # Merge runs on CPU and ships one expert to GPU (offload-safe for any
         # merge draft); masked drafts (random_mask) never touch it.
         model, tokenizer, moe, cpu_source = load_offload(
             cfg.model_id, cfg.offload_path,
-            device_memory_ratio=cfg.device_memory_ratio,
+            device_memory_ratio=device_memory_ratio,
             dtype=cfg.dtype, trust_remote_code=cfg.trust_remote_code,
             load_cpu_source=True,
         )
@@ -243,7 +306,10 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
 
     # ── run ───────────────────────────────────────────────────────────
     controller = Controller(model, adapter, draft, cpu_source=cpu_source,
-                            merge_offload=cfg.merge_offload)
+                            merge_offload=cfg.merge_offload,
+                            merge_during_verify=cfg.merge_during_verify,
+                            flush_on_draft_end=cfg.flush_on_draft_end,
+                            merge_overlap=cfg.merge_overlap)
 
     # One-time, model-derived precomputation (e.g. SpecMoE expert distances).
     draft.prepare(adapter, controller.blocks)
@@ -272,6 +338,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
                 spec_bench_cache=cfg.spec_bench_cache,
                 emit_tokens_csv=cfg.emit_tokens_csv,
                 warmup=cfg.warmup,
+                vram_limit_bytes=usable_vram_bytes,
+                vram_guard=cfg.vram_guard,
                 **callbacks,
             )
     finally:
@@ -293,6 +361,9 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
         "wall_time_s": wall,
         "n_cycles_total": controller.update_count,
         "peak_vram_gb": get_peak_vram_gb(),
+        "vram_budget_ratio": cfg.vram_budget_ratio,
+        "usable_vram_gb": (usable_vram_bytes / 1e9
+                           if usable_vram_bytes is not None else None),
         "overall": result.overall,
         "per_subtask": result.per_subtask,
     }

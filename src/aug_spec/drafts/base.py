@@ -210,24 +210,37 @@ class ScoreBasedAvgDraft(DraftStrategy):
         if self.record_history:
             self._cycle_in_question += 1
             self._snapshot_history([li for li, _ in blocks])
+        # merge_during_verify (verify_merge_plan.md P1): the offload-merge engine
+        # already built draft_cache[li] per layer *during* verify (on_verify_layer,
+        # experts still resident → 0 re-fetch). Skip the after-verify rebuild;
+        # telemetry above still runs. No engine / during_verify=False → unchanged.
+        engine = getattr(blocks[0][1], "_merge_engine", None) if blocks else None
+        if engine is not None and getattr(engine, "during_verify", False):
+            return
         for li, score_vec in self.target_score.items():
-            # Drop old cache for this layer first so peak transient VRAM
-            # during the rebuild stays bounded by one layer's worth.
-            draft_cache.pop(li, None)
-            block = layer_to_block[li]
-            n = adapter.num_experts(block)
-            total = float(score_vec.sum().item())
-            if total <= 0:
-                weights = [1.0 / n] * n
-            else:
-                weights = (score_vec.float() / total).tolist()
-            weights = self._postprocess_weights(weights)
-            basis = self._get_svd_basis(adapter, li, block)
-            if self.K > 1:
-                draft_cache[li] = self._cluster_and_build(
-                    adapter, block, weights, basis)
-            else:
-                draft_cache[li] = self._build_one(adapter, block, weights, basis)
+            self._refresh_layer(adapter, layer_to_block[li], li, score_vec,
+                                draft_cache)
+
+    def _refresh_layer(self, adapter, block, li, score_vec, draft_cache):
+        """Build (or rebuild) the merged draft for one layer from its captured
+        count vector. Shared by `refresh` (after-verify, all layers) and the
+        offload-merge engine's `on_verify_layer` (during-verify, one layer)."""
+        # Drop old cache for this layer first so peak transient VRAM during the
+        # rebuild stays bounded by one layer's worth.
+        draft_cache.pop(li, None)
+        n = adapter.num_experts(block)
+        total = float(score_vec.sum().item())
+        if total <= 0:
+            weights = [1.0 / n] * n
+        else:
+            weights = (score_vec.float() / total).tolist()
+        weights = self._postprocess_weights(weights)
+        basis = self._get_svd_basis(adapter, li, block)
+        if self.K > 1:
+            draft_cache[li] = self._cluster_and_build(
+                adapter, block, weights, basis)
+        else:
+            draft_cache[li] = self._build_one(adapter, block, weights, basis)
 
     def _get_svd_basis(self, adapter, layer_idx: int, block):
         """Return the cached SVD basis for `layer_idx`, building it on first

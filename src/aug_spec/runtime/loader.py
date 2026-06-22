@@ -273,6 +273,57 @@ def get_peak_vram_gb() -> float:
     return max(peaks) if peaks else 0.0
 
 
+def compute_model_vram_bytes(model_id: str, dtype: torch.dtype,
+                             trust_remote_code: bool = True) -> int:
+    """Full-model footprint in bytes = total params × dtype-size, built on the
+    **meta device** (structure only, no weights allocated). This is the `x`
+    ("整個模型佔的 VRAM") for the `vram_budget_ratio` budget — GPU-independent,
+    matches the thesis 0.2x rule (verify_merge_plan.md §0)."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+    cfg = AutoConfig.from_pretrained(
+        model_id, trust_remote_code=trust_remote_code)
+    with torch.device("meta"):
+        meta = AutoModelForCausalLM.from_config(
+            cfg, trust_remote_code=trust_remote_code)
+    n_params = sum(p.numel() for p in meta.parameters())
+    del meta
+    bytes_per = torch.finfo(dtype).bits // 8
+    return n_params * bytes_per
+
+
+def compute_merged_bytes(model_id: str, K: int, dtype: torch.dtype,
+                         trust_remote_code: bool = True) -> int:
+    """Fixed footprint of the cached merged draft experts = K clusters/layer ×
+    MoE layers × one-expert bytes (gate+up+down). Reserved out of the budget so
+    the merged residency is bounded within 0.2x rather than growing freely in
+    the torch allocator (verify_merge_plan.md P1/P2 — honest scarce-VRAM sim).
+    Computed from config (no weights)."""
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(
+        model_id, trust_remote_code=trust_remote_code)
+    n_layers = cfg.num_hidden_layers
+    hidden = cfg.hidden_size
+    inter = getattr(cfg, "moe_intermediate_size", None) or cfg.intermediate_size
+    bytes_per = torch.finfo(dtype).bits // 8
+    expert_bytes = 3 * inter * hidden * bytes_per   # gate_proj + up_proj + down_proj
+    return int(K) * n_layers * expert_bytes
+
+
+def get_gpu_used_bytes(device: int = 0) -> int:
+    """Driver-level total GPU memory in use, via `cudaMemGetInfo` (free/total).
+    **Includes archer's own cudaMalloc pool** — unlike torch
+    `max_memory_allocated`, which only sees the torch caching allocator. This is
+    the right number for the VRAM budget audit/guard (verify_merge_plan.md
+    §0.1). Returns -1 when unavailable."""
+    if not torch.cuda.is_available():
+        return -1
+    try:
+        free, total = torch.cuda.mem_get_info(device)
+        return total - free
+    except Exception:
+        return -1
+
+
 def free_model(model: nn.Module) -> None:
     del model
     gc.collect()

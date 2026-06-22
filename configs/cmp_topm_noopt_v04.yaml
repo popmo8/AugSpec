@@ -1,0 +1,16 @@
+# topM ablation 無 P2+P3 — merge_offload + after-verify refresh merge (merge_during_verify=false).
+# b=0.2, qpc=3, mnt=256. merged-reserve 自動（topm merge draft）→ 兩邊同預算。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.4
+    merge_offload: true
+    merge_during_verify: false
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, use_svd_merge: false, record_history: false}
+run: {T: 5, questions_per_cat: 5, max_new_tokens: 512}
+output: {label: cmp_topm_noopt_v04, dir: output/cmp_topm_noopt_v04}

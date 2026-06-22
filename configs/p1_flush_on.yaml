@@ -1,0 +1,30 @@
+# P1 flush ablation ON — merge_offload, flush_on_draft_end=false. A/B partner of
+# p1_flush_on. merge_during_verify=false both (isolate flush). b=0.2. qpc=1, mnt=64.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: false
+    flush_on_draft_end: true
+
+draft:
+  name: topm_count
+  args:
+    M: 32
+    K: 16
+    draft_top_k: 8
+    use_svd_merge: false
+    record_history: false
+
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 64
+
+output:
+  label: p1_flush_on
+  dir: output/p1_flush_on

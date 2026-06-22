@@ -1,0 +1,13 @@
+# specmoe N=2, vram_budget_ratio=0.4, qpc=3, mnt=256. pin=true (resident kept-N).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.4
+draft:
+  name: specmoe
+  args: {N: 32, route_top_k: 8, pin: true}
+run: {T: 5, questions_per_cat: 3, max_new_tokens: 256}
+output: {label: specmoe_n2_v04, dir: output/specmoe_n2_v04}
