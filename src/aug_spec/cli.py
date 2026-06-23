@@ -196,6 +196,55 @@ class RunConfig:
 
 
 # =========================================================================
+# Profiling dump (AUG_PROFILE=1)
+# =========================================================================
+
+def _dump_profile(controller) -> None:
+    """Print the engine's per-cycle time breakdown (AUG_PROFILE=1 only). Times
+    are µs; normalised by refresh cycles so topm/specmoe rows are comparable.
+    Answers: where each cycle spends time, what serialises (overload_wait) vs
+    overlaps, and SpecMoE's avoidable draft re-fetches (draft_fetch)."""
+    if os.environ.get("AUG_PROFILE") is None:
+        return
+    disp = None
+    for _, block in getattr(controller, "blocks", []):
+        ex = getattr(block, "expert_executor", None)
+        disp = getattr(ex, "expert_dispatcher", None) if ex else None
+        if disp is not None:
+            break
+    if disp is None or not hasattr(disp, "dump_profile"):
+        return
+    p = disp.dump_profile()
+    cyc = max(1, int(getattr(controller, "update_count", 0)))
+    print("\n" + "=" * 70)
+    print(f"  [AUG_PROFILE] per-cycle breakdown ({cyc} cycles)")
+    print("=" * 70)
+    def row(label, n_key, us_key):
+        n, us = p.get(n_key, 0), p.get(us_key, 0)
+        print(f"  {label:18s} {n/cyc:8.2f} /cyc   {us/cyc/1000:8.3f} ms/cyc"
+              f"   ({us/1e6:7.2f} s total)")
+    print(f"  {'step':18s} {'count':>8s}        {'time':>8s}")
+    row("verify_fetch", "verify_fetch_n", "verify_fetch_us")
+    row("draft_fetch", "draft_fetch_n", "draft_fetch_us")   # SpecMoE re-fetch
+    row("evict", "evict_n", "evict_us")
+    row("evict_layer", "evict_layer_n", "evict_layer_us")
+    row("overload_wait", "overload_wait_n", "overload_wait_us")  # H1 serialise
+    row("enqueue_wait", "enqueue_wait_n", "enqueue_wait_us")     # race-fix hits
+    row("expert_forward", "forward_n", "forward_us")
+    row("merge(P3)", "merge_n", "merge_us")
+    row("draft_dispatch", "dispatch_n", "dispatch_us")
+    gb = (p.get("verify_fetch_bytes", 0) + p.get("draft_fetch_bytes", 0)) / 1e9
+    print(f"  fetched {gb:.2f} GB total "
+          f"(verify {p.get('verify_fetch_bytes',0)/1e9:.2f} + "
+          f"draft {p.get('draft_fetch_bytes',0)/1e9:.2f})")
+    kc = getattr(getattr(controller, "draft", None), "kept_changed", None)
+    if kc:
+        print(f"  kept_changed: {sum(kc)/len(kc):.2f} experts/cycle "
+              f"(vs draft_fetch {p.get('draft_fetch_n',0)/cyc:.2f}/cyc)")
+    print("=" * 70)
+
+
+# =========================================================================
 # Run one experiment
 # =========================================================================
 
@@ -419,6 +468,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print(f"  TPS      : {ov.get('tokens_per_second', 0):.2f}")
     print(f"  Wall     : {wall:.2f} s, refresh cycles: {controller.update_count}")
     print(f"\n  Results saved → {summary_path}")
+
+    _dump_profile(controller)
 
     # Release VRAM before returning (so callers can chain).
     free_model(model)

@@ -28,12 +28,13 @@ import torch.nn.functional as F
 
 
 # Draft compute backend for the merged "multi" experts on the offload engine:
-#   "dispatch" (default) → archer MoEMLP::forward, the SAME kernel the SpecMoE
-#                          draft dispatches (apples-to-apples comparison);
-#   "bmm"                → Python torch.bmm.
-# Lets us A/B the draft kernel while holding the offload machinery fixed. The hf
-# backend always uses bmm (no dispatcher).
-_MERGED_BACKEND = os.environ.get("AUG_MERGED_BACKEND", "dispatch").lower()
+#   "engine_bmm" (default) → C++ DispatchBmm — the optimised resident-expert
+#                            path that topm and SpecMoE share;
+#   "dispatch"             → archer per-expert MoEMLP::forward (A/B vs the bmm
+#                            kernel, same machinery);
+#   "bmm"                  → Python torch.bmm.
+# The hf backend always uses bmm (no dispatcher).
+_MERGED_BACKEND = os.environ.get("AUG_MERGED_BACKEND", "engine_bmm").lower()
 
 
 # A cached SVD basis for one weight-matrix type: (US, V_blocks).
@@ -145,6 +146,27 @@ def _pairwise_l2(flats: List[torch.Tensor]) -> torch.Tensor:
     return D.float().cpu()
 
 
+def _specmoe_engine_bmm(controller, layer_idx, block, hs_flat,
+                        selected, routing_weights):
+    """Run SpecMoE's pinned kept-N experts through the engine's batched bmm
+    (`DispatchBmm`). The draft supplies a per-cycle-memoised stack of the kept
+    weights plus a kept-id→column map; `selected` (already substituted to kept)
+    and `routing_weights` are scattered into a [T, N] routing matrix. Returns
+    None when the kept experts aren't resident, so the caller falls back to the
+    per-expert dispatch."""
+    disp = block.expert_executor.expert_dispatcher
+    gpu = hs_flat.device.index
+    st = controller.draft.kept_bmm_state(
+        layer_idx, disp, gpu, hs_flat.device)
+    if st is None:
+        return None
+    gw, uw, dw, kept_to_col = st
+    cols = kept_to_col[selected]                          # [T, k]
+    routing = hs_flat.new_zeros(hs_flat.shape[0], gw.shape[0])  # [T, N]
+    routing.scatter_add_(1, cols, routing_weights)
+    return disp.dispatch_bmm(hs_flat, gw, uw, dw, routing, gpu)
+
+
 def _topk_substitute_forward(controller, layer_idx: int, block: nn.Module):
     """SpecMoE forward for the standard `block.gate` + `block.experts[e]`
     layout (Mixtral / Qwen3).
@@ -177,6 +199,19 @@ def _topk_substitute_forward(controller, layer_idx: int, block: nn.Module):
             routing_weights = routing_weights / routing_weights.sum(
                 dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hs_flat.dtype)
+
+        # engine_bmm (offload, draft): run the resident pinned kept-N experts
+        # through the engine's batched bmm — the SAME entry topm's merged draft
+        # uses, so a bmm-vs-bmm comparison isolates the algorithm. Falls back to
+        # the per-expert dispatch below if the kept experts aren't resident.
+        if (controller.in_draft_phase and _MERGED_BACKEND == "engine_bmm"
+                and hasattr(block, "expert_executor")
+                and hasattr(controller.draft, "kept_bmm_state")):
+            out = _specmoe_engine_bmm(
+                controller, layer_idx, block, hs_flat, selected, routing_weights)
+            if out is not None:
+                return (out.reshape(batch_size, sequence_length, hidden_dim),
+                        router_logits)
 
         # Offload: experts are placeholders — run the (remapped) winners
         # through the archer engine's dispatch instead of the per-expert loop.
@@ -277,22 +312,35 @@ class MoEAdapter:
         weight = hs_flat.new_zeros(T, K)
         weight.scatter_(1, top_cidx, top_scores.to(weight.dtype))
 
-        # Same-engine path (offload): run the K merged experts through the archer
-        # engine's MoEMLP::forward — identical to the SpecMoE draft's expert
-        # execution, so a TPS comparison isolates the algorithm, not the kernel.
-        # The C++ side does the weighted token-combine and returns [T, D].
         disp = self._merge_dispatcher(block) if block is not None else None
-        lists = (self._merged_tensor_lists(experts)
-                 if disp is not None and _MERGED_BACKEND != "bmm" else None)
-        if lists is not None:
-            return disp.dispatch_merged_local(
-                hs_flat, weight, lists, hs_flat.device.index)
 
-        # Fast path (hf): adapters with a uniform SwiGLU layout run all K merged
-        # experts in 3 batched bmm launches/layer instead of a K-iteration
-        # Python loop of tiny per-expert F.linear (~3K launches). Dense-over-all-K
-        # only costs K/k× the selected-token FLOPs, but the GEMMs are launch-bound
-        # at draft batch sizes so it is far cheaper in practice.
+        # engine_bmm (offload): pre-stacked weights → the engine's batched bmm
+        # (C++ DispatchBmm). Same op sequence as the Python bmm below, but the
+        # resident-expert compute is unified inside the engine — the home for the
+        # eventual CUTLASS grouped-GEMM upgrade. SpecMoE's draft calls the same
+        # entry, so a bmm-vs-bmm comparison isolates the algorithm.
+        if disp is not None and _MERGED_BACKEND == "engine_bmm":
+            stk = self._swiglu_stack(cache, experts)
+            if stk is not None:
+                gw, uw, dw = stk
+                return disp.dispatch_bmm(
+                    hs_flat, gw, uw, dw, weight, hs_flat.device.index)
+
+        # dispatch (offload, default): run the K merged experts through the archer
+        # engine's per-expert MoEMLP::forward — identical to SpecMoE's draft
+        # execution, so a TPS comparison there isolates the algorithm, not the
+        # kernel. The C++ side does the weighted token-combine and returns [T, D].
+        if disp is not None and _MERGED_BACKEND == "dispatch":
+            lists = self._merged_tensor_lists(experts)
+            if lists is not None:
+                return disp.dispatch_merged_local(
+                    hs_flat, weight, lists, hs_flat.device.index)
+
+        # Python bmm (hf, or AUG_MERGED_BACKEND=bmm on offload): adapters with a
+        # uniform SwiGLU layout run all K merged experts in 3 batched bmm
+        # launches/layer instead of a K-iteration Python loop of tiny per-expert
+        # F.linear. Dense-over-all-K only costs K/k× the selected-token FLOPs, but
+        # the GEMMs are launch-bound at draft batch sizes so it is far cheaper.
         eo = self._dense_experts_batched(cache, experts, hs_flat)  # [K, T, D] | None
         if eo is not None:
             # out[t] = Σ_k weight[t,k] · expert_k(hs[t]).
@@ -310,14 +358,25 @@ class MoEAdapter:
             out[mask] += expert_out * col[mask].unsqueeze(-1)
         return out
 
+    def _swiglu_stack(self, cache: Dict[str, Any],
+                      experts: List[Dict[str, torch.Tensor]]):
+        """Stack the K merged experts' SwiGLU weights for bmm, memoised on the
+        per-cycle `cache` dict — returns ``(gate, up, down)`` as
+        ``[K, D, I], [K, D, I], [K, I, D]``, or ``None`` when the adapter has no
+        uniform SwiGLU layout (e.g. gptoss). Overridden by qwen3 / mixtral.
+        Shared by the Python bmm and the engine_bmm (C++ DispatchBmm) paths."""
+        return None
+
     def _dense_experts_batched(self, cache: Dict[str, Any],
                                experts: List[Dict[str, torch.Tensor]],
                                hs_flat: torch.Tensor):
         """All K merged experts applied to every token via one batched bmm,
-        returning ``[K, T, D]`` — or ``None`` to use the generic per-cluster
-        loop. Overridden by SwiGLU adapters (qwen3, mixtral); the default has
-        no batched layout."""
-        return None
+        returning ``[K, T, D]`` — or ``None`` (no batched layout) to fall back
+        to the per-cluster loop."""
+        stk = self._swiglu_stack(cache, experts)
+        if stk is None:
+            return None
+        return _bmm_swiglu(hs_flat, *stk)
 
     @staticmethod
     def _merge_dispatcher(block):

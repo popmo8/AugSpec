@@ -17,7 +17,6 @@ import torch.nn.functional as F
 
 from .base import (
     MoEAdapter,
-    _bmm_swiglu,
     _stack_swiglu_weights,
     _svd_decompose,
     _svd_remerge,
@@ -141,11 +140,10 @@ class Qwen3MoeAdapter(MoEAdapter):
         hidden = F.silu(gate) * up
         return F.linear(hidden, avg["down_proj"])
 
-    def _dense_experts_batched(self, cache, experts, hs_flat):
-        # Same SwiGLU as _run_dense_expert, batched over all K merged experts.
-        gw, uw, dw = _stack_swiglu_weights(
+    def _swiglu_stack(self, cache, experts):
+        # gate_proj / up_proj / down_proj, stacked + transposed for bmm.
+        return _stack_swiglu_weights(
             cache, experts, "gate_proj", "up_proj", "down_proj")
-        return _bmm_swiglu(hs_flat, gw, uw, dw)
 
     def _merged_tensor_lists(self, experts):
         # Tensor-id order = [gate, up, down], matching MergeExpertsLocal's

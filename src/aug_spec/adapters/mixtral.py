@@ -12,7 +12,6 @@ import torch.nn.functional as F
 
 from .base import (
     MoEAdapter,
-    _bmm_swiglu,
     _stack_swiglu_weights,
     _svd_decompose,
     _svd_remerge,
@@ -92,10 +91,9 @@ class MixtralAdapter(MoEAdapter):
         hidden = F.silu(gate) * up
         return F.linear(hidden, avg["w2"])
 
-    def _dense_experts_batched(self, cache, experts, hs_flat):
-        # Same SwiGLU as _run_dense_expert (gate=w1, up=w3, down=w2), batched.
-        gw, uw, dw = _stack_swiglu_weights(cache, experts, "w1", "w3", "w2")
-        return _bmm_swiglu(hs_flat, gw, uw, dw)
+    def _swiglu_stack(self, cache, experts):
+        # gate=w1, up=w3, down=w2, stacked + transposed for bmm.
+        return _stack_swiglu_weights(cache, experts, "w1", "w3", "w2")
 
     def _standard_routing(self, block, hs_flat, gate_logits,
                           batch_size, sequence_length, hidden_dim):

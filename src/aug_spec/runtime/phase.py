@@ -23,8 +23,25 @@ Both helpers depend only on the controller exposing:
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Optional
+
+_AUG_PROFILE = os.environ.get("AUG_PROFILE") is not None
+
+
+def _profile_dispatcher(controller: Any):
+    """The archer dispatcher (for set_profile_phase), or None — resolved once
+    per phase-patch so the per-draft hot path stays cheap. Off unless
+    AUG_PROFILE + offload backend."""
+    if not _AUG_PROFILE:
+        return None
+    for _, block in getattr(controller, "blocks", []):
+        ex = getattr(block, "expert_executor", None)
+        disp = getattr(ex, "expert_dispatcher", None) if ex else None
+        if disp is not None and hasattr(disp, "set_profile_phase"):
+            return disp
+    return None
 
 
 @contextmanager
@@ -43,9 +60,12 @@ def shared_model_phase_patch(controller: Any):
     )
 
     orig_get = AssistedCandidateGenerator.get_candidates
+    prof_disp = _profile_dispatcher(controller)
 
     def patched_get(self, input_ids):
         controller.in_draft_phase = True
+        if prof_disp is not None:
+            prof_disp.set_profile_phase(1)   # tag fetches as draft
         # verify→draft transition: offload-merge engine may flush the archer
         # expert cache here (idle during the merged-dense draft) to free budget
         # for the merged experts (§1.4 phase-exclusive). No-op unless flush.
@@ -56,6 +76,8 @@ def shared_model_phase_patch(controller: Any):
             return orig_get(self, input_ids)
         finally:
             controller.in_draft_phase = False
+            if prof_disp is not None:
+                prof_disp.set_profile_phase(0)   # back to verify
             # draft→verify transition: flush the merged experts (dead during
             # verify) to hand the budget back to the verify cache.
             if engine is not None:

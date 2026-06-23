@@ -68,10 +68,18 @@ class SpecMoeDraft(DraftStrategy):
         # Static; built once in prepare(), never cleared by reset().
         self._expert_dist: Dict[int, torch.Tensor] = {}
         self.num_experts: int = 0
+        # layer_idx → (gw, uw, dw, kept_to_col) for the engine_bmm draft path,
+        # gathered from the resident pinned kept-N and memoised per cycle (the
+        # kept set changes every refresh, so it is cleared there).
+        self._kept_bmm: Dict[int, tuple] = {}
 
         # Run-level: one int per verify cycle = how many of the top-route_top_k
         # target experts fell outside the OLD mask, summed over layers.
         self.cycle_misses: List[int] = []
+        # Run-level: per cycle, how many kept-N experts are NEW vs last cycle
+        # (summed over layers) — AUG_PROFILE churn metric, compared against the
+        # draft re-fetch count to size the "pin earlier" opportunity.
+        self.kept_changed: List[int] = []
 
     # ── one-time setup ──────────────────────────────────────────────────
     def prepare(self, adapter, blocks) -> None:
@@ -99,6 +107,7 @@ class SpecMoeDraft(DraftStrategy):
         # persist across questions.
         self.target_score.clear()
         self._draft_mask.clear()
+        self._kept_bmm.clear()
 
     # ── target-phase capture (forward passes the full softmax) ──────────
     def capture(self, layer_idx: int, softmax: torch.Tensor) -> None:
@@ -110,6 +119,9 @@ class SpecMoeDraft(DraftStrategy):
         if not self.target_score:
             return
 
+        # New kept sets → invalidate the engine_bmm gathered/stacked weights.
+        self._kept_bmm.clear()
+
         # Miss telemetry against the OLD masks, before they are overwritten.
         cycle_miss = 0
         for li, score_vec in self.target_score.items():
@@ -120,11 +132,15 @@ class SpecMoeDraft(DraftStrategy):
             cycle_miss += int((~old_mask[top]).sum().item())
         self.cycle_misses.append(cycle_miss)
 
+        cycle_changed = 0
         layer_to_block = dict(blocks)
         for li, score_vec in self.target_score.items():
             top_n = torch.topk(score_vec, self.N).indices
             mask = torch.zeros(self.num_experts, dtype=torch.bool)
             mask[top_n] = True
+            old_mask = self._draft_mask.get(li)
+            if old_mask is not None:
+                cycle_changed += int((mask & ~old_mask).sum().item())
             self._draft_mask[li] = mask
             draft_cache[li] = self._build_substitute_table(li, mask)
             # specmoe_pin_plan.md: pin this layer's kept-N so the draft reads
@@ -136,6 +152,7 @@ class SpecMoeDraft(DraftStrategy):
                 disp = getattr(ex, "expert_dispatcher", None) if ex else None
                 if disp is not None:
                     disp.set_pinned(li, top_n.tolist(), 0)
+        self.kept_changed.append(cycle_changed)
 
     def _build_substitute_table(self, layer_idx: int,
                                 mask: torch.Tensor) -> torch.Tensor:
@@ -145,3 +162,35 @@ class SpecMoeDraft(DraftStrategy):
         kept = torch.nonzero(mask, as_tuple=False).flatten()
         nearest_pos = D[:, kept].argmin(dim=1)        # [num_experts]
         return kept[nearest_pos].long()
+
+    def kept_bmm_state(self, layer_idx, dispatcher, gpu, device):
+        """For the engine_bmm draft path: the kept-N experts' weights stacked
+        for `DispatchBmm` plus a kept-id→column map, gathered from the resident
+        pinned weights and memoised per cycle. Returns
+        ``(gw [N,D,I], uw [N,D,I], dw [N,I,D], kept_to_col [num_experts])`` or
+        ``None`` when any kept expert isn't GPU-resident (caller then falls back
+        to the per-expert dispatch). Requires pin=true so the kept-N stay
+        resident across the draft."""
+        st = self._kept_bmm.get(layer_idx)
+        if st is not None:
+            return st
+        mask = self._draft_mask.get(layer_idx)
+        if mask is None:
+            return None
+        kept = torch.nonzero(mask, as_tuple=False).flatten().tolist()  # ascending
+        gates, ups, downs = [], [], []
+        for e in kept:
+            w = dispatcher.get_resident_expert_weights(layer_idx, e, gpu)
+            if len(w) < 3:
+                return None  # not resident → caller uses per-expert dispatch
+            gates.append(w[0]); ups.append(w[1]); downs.append(w[2])
+        # tensor-id order [gate[I,D], up[I,D], down[D,I]] → bmm operands.
+        gw = torch.stack(gates).transpose(1, 2).contiguous()  # [N, D, I]
+        uw = torch.stack(ups).transpose(1, 2).contiguous()    # [N, D, I]
+        dw = torch.stack(downs).transpose(1, 2).contiguous()  # [N, I, D]
+        kept_to_col = torch.zeros(self.num_experts, dtype=torch.long, device=device)
+        for col, e in enumerate(kept):
+            kept_to_col[e] = col
+        st = (gw, uw, dw, kept_to_col)
+        self._kept_bmm[layer_idx] = st
+        return st

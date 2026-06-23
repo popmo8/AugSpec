@@ -6,9 +6,12 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -119,6 +122,25 @@ class ExpertDispatcher : public base::noncopyable {
       torch::Tensor hidden_states, torch::Tensor weight,
       const std::vector<std::vector<torch::Tensor>>& merged, int gpu_id);
 
+  // aug_spec v1: batched bmm over a set of resident experts (topm merged or
+  // specmoe pinned kept-N) — unifies the resident-expert draft compute inside
+  // the engine. Weights arrive PRE-STACKED (Python memoises the stack once per
+  // cycle, so there is no per-call re-stack): gw/uw are [E, D, I], dw is
+  // [E, I, D]; `weight` is [T, E] routing (0 = not selected). The op sequence is
+  // identical to the Python torch.bmm path, so results match bit-for-bit. (v2
+  // will swap the body for a CUTLASS grouped GEMM behind this same signature.)
+  torch::Tensor DispatchBmm(torch::Tensor hidden, torch::Tensor gw,
+                            torch::Tensor uw, torch::Tensor dw,
+                            torch::Tensor weight, int gpu_id);
+
+  // aug_spec profiling (AUG_PROFILE=1; zero cost otherwise). SetProfilePhase
+  // tags fetches as verify(0) / draft(1) so SpecMoE's draft re-fetches are
+  // separable. DumpProfile returns cumulative counters (times in µs); used to
+  // see where each cycle spends time and what serialises vs overlaps.
+  void SetProfilePhase(int phase);
+  std::map<std::string, int64_t> DumpProfile();
+  void ResetProfile();
+
   // aug_spec / verify_merge_plan.md P1: evict every GPU-resident expert on
   // `gpu_id` back to host and reset the sparse-cache budget to full. Cheap —
   // the host copies are the offload source, so this just frees the GPU mirrors
@@ -212,6 +234,25 @@ class ExpertDispatcher : public base::noncopyable {
   int cache_capacity_ = 0;
 
   std::vector<MoEMLP*> modules_;
+
+  // aug_spec profiling counters (times in µs, all atomic — touched by the
+  // fetch/exec worker threads and the main dispatch thread).
+  struct ProfileCounters {
+    std::atomic<int64_t> verify_fetch_n{0}, verify_fetch_us{0},
+        verify_fetch_bytes{0};
+    std::atomic<int64_t> draft_fetch_n{0}, draft_fetch_us{0},
+        draft_fetch_bytes{0};
+    std::atomic<int64_t> evict_n{0}, evict_us{0};
+    std::atomic<int64_t> overload_wait_n{0}, overload_wait_us{0};
+    std::atomic<int64_t> enqueue_wait_n{0}, enqueue_wait_us{0};
+    std::atomic<int64_t> forward_n{0}, forward_us{0};
+    std::atomic<int64_t> merge_n{0}, merge_us{0};
+    std::atomic<int64_t> evict_layer_n{0}, evict_layer_us{0};
+    std::atomic<int64_t> dispatch_n{0}, dispatch_us{0};
+  };
+  ProfileCounters prof_;
+  std::atomic<int> profile_phase_{0};   // 0 = verify, 1 = draft
+  bool profile_enabled_ = false;
 };
 
 #define SET_TENSORS_AND_MODULE_FROM_BLOB(cls, module, node, device, \

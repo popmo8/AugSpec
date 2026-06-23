@@ -18,7 +18,16 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <chrono>
+#include <cstdlib>
 #include <future>
+
+// aug_spec profiling: monotonic microsecond clock for the AUG_PROFILE counters.
+static inline int64_t _prof_now_us() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
                                    int expert_type, int num_threads)
@@ -41,6 +50,7 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
       pinned_(kNumDevices()),
       modules_(kNumDevices(), nullptr) {
   main_thread_stop_flag_.store(false);
+  profile_enabled_ = (std::getenv("AUG_PROFILE") != nullptr);
 
   // module_ = new MoEMLP(dtype, expert_type);
 
@@ -134,11 +144,29 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
   int expert_idx = args.expert_idx;
   auto expert_node = experts_[expert_idx][layer_idx];
 
-  if (!expert_node->node->mutex.try_lock()) {
-    // NOTE: try lock must success, if there is no prefetching
-    DLOG_FATAL("ExpertDispatcher::Enqueue: mutex try_lock failed (expert_idx ",
-               expert_idx, " layer_idx ", layer_idx, "node ",
-               expert_node->node->str(), ")");
+  // aug_spec race fix: under heavy cache churn (esp. topm's tiny merged-reserve
+  // pool → frequent eviction) a concurrent fetch/evict can hold this node's
+  // mutex mid-move (DEVICE[cuda;cuda;cpu]). The old `try_lock + FATAL` aborted
+  // the whole run on that timing window. Enqueue holds no other lock here, so
+  // the mover (which holds node->mutex, not anything Enqueue needs) cannot
+  // deadlock us — wait (bounded) for it to finish and release. The device
+  // re-check below then routes correctly: still resident → exec; evicted while
+  // we waited → input_queue re-fetch. The ~10s ceiling distinguishes genuine
+  // churn (sub-ms) from a real stuck thread (keeps the original assert's intent
+  // of catching logic bugs, without crashing on benign contention).
+  int _enq_spins = 0;
+  int64_t _enq_t0 = profile_enabled_ ? _prof_now_us() : 0;
+  while (!expert_node->node->mutex.try_lock()) {
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    if (++_enq_spins > 200000) {
+      DLOG_FATAL("ExpertDispatcher::Enqueue: node mutex held >10s (stuck), "
+                 "expert_idx ", expert_idx, " layer_idx ", layer_idx, " node ",
+                 expert_node->node->str());
+    }
+  }
+  if (profile_enabled_ && _enq_spins > 0) {
+    prof_.enqueue_wait_us += _prof_now_us() - _enq_t0;
+    prof_.enqueue_wait_n += 1;   // how often the race window was hit
   }
   expert_node->node->last_access_time = MCIROSECONDS_SINCE_EPOCH;
 
@@ -235,6 +263,7 @@ std::vector<torch::Tensor> ExpertDispatcher::GetResidentExpertWeights(
 std::vector<torch::Tensor> ExpertDispatcher::MergeExpertsLocal(
     int layer_idx, const std::vector<int>& expert_ids,
     const std::vector<double>& weights, int gpu_id) {
+  int64_t _mg_t0 = profile_enabled_ ? _prof_now_us() : 0;
   std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
   auto device = torch::Device(torch::kCUDA, gpu_id);
   std::vector<torch::Tensor> acc;          // fp32 accumulators per weight matrix
@@ -279,12 +308,17 @@ std::vector<torch::Tensor> ExpertDispatcher::MergeExpertsLocal(
   for (auto& a : acc) {
     if (a.defined()) out.push_back(a.to(out_dtype));
   }
+  if (profile_enabled_) {
+    prof_.merge_us += _prof_now_us() - _mg_t0;
+    prof_.merge_n += 1;
+  }
   return out;
 }
 
 torch::Tensor ExpertDispatcher::DispatchMergedLocal(
     torch::Tensor hidden_states, torch::Tensor weight,
     const std::vector<std::vector<torch::Tensor>>& merged, int gpu_id) {
+  int64_t _dp_t0 = profile_enabled_ ? _prof_now_us() : 0;
   cudaSetDevice(gpu_id);
   auto device = CUDA_DEVICE(gpu_id);
   const int64_t T = hidden_states.size(0);
@@ -313,7 +347,36 @@ torch::Tensor ExpertDispatcher::DispatchMergedLocal(
         0, token_idx, (output.to(torch::kFloat32) * scale.to(torch::kFloat32)));
   }
 
+  if (profile_enabled_) {  // forward() already synced each expert
+    prof_.dispatch_us += _prof_now_us() - _dp_t0;
+    prof_.dispatch_n += 1;
+  }
   return final_hidden.to(hidden_states.dtype());
+}
+
+torch::Tensor ExpertDispatcher::DispatchBmm(
+    torch::Tensor hidden, torch::Tensor gw, torch::Tensor uw,
+    torch::Tensor dw, torch::Tensor weight, int gpu_id) {
+  int64_t _db_t0 = profile_enabled_ ? _prof_now_us() : 0;
+  cudaSetDevice(gpu_id);
+  const int64_t E = gw.size(0);
+  const int64_t T = hidden.size(0);
+  const int64_t D = hidden.size(1);
+  // Pre-stacked resident experts → 3 batched GEMMs. gw/uw are [E, D, I] and dw
+  // is [E, I, D], so bmm(hidden, ·) gives SiLU(hs·gateᵀ)⊙(hs·upᵀ)·downᵀ. The
+  // stack itself is memoised Python-side (once per cycle); this is the exact
+  // op sequence of the Python torch.bmm path, just inside the engine.
+  auto hsE = hidden.unsqueeze(0).expand({E, T, D});                   // [E,T,D]
+  auto hid = torch::silu(torch::bmm(hsE, gw)) * torch::bmm(hsE, uw);  // [E,T,I]
+  auto eo = torch::bmm(hid, dw);                                      // [E,T,D]
+  // out[t] = Σ_e weight[t,e] · expert_e(hs[t]).
+  auto out = (eo * weight.transpose(0, 1).unsqueeze(-1)).sum(0);      // [T,D]
+  if (profile_enabled_) {  // sync so the timing reflects real GPU work
+    c10::cuda::getCurrentCUDAStream(gpu_id).synchronize();
+    prof_.dispatch_us += _prof_now_us() - _db_t0;
+    prof_.dispatch_n += 1;
+  }
+  return out;
 }
 
 void ExpertDispatcher::FlushCache(int gpu_id) {
@@ -341,6 +404,7 @@ void ExpertDispatcher::FlushCache(int gpu_id) {
 }
 
 void ExpertDispatcher::EvictLayer(int layer_idx, int gpu_id) {
+  int64_t _el_t0 = profile_enabled_ ? _prof_now_us() : 0;
   std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
   std::vector<uint64_t> to_evict;
   for (auto key : cached_experts_[gpu_id]) {
@@ -362,6 +426,51 @@ void ExpertDispatcher::EvictLayer(int layer_idx, int gpu_id) {
     }
     cached_experts_[gpu_id].erase(key);
   }
+  if (profile_enabled_) {
+    prof_.evict_layer_us += _prof_now_us() - _el_t0;
+    prof_.evict_layer_n += 1;
+  }
+}
+
+void ExpertDispatcher::SetProfilePhase(int phase) {
+  profile_phase_.store(phase);
+}
+
+void ExpertDispatcher::ResetProfile() {
+  prof_.verify_fetch_n = 0; prof_.verify_fetch_us = 0; prof_.verify_fetch_bytes = 0;
+  prof_.draft_fetch_n = 0; prof_.draft_fetch_us = 0; prof_.draft_fetch_bytes = 0;
+  prof_.evict_n = 0; prof_.evict_us = 0;
+  prof_.overload_wait_n = 0; prof_.overload_wait_us = 0;
+  prof_.enqueue_wait_n = 0; prof_.enqueue_wait_us = 0;
+  prof_.forward_n = 0; prof_.forward_us = 0;
+  prof_.merge_n = 0; prof_.merge_us = 0;
+  prof_.evict_layer_n = 0; prof_.evict_layer_us = 0;
+  prof_.dispatch_n = 0; prof_.dispatch_us = 0;
+}
+
+std::map<std::string, int64_t> ExpertDispatcher::DumpProfile() {
+  return {
+      {"verify_fetch_n", prof_.verify_fetch_n.load()},
+      {"verify_fetch_us", prof_.verify_fetch_us.load()},
+      {"verify_fetch_bytes", prof_.verify_fetch_bytes.load()},
+      {"draft_fetch_n", prof_.draft_fetch_n.load()},
+      {"draft_fetch_us", prof_.draft_fetch_us.load()},
+      {"draft_fetch_bytes", prof_.draft_fetch_bytes.load()},
+      {"evict_n", prof_.evict_n.load()},
+      {"evict_us", prof_.evict_us.load()},
+      {"overload_wait_n", prof_.overload_wait_n.load()},
+      {"overload_wait_us", prof_.overload_wait_us.load()},
+      {"enqueue_wait_n", prof_.enqueue_wait_n.load()},
+      {"enqueue_wait_us", prof_.enqueue_wait_us.load()},
+      {"forward_n", prof_.forward_n.load()},
+      {"forward_us", prof_.forward_us.load()},
+      {"merge_n", prof_.merge_n.load()},
+      {"merge_us", prof_.merge_us.load()},
+      {"evict_layer_n", prof_.evict_layer_n.load()},
+      {"evict_layer_us", prof_.evict_layer_us.load()},
+      {"dispatch_n", prof_.dispatch_n.load()},
+      {"dispatch_us", prof_.dispatch_us.load()},
+  };
 }
 
 void ExpertDispatcher::SetPinned(int layer_idx,
@@ -493,8 +602,13 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
                    " expert_idx ", expert_idx);
         // gpu_overload_[gpu_id].wait_and_set(false, true);
         // busy wait for cache to be available
+        int64_t _ow_t0 = profile_enabled_ ? _prof_now_us() : 0;
         while (gpu_overload_[gpu_id]) {
           std::this_thread::sleep_for(std::chrono::microseconds(1));
+        }
+        if (profile_enabled_) {
+          prof_.overload_wait_us += _prof_now_us() - _ow_t0;
+          prof_.overload_wait_n += 1;
         }
         gpu_overload_[gpu_id] = true;
       } else {
@@ -562,7 +676,12 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
                    " expert_idx ", expert_idx);
 
         auto evict_node = evict_expert_node->node;
+        int64_t _ev_t0 = profile_enabled_ ? _prof_now_us() : 0;
         evict_node->SetDevice(evict_node->default_host);
+        if (profile_enabled_) {
+          prof_.evict_us += _prof_now_us() - _ev_t0;
+          prof_.evict_n += 1;
+        }
         cache_sizes_[gpu_id] += evict_node->byte_size;
         int64_t evict_layer_idx = evict_expert_node->layer_idx;
         int64_t evict_expert_idx = evict_expert_node->expert_idx;
@@ -586,7 +705,21 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
       cached_experts_[gpu_id].insert(key);
     }
 
+    int64_t _ft_t0 = profile_enabled_ ? _prof_now_us() : 0;
     expert_node->node->SetDevice(device, true, stream);
+    if (profile_enabled_ && !cache_hit) {
+      // Real H2D fetch (cache miss). Tag by phase so SpecMoE's draft re-fetches
+      // (kept-N evicted during verify) are separable from verify fetches.
+      int64_t _us = _prof_now_us() - _ft_t0;
+      int64_t _by = expert_node->node->byte_size;
+      if (profile_phase_.load() == 1) {
+        prof_.draft_fetch_n += 1; prof_.draft_fetch_us += _us;
+        prof_.draft_fetch_bytes += _by;
+      } else {
+        prof_.verify_fetch_n += 1; prof_.verify_fetch_us += _us;
+        prof_.verify_fetch_bytes += _by;
+      }
+    }
     expert_node->node->incache_visit_count += 1;
     expert_node->SetTensorsFromBlob(device);
     // module_->SetTensorsFromIds(expert_node->node->tensor_ids);
@@ -693,7 +826,12 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id) {
     // int expert_type = expert_type_;
     // cudaStreamSynchronize(stream);  // make sure the input is ready
 
+    int64_t _fw_t0 = profile_enabled_ ? _prof_now_us() : 0;
     auto output = modules_[gpu_id]->forward(input, stream);
+    if (profile_enabled_) {
+      prof_.forward_us += _prof_now_us() - _fw_t0;
+      prof_.forward_n += 1;
+    }
     OutputFunc(args, output, token_mask, gpu_id);
   }
 

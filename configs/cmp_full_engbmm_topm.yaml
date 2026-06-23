@@ -1,0 +1,16 @@
+# FULL SpecBench (qpc=80 → all 480 Q) — topm via engine_bmm (C++ DispatchBmm).
+# b=0.2, mnt=512. Same engine bmm path both sides.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, use_svd_merge: false, record_history: false}
+run: {T: 5, questions_per_cat: 80, max_new_tokens: 512}
+output: {label: cmp_full_engbmm_topm, dir: output/cmp_full_engbmm_topm}
