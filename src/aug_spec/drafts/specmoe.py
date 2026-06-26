@@ -154,6 +154,46 @@ class SpecMoeDraft(DraftStrategy):
                     disp.set_pinned(li, top_n.tolist(), 0)
         self.kept_changed.append(cycle_changed)
 
+    def _dispatcher(self, block):
+        ex = getattr(block, "expert_executor", None)
+        return getattr(ex, "expert_dispatcher", None) if ex else None
+
+    def early_pin(self, layer_idx, block, mode=1) -> None:
+        """Pin this layer's next-draft kept-N during verify, the moment its count
+        is captured (before this layer's dispatch), so they are not evicted
+        before the draft. mode 2 also keeps last cycle's kept-N pinned through
+        this layer's compute (dropped later in `late_unpin`) so an old kept-N
+        that this verify still routes is not evicted mid-compute. Offload + pin
+        only; no-op otherwise."""
+        if not self.pin:
+            return
+        score = self.target_score.get(layer_idx)   # just set by capture()
+        if score is None or self.num_experts == 0:
+            return
+        disp = self._dispatcher(block)
+        if disp is None:
+            return
+        ids = set(torch.topk(score, self.N).indices.tolist())   # new kept-N
+        if mode == 2:
+            old_mask = self._draft_mask.get(layer_idx)          # last cycle's
+            if old_mask is not None:
+                ids |= set(torch.nonzero(old_mask, as_tuple=False)
+                           .flatten().tolist())
+        disp.set_pinned(layer_idx, list(ids), 0)
+
+    def late_unpin(self, layer_idx, block) -> None:
+        """mode 2: after this layer's experts are computed, re-pin only the new
+        kept-N (drops the old kept-N the next draft won't use)."""
+        if not self.pin:
+            return
+        score = self.target_score.get(layer_idx)
+        if score is None or self.num_experts == 0:
+            return
+        disp = self._dispatcher(block)
+        if disp is not None:
+            top_n = torch.topk(score, self.N).indices
+            disp.set_pinned(layer_idx, top_n.tolist(), 0)
+
     def _build_substitute_table(self, layer_idx: int,
                                 mask: torch.Tensor) -> torch.Tensor:
         """[num_experts] long: each expert → the kept expert it routes to.
@@ -179,11 +219,19 @@ class SpecMoeDraft(DraftStrategy):
             return None
         kept = torch.nonzero(mask, as_tuple=False).flatten().tolist()  # ascending
         gates, ups, downs = [], [], []
+        n_res = 0
         for e in kept:
             w = dispatcher.get_resident_expert_weights(layer_idx, e, gpu)
-            if len(w) < 3:
-                return None  # not resident → caller uses per-expert dispatch
-            gates.append(w[0]); ups.append(w[1]); downs.append(w[2])
+            if len(w) >= 3:
+                n_res += 1
+                gates.append(w[0]); ups.append(w[1]); downs.append(w[2])
+        # AUG_PROFILE diagnostic: how many of this layer's kept-N are actually
+        # GPU-resident at draft time (need 100% for the bmm path to engage).
+        self._bmm_calls = getattr(self, "_bmm_calls", 0) + 1
+        self._bmm_res_sum = getattr(self, "_bmm_res_sum", 0) + n_res
+        self._bmm_kept_sum = getattr(self, "_bmm_kept_sum", 0) + len(kept)
+        if n_res < len(kept):
+            return None  # not all resident → caller uses per-expert dispatch
         # tensor-id order [gate[I,D], up[I,D], down[D,I]] → bmm operands.
         gw = torch.stack(gates).transpose(1, 2).contiguous()  # [N, D, I]
         uw = torch.stack(ups).transpose(1, 2).contiguous()    # [N, D, I]

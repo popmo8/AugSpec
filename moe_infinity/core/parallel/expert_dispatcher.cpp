@@ -51,6 +51,7 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
       modules_(kNumDevices(), nullptr) {
   main_thread_stop_flag_.store(false);
   profile_enabled_ = (std::getenv("AUG_PROFILE") != nullptr);
+  no_overload_ = (std::getenv("AUG_NO_OVERLOAD") != nullptr);
 
   // module_ = new MoEMLP(dtype, expert_type);
 
@@ -536,12 +537,17 @@ ExpertNodePtr ExpertDispatcher::FindExpertEvict(int gpu_id) {
     if (node == nullptr) continue;
     if (node->device.is_cuda() && node->incache_visit_count < min_visit_count &&
         node->mutex.try_lock()) {
+      // Keep the chosen victim LOCKED through the actual eviction (the caller
+      // unlocks after SetDevice) so it can't be re-acquired + computed between
+      // selection and eviction — that race frees in-use GPU memory and segfaults
+      // under batch>1 (verify) concurrency. Release the previous best on replace.
+      if (evict_expert_node != nullptr)
+        evict_expert_node->node->mutex.unlock();
       evict_expert_node = experts_[expert_idx][layer_idx];
       min_visit_count = node->incache_visit_count;
-      node->mutex.unlock();
     }
   }
-  return evict_expert_node;
+  return evict_expert_node;   // returned LOCKED (caller must unlock after evict)
 }
 
 void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
@@ -593,7 +599,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
                cached_experts_[gpu_id].size());
 
     if (!cache_hit && cache_sizes_[gpu_id] < expert_node->node->byte_size) {
-      if (batch_size > 1) {
+      if (batch_size > 1 && !no_overload_) {
         // force fetch to GPU regardless of cache size, only for prefill
         // only one extra cache slot for prefill
         DLOG_DEBUG("overloading expert cache: gpu_id ", gpu_id, " cache size ",
@@ -696,6 +702,9 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
               "ExpertDispatcher::GPUFetchFunc: evict_key not found. layer_idx ",
               evict_layer_idx, " expert_idx ", evict_expert_idx);
         }
+        // Eviction done — release the victim lock FindExpertEvict held (now on
+        // host, so a waiting Enqueue re-routes it to a re-fetch).
+        evict_node->mutex.unlock();
       }
     }
 

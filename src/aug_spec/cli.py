@@ -241,6 +241,12 @@ def _dump_profile(controller) -> None:
     if kc:
         print(f"  kept_changed: {sum(kc)/len(kc):.2f} experts/cycle "
               f"(vs draft_fetch {p.get('draft_fetch_n',0)/cyc:.2f}/cyc)")
+    draft = getattr(controller, "draft", None)
+    if draft is not None and getattr(draft, "_bmm_calls", 0) > 0:
+        frac = draft._bmm_res_sum / max(1, draft._bmm_kept_sum)
+        print(f"  kept_bmm: {draft._bmm_calls} calls, kept resident "
+              f"{draft._bmm_res_sum}/{draft._bmm_kept_sum} = {frac*100:.0f}% "
+              f"(need 100%/layer for bmm to engage)")
     print("=" * 70)
 
 

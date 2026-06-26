@@ -36,6 +36,11 @@ import torch.nn.functional as F
 # The hf backend always uses bmm (no dispatcher).
 _MERGED_BACKEND = os.environ.get("AUG_MERGED_BACKEND", "engine_bmm").lower()
 
+# SpecMoE early-pin (Stage 1): pin each layer's kept-N during verify instead of
+# in refresh, so they stay resident for the next draft (draft re-fetch → 0).
+# 0=off, 1=pin-now, 2=keep last cycle's kept until after this layer's compute.
+_EARLY_PIN = int(os.environ.get("AUG_EARLY_PIN", "0"))
+
 
 # A cached SVD basis for one weight-matrix type: (US, V_blocks).
 #   US       : [O, q]  — the U @ diag(S) factor, precomputed.
@@ -194,6 +199,16 @@ def _topk_substitute_forward(controller, layer_idx: int, block: nn.Module):
                 selected = sub_table.to(selected.device)[selected]   # remap
         else:
             controller.draft.capture(layer_idx, full_softmax)
+            # AUG_EARLY_PIN: pin this layer's next-draft kept-N NOW (count is known
+            # the moment the gate runs) so they stay resident for the draft
+            # (draft_fetch → 0). Default (0) pins only in refresh (after verify).
+            #   mode 1 = pin new kept-N now (unpins old-dropped immediately).
+            #   mode 2 = also keep last cycle's kept pinned through this layer's
+            #            compute, then drop the dropped ones in late_unpin (after
+            #            dispatch) so an old-kept this verify still uses isn't
+            #            evicted early.
+            if _EARLY_PIN and hasattr(controller.draft, "early_pin"):
+                controller.draft.early_pin(layer_idx, block, _EARLY_PIN)
 
         if getattr(block, "norm_topk_prob", True):
             routing_weights = routing_weights / routing_weights.sum(
@@ -218,6 +233,12 @@ def _topk_substitute_forward(controller, layer_idx: int, block: nn.Module):
         if hasattr(block, "expert_executor"):
             final = controller.adapter._dispatch_selected(
                 block, hs_flat, selected, routing_weights)
+            # mode 2: this layer's experts are now computed → drop the old kept-N
+            # that the next draft won't use (kept pinned until here so they were
+            # not evicted mid-compute).
+            if (_EARLY_PIN == 2 and not controller.in_draft_phase
+                    and hasattr(controller.draft, "late_unpin")):
+                controller.draft.late_unpin(layer_idx, block)
             return (final.reshape(batch_size, sequence_length, hidden_dim),
                     router_logits)
 

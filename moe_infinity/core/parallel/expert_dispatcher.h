@@ -253,6 +253,12 @@ class ExpertDispatcher : public base::noncopyable {
   ProfileCounters prof_;
   std::atomic<int> profile_phase_{0};   // 0 = verify, 1 = draft
   bool profile_enabled_ = false;
+
+  // aug_spec (AUG_NO_OVERLOAD): route batch>1 cache-full fetches through the
+  // normal FindExpertEvict path (evict one LFU non-pinned per fetch, pinned
+  // kept-N skipped) instead of the single-slot serialised "overload" borrow.
+  // Restores prefetch depth and makes pinning actually keep kept-N resident.
+  bool no_overload_ = false;
 };
 
 #define SET_TENSORS_AND_MODULE_FROM_BLOB(cls, module, node, device, \

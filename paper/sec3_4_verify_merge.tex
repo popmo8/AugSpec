@@ -1,0 +1,102 @@
+% ============================================================================
+% Section 3.4 — Memory-Bounded Verify-Time Refresh
+% Insert after Section 3.3, before Section 4 (Experiments).
+% Packages: amsmath, algorithm, algpseudocode.
+% NOTE on cross-refs: replace \eqref{eq:merge}, \eqref{eq:slice},
+%   \eqref{eq:speedup} with the actual labels of your Eq. (4), Eq. (5), Eq. (2).
+% Notation reused from 3.1-3.3:
+%   n experts {E_i}, L layers, counts c_i over window W, top-M set M,
+%   merged experts \hat{E} (K=1) / \hat{E}^{(j)} over slices Q_j (K>1),
+%   budget rho = K/n, speedup S with acceptance term tau(gamma) [Eq. (2)].
+% ============================================================================
+\subsection{Memory-Bounded Verify-Time Refresh}
+\label{sec:verify-merge}
+
+Sections~\ref{sec:topm}--\ref{sec:cluster} construct the merged experts
+$\widehat{\mathcal{E}}$ and argue that their per-cycle refresh
+(Eq.~\eqref{eq:merge}, Eq.~\eqref{eq:slice}) is \emph{interconnect-free}:
+verification already fetches the activated experts, so re-evaluating the
+count-weighted merge over the top-$M$ constituents $\mathcal{M}$ only reuses
+matrices that are already GPU-resident. This argument is sound only if the
+constituents are \emph{still} resident at the moment the merge runs. On a
+production offloading engine under the tight budget $\rho$, they are not: when
+the expert cache is full during batched verification, the engine evicts each
+activated expert back to host \emph{immediately after its use}. A na\"ive refresh
+deferred to the cycle boundary therefore finds every constituent of
+Eq.~\eqref{eq:merge} already evicted and must re-fetch them over PCIe---
+reintroducing exactly the migration cost the merged draft was designed to remove.
+Making the refresh genuinely free thus requires \emph{co-scheduling} the merge
+with verification so that the constituents are resident when the merge consumes
+them, while never exceeding the budget. We realise this with a four-stage memory
+schedule, $\mathrm{P1}$--$\mathrm{P4}$, applied in dependency order.
+
+\paragraph{P1: Phase-exclusive residency.}
+Drafting and verification never run concurrently, so their working sets need not
+co-reside. We give each phase exclusive ownership of the expert-memory budget:
+at the end of a draft phase we flush the $K$ pinned merged experts
+$\{\widehat{\mathcal{E}}\}$, returning their footprint to the verification cache,
+and symmetrically reclaim that cache at the start of the next draft. Since the
+budget $\rho=K/n$ that pins the merged experts would otherwise permanently shrink
+the cache available to verification, phase-exclusive ownership both keeps peak
+memory within $\rho$ and, by leaving the verification cache less full, reduces how
+often the engine falls back to the immediate post-use eviction that destroys
+residency.
+
+\paragraph{P2: Constituent-last ordering with per-layer eviction.}
+Within each verification layer we reorder expert fetches so that the
+non-constituent experts are dispatched first and the merge constituents
+$\mathcal{M}$ last, maximising the interval over which the constituents remain
+resident before the merge consumes them. Once a layer has been both verified and
+merged, we evict its experts in a single per-layer pass, bounding the live cache
+to roughly one layer's working set so the schedule fits the budget at every
+depth. This ordering also serialises the merge against the engine's eviction,
+guaranteeing that the in-place merge of P3 never reads a partially-evicted
+constituent.
+
+\paragraph{P3: In-place verify-time merge.}
+With residency guaranteed by P1 and P2, we evaluate the count-weighted merge
+(Eq.~\eqref{eq:merge} for $K{=}1$, Eq.~\eqref{eq:slice} for $K{>}1$) in place,
+per layer, the moment layer $\ell$'s verification completes, directly from the
+resident constituent weights through a single fused on-device kernel. No
+host-to-device transfer is incurred. Because the counts $c_i$ that drive the
+merge are exactly those produced by the verification pass, relocating the merge
+from the cycle boundary into the pass is \emph{output-identical} to the refresh
+of Sections~\ref{sec:topm}--\ref{sec:cluster}: it changes \emph{when} the merged
+experts are built, not \emph{what} they are, leaving the draft weights---and hence
+the acceptance term $\tau(\gamma)$ in Eq.~\eqref{eq:speedup}---unchanged. P2 and
+P3 share a single per-layer hook and are realised as one mechanism.
+
+\paragraph{P4: Merge--fetch overlap.}
+The in-place merge of P3 is a synchronous on-device computation. As an orthogonal
+extension, its latency can be hidden by issuing the merge on a side stream that
+overlaps the host-to-device fetch of the following layer's experts, at the cost
+of pinning each constituent until its side-stream merge completes. We describe P4
+for completeness and leave its implementation and evaluation to future work.%
+\footnote{P1--P3 are enabled in all reported results; P4 is a design extension
+that we do not evaluate.}
+
+Together, P1--P3 turn the ``free refresh'' of Sections~\ref{sec:topm}--%
+\ref{sec:cluster} from an asymptotic argument into a property that holds on a real
+offloading engine at the budget $\rho$: every speculative cycle rebuilds all
+merged experts with zero re-fetch, so the only expert migration that remains is
+the verification traffic the target would incur regardless.
+
+\begin{algorithm}[t]
+\caption{One speculative cycle with memory-bounded refresh (P1--P3)}
+\label{alg:verify-merge}
+\begin{algorithmic}[1]
+\State \textbf{Draft:} generate $\gamma$ tokens using resident
+       $\{\widehat{\mathcal{E}}\}$ \Comment{no expert migration}
+\State flush $\{\widehat{\mathcal{E}}\}$, reclaim verification cache \Comment{P1}
+\For{each layer $\ell = 1,\dots,L$ in the verification pass}
+  \State evaluate gate; obtain counts $c_i$ and top-$M$ set $\mathcal{M}$
+         \Comment{byproduct of verification}
+  \State dispatch non-constituent experts, then $\mathcal{M}$ \Comment{P2}
+  \State verify layer $\ell$
+  \State build $\widehat{\mathcal{E}}_\ell$ from resident weights via
+         Eq.~\eqref{eq:merge}/\eqref{eq:slice} \Comment{P3, 0 re-fetch}
+  \State evict layer $\ell$'s experts \Comment{P2}
+\EndFor
+\State pin $\{\widehat{\mathcal{E}}\}$ for the next draft \Comment{P1}
+\end{algorithmic}
+\end{algorithm}

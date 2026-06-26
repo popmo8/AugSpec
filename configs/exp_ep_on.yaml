@@ -1,0 +1,14 @@
+# Stage 1 early-pin 比較(on):specmoe pinned, vram 0.2, profiling.
+# AUG_EARLY_PIN 由 script 設(off run 不設、on run 設 1)。draft 預設 engine_bmm。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+draft:
+  name: specmoe
+  args: {N: 16, route_top_k: 8, pin: true}
+run: {T: 5, questions_per_cat: 1, max_new_tokens: 128}
+output: {label: exp_ep_on, dir: output/exp_ep_on}

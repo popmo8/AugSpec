@@ -1,0 +1,15 @@
+# topm qpc=5, no_overload OFF baseline. P2+P3, vram 0.2.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, use_svd_merge: false, record_history: false}
+run: {T: 5, questions_per_cat: 5, max_new_tokens: 128}
+output: {label: q5_tm_off, dir: output/q5_tm_off}

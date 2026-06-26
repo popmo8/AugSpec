@@ -1,0 +1,13 @@
+# specmoe qpc=5, early-pin + no_overload ON, mnt=512 (matches old engine_bmm runs).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+draft:
+  name: specmoe
+  args: {N: 16, route_top_k: 8, pin: true}
+run: {T: 5, questions_per_cat: 5, max_new_tokens: 512}
+output: {label: q5_512_sm_on, dir: output/q5_512_sm_on}
