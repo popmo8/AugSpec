@@ -27,10 +27,8 @@ class PrefillTopMCountDraft(PrefillCountDraft):
     """Prefill-only count merge with a fixed top-M cutoff."""
 
     def __init__(self, count_top_k: int, M: Optional[int] = None,
-                 use_svd_merge: bool = False, svd_rank: int = 256,
                  K: int = 1, draft_top_k: Optional[int] = None):
         super().__init__(count_top_k=count_top_k,
-                         use_svd_merge=use_svd_merge, svd_rank=svd_rank,
                          K=K, draft_top_k=draft_top_k)
         if M is not None and M < 1:
             raise ValueError(f"M must be >= 1, got {M!r}")

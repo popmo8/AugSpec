@@ -13,7 +13,7 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
-from .base import MoEAdapter, _svd_decompose, _svd_remerge, _weighted_sum
+from .base import MoEAdapter
 
 
 def _wrap_chat_template_with_reasoning(tokenizer, reasoning_effort: str):
@@ -107,32 +107,6 @@ class GptOssAdapter(MoEAdapter):
         }
         del gate_up_sum, gate_up_bias_sum, down_sum, down_bias_sum
         return out
-
-    def build_svd_basis(self, mlp, rank=256, store_dtype=torch.bfloat16):
-        experts = mlp.experts
-        n = experts.gate_up_proj.shape[0]
-        # Weight matrices get an SVD basis; biases are 1-D (no subspace), so
-        # we keep the static per-expert bias tensors for a per-cycle plain avg.
-        return {
-            "dtype": experts.gate_up_proj.dtype,
-            "gate_up": _svd_decompose(
-                [experts.gate_up_proj[e].float() for e in range(n)],
-                rank, store_dtype),
-            "down": _svd_decompose(
-                [experts.down_proj[e].float() for e in range(n)],
-                rank, store_dtype),
-            "gate_up_bias": [experts.gate_up_proj_bias[e] for e in range(n)],
-            "down_bias":    [experts.down_proj_bias[e] for e in range(n)],
-        }
-
-    def build_svd_from_basis(self, basis, weights):
-        dtype = basis["dtype"]
-        return {
-            "gate_up_proj":      _svd_remerge(basis["gate_up"], weights).to(dtype),
-            "gate_up_proj_bias": _weighted_sum(basis["gate_up_bias"], weights).to(dtype),
-            "down_proj":         _svd_remerge(basis["down"], weights).to(dtype),
-            "down_proj_bias":    _weighted_sum(basis["down_bias"], weights).to(dtype),
-        }
 
     def _run_dense_expert(self, avg, flat):
         alpha = self._alpha

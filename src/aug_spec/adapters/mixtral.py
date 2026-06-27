@@ -13,8 +13,6 @@ import torch.nn.functional as F
 from .base import (
     MoEAdapter,
     _stack_swiglu_weights,
-    _svd_decompose,
-    _svd_remerge,
     _topk_substitute_forward,
 )
 
@@ -63,26 +61,6 @@ class MixtralAdapter(MoEAdapter):
         }
         del w1_sum, w2_sum, w3_sum
         return out
-
-    def build_svd_basis(self, block, rank=256, store_dtype=torch.bfloat16):
-        dtype = block.experts[0].w1.weight.dtype
-        return {
-            "dtype": dtype,
-            "w1": _svd_decompose([e.w1.weight.float() for e in block.experts],
-                                 rank, store_dtype),
-            "w2": _svd_decompose([e.w2.weight.float() for e in block.experts],
-                                 rank, store_dtype),
-            "w3": _svd_decompose([e.w3.weight.float() for e in block.experts],
-                                 rank, store_dtype),
-        }
-
-    def build_svd_from_basis(self, basis, weights):
-        dtype = basis["dtype"]
-        return {
-            "w1": _svd_remerge(basis["w1"], weights).to(dtype),
-            "w2": _svd_remerge(basis["w2"], weights).to(dtype),
-            "w3": _svd_remerge(basis["w3"], weights).to(dtype),
-        }
 
     def _run_dense_expert(self, avg, hs_flat):
         # Mixtral expert: SiLU(w1 · h) ⊙ (w3 · h) → w2(...).

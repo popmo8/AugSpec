@@ -1,6 +1,7 @@
-# topM merged draft via the engine's batched bmm (AUG_MERGED_BACKEND=engine_bmm,
-# C++ DispatchBmm). Must match the Python-bmm result (bmm_ctrl) bit-for-bit.
-# P2+P3, no P1. b=0.2, qpc=5, mnt=512.
+# topm qpc=5, mnt=512 — same as q5_512_tm_on.yaml but within-cluster merge is
+# UNIFORM (run with AUG_CLUSTER_UNIFORM=1). Cluster slicing + cross-cluster mass
+# stay frequency-based; only the within-cluster combine changes. Baseline =
+# q5_512_tm_on (frequency within-cluster).
 model:
   id: Qwen/Qwen3-30B-A3B-Base
   backend: offload
@@ -14,4 +15,4 @@ draft:
   name: topm_count
   args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
 run: {T: 5, questions_per_cat: 5, max_new_tokens: 512}
-output: {label: cmp_engbmm_topm, dir: output/cmp_engbmm_topm}
+output: {label: q5_512_tm_unif, dir: output/q5_512_tm_unif}

@@ -20,6 +20,7 @@ The Controller calls these in this order per question:
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -69,9 +70,6 @@ class ScoreBasedAvgDraft(DraftStrategy):
     `[num_experts]` fp32 tensor that gets normalised and used as
     per-expert weights for the chosen merge method.
 
-    Set `use_svd_merge=True` (and optionally `svd_rank`) to use the
-    Sub-MoE subspace merging strategy instead of naive weighted averaging.
-
     Set `K>1` to keep K merged experts per layer (a mini-MoE) instead of a
     single dense expert. Active experts are partitioned into K clusters and
     each cluster is merged independently; the draft forward then runs the
@@ -88,20 +86,10 @@ class ScoreBasedAvgDraft(DraftStrategy):
     history_value_kind: str = "float"
 
     def __init__(self, record_history: bool = False,
-                 use_svd_merge: bool = False,
-                 svd_rank: int = 256,
                  K: int = 1,
                  draft_top_k: Optional[int] = None):
         # layer_idx → CPU fp32 tensor [num_experts]
         self.target_score: Dict[int, torch.Tensor] = {}
-        self.use_svd_merge = use_svd_merge
-        self.svd_rank = svd_rank
-
-        # layer_idx → cached SVD basis (one joint decomposition over all
-        # experts). Built lazily on first use, then reused every cycle and
-        # across questions — the expert weights are static, so this is NOT
-        # cleared by reset(). Empty unless use_svd_merge is set.
-        self._svd_basis: Dict[int, Any] = {}
 
         # K: number of merged experts cached per layer.
         #   K == 1 → single dense expert (a plain Dict[str, Tensor] cache).
@@ -235,44 +223,27 @@ class ScoreBasedAvgDraft(DraftStrategy):
         else:
             weights = (score_vec.float() / total).tolist()
         weights = self._postprocess_weights(weights)
-        basis = self._get_svd_basis(adapter, li, block)
         if self.K > 1:
-            draft_cache[li] = self._cluster_and_build(
-                adapter, block, weights, basis)
+            draft_cache[li] = self._cluster_and_build(adapter, block, weights)
         else:
-            draft_cache[li] = self._build_one(adapter, block, weights, basis)
+            draft_cache[li] = self._build_one(adapter, block, weights)
 
-    def _get_svd_basis(self, adapter, layer_idx: int, block):
-        """Return the cached SVD basis for `layer_idx`, building it on first
-        use. Returns None when SVD merging is disabled."""
-        if not self.use_svd_merge:
-            return None
-        basis = self._svd_basis.get(layer_idx)
-        if basis is None:
-            basis = adapter.build_svd_basis(block, rank=self.svd_rank)
-            self._svd_basis[layer_idx] = basis
-        return basis
+    def _build_one(self, adapter, block,
+                   weights: List[float]) -> Dict[str, torch.Tensor]:
+        """Merge `weights` into a single expert by linear weighted average.
 
-    def _build_one(self, adapter, block, weights: List[float],
-                   basis) -> Dict[str, torch.Tensor]:
-        """Merge `weights` into a single expert via the configured method.
-
-        When `basis` is given (SVD enabled) the merge reuses the cached
-        decomposition; otherwise it is a plain weighted average.
+        The offload-merge engine owns the merge when merge_offload built one
+        (tagged onto the block by the controller); otherwise the plain adapter
+        merge. The engine's build delegates to build_weighted_avg, so this is
+        behaviour-preserving.
         """
-        if basis is not None:
-            return adapter.build_svd_from_basis(basis, weights)
-        # Offload-merge engine owns the merge when merge_offload built one
-        # (tagged onto the block by the controller); otherwise the plain
-        # adapter merge. Shell: engine.build delegates to build_weighted_avg,
-        # so this is behaviour-preserving.
         engine = getattr(block, "_merge_engine", None)
         if engine is not None:
             return engine.build(block, weights)
         return adapter.build_weighted_avg(block, weights)
 
-    def _cluster_and_build(self, adapter, block, weights: List[float],
-                           basis) -> Dict[str, Any]:
+    def _cluster_and_build(self, adapter, block,
+                           weights: List[float]) -> Dict[str, Any]:
         """Partition active experts into K clusters and merge each one.
 
         Clustering (frequency-slice): active experts are sorted by weight
@@ -299,6 +270,12 @@ class ScoreBasedAvgDraft(DraftStrategy):
         active = [i for i, w in enumerate(weights) if w > 0.0]
         groups = self._assign_clusters(active, weights)
 
+        # AUG_CLUSTER_UNIFORM experiment: merge each cluster with EQUAL weights
+        # (1/|group|) instead of frequency-proportional ones. The slicing
+        # (_assign_clusters) and the cross-cluster mass (`masses`) stay
+        # frequency-based — only the within-cluster combine changes.
+        uniform_merge = os.environ.get("AUG_CLUSTER_UNIFORM") is not None
+
         experts: List[Dict[str, torch.Tensor]] = []
         masses: List[float] = []
         for group in groups:
@@ -306,10 +283,15 @@ class ScoreBasedAvgDraft(DraftStrategy):
             # Renormalise within the cluster so each merge gets weights summing
             # to 1; the cluster's share of the whole is tracked in `masses`.
             cluster_weights = [0.0] * n
-            for i in group:
-                cluster_weights[i] = weights[i] / group_mass
+            if uniform_merge:
+                w_each = 1.0 / len(group)
+                for i in group:
+                    cluster_weights[i] = w_each
+            else:
+                for i in group:
+                    cluster_weights[i] = weights[i] / group_mass
             experts.append(
-                self._build_one(adapter, block, cluster_weights, basis))
+                self._build_one(adapter, block, cluster_weights))
             masses.append(group_mass)
 
         total = sum(masses)

@@ -18,8 +18,6 @@ import torch.nn.functional as F
 from .base import (
     MoEAdapter,
     _stack_swiglu_weights,
-    _svd_decompose,
-    _svd_remerge,
     _topk_substitute_forward,
 )
 
@@ -109,29 +107,6 @@ class Qwen3MoeAdapter(MoEAdapter):
         if merge_device is not None:
             out = {k: v.to(merge_device) for k, v in out.items()}
         return out
-
-    def build_svd_basis(self, block, rank=256, store_dtype=torch.bfloat16):
-        dtype = block.experts[0].gate_proj.weight.dtype
-        return {
-            "dtype": dtype,
-            "gate_proj": _svd_decompose(
-                [e.gate_proj.weight.float() for e in block.experts],
-                rank, store_dtype),
-            "up_proj": _svd_decompose(
-                [e.up_proj.weight.float() for e in block.experts],
-                rank, store_dtype),
-            "down_proj": _svd_decompose(
-                [e.down_proj.weight.float() for e in block.experts],
-                rank, store_dtype),
-        }
-
-    def build_svd_from_basis(self, basis, weights):
-        dtype = basis["dtype"]
-        return {
-            "gate_proj": _svd_remerge(basis["gate_proj"], weights).to(dtype),
-            "up_proj":   _svd_remerge(basis["up_proj"], weights).to(dtype),
-            "down_proj": _svd_remerge(basis["down_proj"], weights).to(dtype),
-        }
 
     def _run_dense_expert(self, avg, hs_flat):
         # Qwen3MoeMLP: SiLU(gate_proj · h) ⊙ (up_proj · h) → down_proj(...).

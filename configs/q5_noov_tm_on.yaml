@@ -10,6 +10,6 @@ model:
     merge_during_verify: true
 draft:
   name: topm_count
-  args: {M: 32, K: 16, draft_top_k: 8, use_svd_merge: false, record_history: false}
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
 run: {T: 5, questions_per_cat: 5, max_new_tokens: 128}
 output: {label: q5_tm_on, dir: output/q5_tm_on}

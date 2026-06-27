@@ -19,10 +19,8 @@ class CountDraft(ScoreBasedAvgDraft):
     history_value_kind = "int"
 
     def __init__(self, count_top_k: int, record_history: bool = False,
-                 use_svd_merge: bool = False, svd_rank: int = 256,
                  K: int = 1, draft_top_k: Optional[int] = None):
         super().__init__(record_history=record_history,
-                         use_svd_merge=use_svd_merge, svd_rank=svd_rank,
                          K=K, draft_top_k=draft_top_k)
         self.count_top_k = count_top_k
         self._scorer = make_count_scorer(count_top_k=count_top_k)
@@ -64,11 +62,9 @@ class PrunedCountDraft(CountDraft):
     def __init__(self, count_top_k: int,
                  cumulative_threshold: float = 0.9,
                  record_history: bool = False,
-                 use_svd_merge: bool = False, svd_rank: int = 256,
                  K: int = 1, draft_top_k: Optional[int] = None):
         super().__init__(count_top_k=count_top_k,
                          record_history=record_history,
-                         use_svd_merge=use_svd_merge, svd_rank=svd_rank,
                          K=K, draft_top_k=draft_top_k)
         if not (0.0 < cumulative_threshold <= 1.0):
             raise ValueError(

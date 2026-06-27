@@ -56,14 +56,10 @@ class TopMCountDraft(CountDraft):
     def __init__(self, count_top_k: int,
                  M: Optional[int] = None,
                  record_history: bool = False,
-                 use_svd_merge: bool = False,
-                 svd_rank: int = 256,
                  K: int = 1,
                  draft_top_k: Optional[int] = None):
         super().__init__(count_top_k=count_top_k,
                          record_history=record_history,
-                         use_svd_merge=use_svd_merge,
-                         svd_rank=svd_rank,
                          K=K,
                          draft_top_k=draft_top_k)
         if M is not None and M < 1:

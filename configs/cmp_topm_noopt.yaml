@@ -11,6 +11,6 @@ model:
     merge_during_verify: false
 draft:
   name: topm_count
-  args: {M: 32, K: 16, draft_top_k: 8, use_svd_merge: false, record_history: false}
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
 run: {T: 5, questions_per_cat: 3, max_new_tokens: 256}
 output: {label: cmp_topm_noopt, dir: output/cmp_topm_noopt}

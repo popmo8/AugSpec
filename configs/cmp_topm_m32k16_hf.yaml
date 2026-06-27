@@ -13,7 +13,6 @@ draft:
     M: 32             # active-expert pool before clustering
     K: 16             # partition into 16 cluster-merged experts
     draft_top_k: 8    # run the 8 heaviest clusters
-    use_svd_merge: false
     record_history: false
 
 run:

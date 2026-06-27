@@ -42,73 +42,6 @@ _MERGED_BACKEND = os.environ.get("AUG_MERGED_BACKEND", "engine_bmm").lower()
 _EARLY_PIN = int(os.environ.get("AUG_EARLY_PIN", "0"))
 
 
-# A cached SVD basis for one weight-matrix type: (US, V_blocks).
-#   US       : [O, q]  — the U @ diag(S) factor, precomputed.
-#   V_blocks : list of n tensors [I, q] — one V block per expert.
-SvdBasis = Tuple[torch.Tensor, List[torch.Tensor]]
-
-
-def _svd_decompose(matrices: List[torch.Tensor], rank: int,
-                   store_dtype: torch.dtype) -> SvdBasis:
-    """Joint SVD over ALL experts for one weight-matrix type (Sub-MoE §3.3).
-
-    Because the expert weights are static, this is computed ONCE per layer
-    and cached; `_svd_remerge` then reuses it every cycle. The shared basis
-    satisfies ``W_i ≈ US @ V_i^T`` for every expert i, so any frequency-
-    weighted combination is just ``US @ (Σ w_i V_i)^T`` — no re-SVD.
-
-    Steps:
-      1. Horizontal concat:  [W_0 | … | W_{n-1}]  →  O × nI
-      2. Randomised SVD (rank q):  A ≈ U diag(S) V^T
-      3. Precompute  US = U ⊙ S  and split V into n blocks V_i ∈ ℝ^{I×q}
-
-    Args:
-        matrices:    n float32 tensors, each [O, I] (one per expert).
-        rank:        SVD rank q. Clamped to min(rank, O, n*I).
-        store_dtype: dtype the cached factors are stored in (e.g. bfloat16
-                     to bound cache memory; the per-cycle merge upcasts).
-    """
-    n = len(matrices)
-    O, I_dim = matrices[0].shape
-
-    A = torch.cat(matrices, dim=1)                    # [O, nI]
-    q = min(rank, O, n * I_dim)
-    U, S, V = torch.pca_lowrank(A, q=q, center=False, niter=2)
-
-    US = (U * S.unsqueeze(0)).to(store_dtype).contiguous()           # [O, q]
-    V_blocks = [vb.to(store_dtype).contiguous()
-                for vb in V.split(I_dim, dim=0)]      # n × [I, q]
-    return US, V_blocks
-
-
-def _svd_remerge(basis: SvdBasis, weights: List[float]) -> torch.Tensor:
-    """Frequency-weighted merge + reconstruct from a cached SVD basis.
-
-    Returns the fp32 reconstruction ``US @ (Σ w_i V_i)^T`` of shape [O, I].
-    Cheap: one [I, q] accumulation plus one [O, q] × [q, I] matmul per call.
-    Zero-weight experts are skipped. The caller casts to the target dtype.
-    """
-    US, V_blocks = basis
-    I_dim, q = V_blocks[0].shape
-    V_merged = torch.zeros(I_dim, q, dtype=torch.float32, device=US.device)
-    for w, Vb in zip(weights, V_blocks):
-        if w == 0.0:
-            continue
-        V_merged.add_(Vb.float(), alpha=w)
-    return US.float() @ V_merged.t()                  # [O, I]
-
-
-def _weighted_sum(tensors: List[torch.Tensor],
-                  weights: List[float]) -> torch.Tensor:
-    """fp32 frequency-weighted sum of per-expert tensors (e.g. biases)."""
-    out = torch.zeros_like(tensors[0], dtype=torch.float32)
-    for t, w in zip(tensors, weights):
-        if w == 0.0:
-            continue
-        out.add_(t.float(), alpha=w)
-    return out
-
-
 def _stack_swiglu_weights(cache: Dict[str, Any],
                           experts: List[Dict[str, torch.Tensor]],
                           gate_key: str, up_key: str, down_key: str):
@@ -412,27 +345,6 @@ class MoEAdapter:
         merged experts can't run through that kernel (e.g. gptoss biases).
         Overridden by adapters whose experts match the MoEMLP layout."""
         return None
-
-    def build_svd_basis(self, block: nn.Module, rank: int = 256,
-                        store_dtype: torch.dtype = torch.bfloat16) -> Dict[str, Any]:
-        """Decompose every expert in `block` into a cached SVD basis.
-
-        Computed ONCE per layer (expert weights are static) and reused by
-        `build_svd_from_basis` every cycle. Returns a dict keyed per weight-
-        matrix type (`SvdBasis` tuples) plus any static extras (e.g. biases)
-        and a `"dtype"` entry for the reconstruction's target dtype.
-        """
-        raise NotImplementedError
-
-    def build_svd_from_basis(self, basis: Dict[str, Any],
-                             weights: List[float]) -> Dict[str, torch.Tensor]:
-        """Frequency-weighted Sub-MoE merge from a cached `build_svd_basis`.
-
-        Cheap per-cycle path: only V-merge + reconstruction, no re-SVD.
-        Returns a dict with the same keys as `build_weighted_avg`, so the
-        existing `_run_dense_expert` methods work unchanged.
-        """
-        raise NotImplementedError
 
     def make_averaged_forward(self, controller, layer_idx: int, block: nn.Module):
         raise NotImplementedError
