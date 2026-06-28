@@ -182,6 +182,14 @@ class ScoreBasedAvgDraft(DraftStrategy):
     def reset(self):
         self.target_score.clear()
         self._cycle_in_question = -1
+        # AUG_DUMP_ACTIVE_SET diagnostic: a new question starts here, so bump
+        # the question id and restart the per-layer cycle counter. This lets
+        # the set-shift analysis compare only consecutive cycles *within* the
+        # same question (the count vector is overwritten — not accumulated —
+        # each cycle, and cleared here between questions).
+        if os.environ.get("AUG_DUMP_ACTIVE_SET"):
+            self._dump_qid = getattr(self, "_dump_qid", -1) + 1
+            self._dump_active_cycle = {}
 
     def capture(self, layer_idx, router_logits):
         score_vec = self._score_vector_from_logits(router_logits)
@@ -223,8 +231,9 @@ class ScoreBasedAvgDraft(DraftStrategy):
         else:
             weights = (score_vec.float() / total).tolist()
         weights = self._postprocess_weights(weights)
+        self._maybe_dump_active_set(li, weights, total)
         if self.K > 1:
-            draft_cache[li] = self._cluster_and_build(adapter, block, weights)
+            draft_cache[li] = self._cluster_and_build(adapter, block, weights, li)
         else:
             draft_cache[li] = self._build_one(adapter, block, weights)
 
@@ -243,7 +252,8 @@ class ScoreBasedAvgDraft(DraftStrategy):
         return adapter.build_weighted_avg(block, weights)
 
     def _cluster_and_build(self, adapter, block,
-                           weights: List[float]) -> Dict[str, Any]:
+                           weights: List[float],
+                           layer_idx: int = -1) -> Dict[str, Any]:
         """Partition active experts into K clusters and merge each one.
 
         Clustering (frequency-slice): active experts are sorted by weight
@@ -268,7 +278,7 @@ class ScoreBasedAvgDraft(DraftStrategy):
         """
         n = len(weights)
         active = [i for i, w in enumerate(weights) if w > 0.0]
-        groups = self._assign_clusters(active, weights)
+        groups = self._assign_clusters(active, weights, layer_idx)
 
         # AUG_CLUSTER_UNIFORM experiment: merge each cluster with EQUAL weights
         # (1/|group|) instead of frequency-proportional ones. The slicing
@@ -278,7 +288,7 @@ class ScoreBasedAvgDraft(DraftStrategy):
 
         experts: List[Dict[str, torch.Tensor]] = []
         masses: List[float] = []
-        for group in groups:
+        for cluster_idx, group in enumerate(groups):
             group_mass = sum(weights[i] for i in group)
             # Renormalise within the cluster so each merge gets weights summing
             # to 1; the cluster's share of the whole is tracked in `masses`.
@@ -290,6 +300,8 @@ class ScoreBasedAvgDraft(DraftStrategy):
             else:
                 for i in group:
                     cluster_weights[i] = weights[i] / group_mass
+            self._maybe_dump_cluster_weights(
+                layer_idx, cluster_idx, group, group_mass, weights)
             experts.append(
                 self._build_one(adapter, block, cluster_weights))
             masses.append(group_mass)
@@ -304,20 +316,123 @@ class ScoreBasedAvgDraft(DraftStrategy):
         }
 
     def _assign_clusters(self, active: List[int],
-                         weights: List[float]) -> List[List[int]]:
+                         weights: List[float],
+                         layer_idx: int = -1) -> List[List[int]]:
         """Group active expert indices into at most K clusters.
 
-        Frequency-slice strategy: sort by weight descending, then cut into K
-        contiguous, near-equal-size slices. Returns a list of non-empty
+        Frequency-slice strategy (default): sort by weight descending, then cut
+        into K contiguous, near-equal-size slices. Returns a list of non-empty
         index groups (fewer than K only when active experts < K).
+
+        AUG_CLUSTER_LABELS=<file> experiment override: load a *static* per-layer
+        partition (precomputed offline, e.g. co-occurrence or random — see
+        scripts/make_cluster_labels.py) and group this cycle's active experts by
+        their fixed cluster label. Lets us A/B the *partition* alone — cross-
+        cluster mass and within-cluster weights stay frequency-based, exactly as
+        the freq-slice path. Falls back to freq-slice when unset or the layer is
+        missing from the file.
         """
+        labels = self._load_static_labels()
+        if labels is not None and layer_idx in labels:
+            lab = labels[layer_idx]
+            buckets: Dict[int, List[int]] = {}
+            for i in active:
+                buckets.setdefault(lab[i], []).append(i)
+            return [buckets[k] for k in sorted(buckets)]
         ordered = sorted(active, key=lambda i: -weights[i])
         m = len(ordered)
         k = min(self.K, m)
         return [ordered[j * m // k:(j + 1) * m // k] for j in range(k)]
+
+    def _load_static_labels(self) -> Optional[Dict[int, List[int]]]:
+        """Lazy-load (and cache) the AUG_CLUSTER_LABELS partition file, mapping
+        layer_idx -> [cluster_label per expert]. Returns None when the env var
+        is unset (the normal freq-slice path)."""
+        cache = getattr(self, "_static_labels_cache", "unset")
+        if cache != "unset":
+            return cache
+        path = os.environ.get("AUG_CLUSTER_LABELS")
+        if not path:
+            self._static_labels_cache = None
+            return None
+        import json
+        with open(path) as f:
+            data = json.load(f)
+        labels = {int(k): list(v) for k, v in data["labels"].items()}
+        self._static_labels_cache = labels
+        return labels
 
     def _postprocess_weights(self, weights: List[float]) -> List[float]:
         """Hook called once per layer per cycle, right before
         `adapter.build_weighted_avg`. Subclasses override to e.g. prune
         low-mass experts. Default = identity passthrough."""
         return weights
+
+    def _maybe_dump_active_set(self, layer_idx: int, weights: List[float],
+                               total: float) -> None:
+        """Diagnostic-only: when AUG_DUMP_ACTIVE_SET=<path> is set, append one
+        JSONL record per (layer, question, cycle) listing the *selected* expert
+        ids for that cycle (post top-M cutoff, i.e. weight > 0). Feeds the
+        co-occurrence and cycle-to-cycle set-shift analyses. `degenerate` flags
+        the all-zero-count fallback (uniform over every expert), which the
+        analysis drops. No-op when the env var is unset.
+        """
+        path = os.environ.get("AUG_DUMP_ACTIVE_SET")
+        if not path:
+            return
+        import json
+        counter = getattr(self, "_dump_active_cycle", None)
+        if counter is None:
+            counter = self._dump_active_cycle = {}
+        cyc = counter.get(layer_idx, -1) + 1
+        counter[layer_idx] = cyc
+        active = [i for i, w in enumerate(weights) if w > 0.0]
+        rec = {
+            "layer": int(layer_idx),
+            "qid": int(getattr(self, "_dump_qid", 0)),
+            "cycle": int(cyc),
+            "n": len(weights),
+            "active": active,
+            "degenerate": total <= 0,
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def _maybe_dump_cluster_weights(self, layer_idx: int, cluster_idx: int,
+                                    group: List[int], group_mass: float,
+                                    weights: List[float]) -> None:
+        """Diagnostic-only: when AUG_DUMP_CLUSTER_WEIGHTS=<path> is set, append
+        one JSONL record per merged cluster capturing the *frequency-based*
+        within-cluster weights (weights[i] / group_mass). This is exactly the
+        non-uniform merge weighting; comparing it to the uniform reference
+        (1/|group|) quantifies how far apart the within-cluster weights are.
+        No-op (and zero overhead beyond an env lookup) when unset, so it never
+        affects normal runs.
+        """
+        path = os.environ.get("AUG_DUMP_CLUSTER_WEIGHTS")
+        if not path:
+            return
+        import json
+        # Per-layer call counter so records from successive refresh cycles of
+        # the same layer stay distinguishable. cluster 0 of a layer marks a new
+        # cycle for that layer.
+        counter = getattr(self, "_dump_cycle_counter", None)
+        if counter is None:
+            counter = self._dump_cycle_counter = {}
+        if cluster_idx == 0:
+            counter[layer_idx] = counter.get(layer_idx, -1) + 1
+        size = len(group)
+        if group_mass > 0:
+            w = sorted((weights[i] / group_mass for i in group), reverse=True)
+        else:
+            w = [1.0 / size] * size if size else []
+        rec = {
+            "layer": int(layer_idx),
+            "cycle": int(counter.get(layer_idx, 0)),
+            "cluster": int(cluster_idx),
+            "size": size,
+            "group_mass": float(group_mass),
+            "weights": [float(x) for x in w],
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
