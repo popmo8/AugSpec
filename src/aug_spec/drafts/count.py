@@ -18,6 +18,11 @@ class CountDraft(ScoreBasedAvgDraft):
 
     history_value_kind = "int"
 
+    # The count family needs the adapter's native top-k auto-filled when the
+    # config omits count_top_k (covers pruned_count / topm_count / prefill* via
+    # inheritance).
+    needs_count_top_k = True
+
     def __init__(self, count_top_k: int, record_history: bool = False,
                  K: int = 1, draft_top_k: Optional[int] = None):
         super().__init__(record_history=record_history,

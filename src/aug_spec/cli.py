@@ -52,19 +52,13 @@ import yaml
 from aug_spec import __version__
 from aug_spec.adapters import adapter_for_config, get_adapter
 from aug_spec.controller import Controller
-from aug_spec.drafts import ScoreBasedAvgDraft, SpecMoeDraft, get_draft
+from aug_spec.drafts import (
+    ScoreBasedAvgDraft, SpecMoeDraft, get_draft, get_draft_class)
 from aug_spec.runtime.loader import (
     compute_merged_bytes, compute_model_vram_bytes, free_model,
     get_peak_vram_gb, load_model, load_offload,
 )
 
-# Drafts that cache merged dense experts (ScoreBasedAvgDraft family). Used to
-# reserve the merged residency out of the VRAM budget. SpecMoE / random_mask
-# hold no merged, so they reserve nothing.
-_MERGE_DRAFTS = frozenset({
-    "count", "topm_count", "softmax",
-    "prefill_count", "prefill_topm_count", "uniform",
-})
 from aug_spec.runtime.phase import shared_model_phase_patch, specbench_callbacks
 from aug_spec.runtime.specbench import run_specbench
 
@@ -295,7 +289,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
             # stays within 0.2x, an honest scarce-VRAM sim (verify_merge_plan.md
             # P1/P2). Only merge drafts on the offload-merge engine hold merged.
             merged_bytes = 0
-            if cfg.merge_offload and cfg.draft_name in _MERGE_DRAFTS:
+            if cfg.merge_offload and \
+                    get_draft_class(cfg.draft_name).holds_merged_residency:
                 K = int(cfg.draft_args.get("K", 1))
                 merged_bytes = compute_merged_bytes(
                     cfg.model_id, K, cfg.dtype, cfg.trust_remote_code)
@@ -344,14 +339,12 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print(f"  Adapter    : {adapter.name}")
     print(f"  VRAM       : {get_peak_vram_gb():.2f} GB")
 
-    # ── resolve draft args (auto-fill count_top_k from adapter if absent) ─
+    # ── resolve draft args (auto-fill from adapter per the draft's flags) ─
     draft_args = dict(cfg.draft_args)
-    if cfg.draft_name in ("count", "pruned_count",
-                          "topm_count",
-                          "prefill_count", "prefill_topm_count") and \
-            "count_top_k" not in draft_args:
+    draft_cls = get_draft_class(cfg.draft_name)
+    if draft_cls.needs_count_top_k and "count_top_k" not in draft_args:
         draft_args["count_top_k"] = adapter.default_count_top_k(model)
-    if cfg.draft_name == "random_mask" and "num_experts" not in draft_args:
+    if draft_cls.needs_num_experts and "num_experts" not in draft_args:
         # Pick num_experts from the first MoE block in the model.
         first_block = next(iter(adapter.iter_moe(model)))[1]
         draft_args["num_experts"] = adapter.num_experts(first_block)

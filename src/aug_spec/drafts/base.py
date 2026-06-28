@@ -31,6 +31,22 @@ class DraftStrategy:
 
     cache_kind: str = "averaged"  # or "masked" / "substitute"
 
+    # --- class-level "what kind of draft am I" facts (consumed by cli.py) ----
+    # Kept as class attributes (not hardcoded name lists in cli.py) so a new
+    # draft declares its own behaviour and cli never needs editing (A1).
+    #
+    # holds_merged_residency: caches a merged dense expert, so the offload-merge
+    #   engine must reserve its VRAM out of the budget. True for the
+    #   ScoreBasedAvgDraft family and UniformDraft; SpecMoe / random_mask hold
+    #   none.
+    # needs_count_top_k: requires the adapter's native top-k auto-filled into
+    #   draft args when absent (the CountDraft family).
+    # needs_num_experts: requires the layer's expert count auto-filled when
+    #   absent (random_mask).
+    holds_merged_residency: bool = False
+    needs_count_top_k: bool = False
+    needs_num_experts: bool = False
+
     def prepare(self, adapter, blocks) -> None:
         """One-time setup before any inference (called once by the CLI after
         the controller is built). Use for static, model-derived precomputation
@@ -79,6 +95,11 @@ class ScoreBasedAvgDraft(DraftStrategy):
     """
 
     cache_kind = "averaged"
+
+    # Every score-based averaged draft builds a merged dense expert, so the
+    # whole family reserves merged residency (covers count / pruned_count /
+    # topm_count / softmax / prefill* via inheritance).
+    holds_merged_residency = True
 
     # History encoding for `expert_weights_history.json`. Count-style
     # scorers produce integer-valued tensors; subclasses with continuous

@@ -34,12 +34,21 @@ _REGISTRY: Dict[str, Type[DraftStrategy]] = {
 }
 
 
-def get_draft(name: str, **kwargs: Any) -> DraftStrategy:
-    """Instantiate a draft strategy by registered name with **kwargs."""
+def get_draft_class(name: str) -> Type[DraftStrategy]:
+    """Look up a draft class by registered name *without* instantiating it.
+
+    Lets the CLI read class-level facts (holds_merged_residency /
+    needs_count_top_k / needs_num_experts) before the draft args (and the
+    model needed to fill them) are resolved."""
     if name not in _REGISTRY:
         known = ", ".join(sorted(_REGISTRY))
         raise KeyError(f"unknown draft {name!r}; known: {known}")
-    return _REGISTRY[name](**kwargs)
+    return _REGISTRY[name]
+
+
+def get_draft(name: str, **kwargs: Any) -> DraftStrategy:
+    """Instantiate a draft strategy by registered name with **kwargs."""
+    return get_draft_class(name)(**kwargs)
 
 
 __all__ = [
@@ -55,4 +64,5 @@ __all__ = [
     "RandomMaskDraft",
     "SpecMoeDraft",
     "get_draft",
+    "get_draft_class",
 ]

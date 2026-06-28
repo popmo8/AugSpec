@@ -16,6 +16,10 @@ class RandomMaskDraft(DraftStrategy):
 
     cache_kind = "masked"
 
+    # Needs the layer's expert count auto-filled into draft args when the
+    # config omits num_experts.
+    needs_num_experts = True
+
     def __init__(self, num_experts: int, seed: int):
         self.num_experts = num_experts
         self.seed = seed
