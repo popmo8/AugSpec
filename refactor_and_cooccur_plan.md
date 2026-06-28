@@ -19,8 +19,8 @@
 |---|---|---|---|
 | **A0** | `AUG_CLUSTER_UNIFORM` 群內 uniform merge 實驗開關 | 低 | ✅ DONE；**實驗結論:uniform 掉 6.6pp,群內預設用 freq(見 0.5）** |
 | **A1** | draft「名單事實」移到類別屬性，cli 去三重列舉 | 低 | ✅ DONE（drafts 旗標 + cli 去 `_MERGE_DRAFTS`；順手修正 pruned_count 漏列） |
-| **A2** | 整理 merge 入口（**固定線性加權平均，不抽 strategy**）+ 預留 cache 包裝點 | 低 | ⬜ TODO |
-| **A3** | `clustering/` strategy registry（freq_slice 原樣搬入，YAML 可選） | 中（碰 merge/cache 路徑） | ⬜ TODO |
+| **A2** | 整理 merge 入口（**固定線性加權平均，不抽 strategy**）+ 預留 cache 包裝點 | 低 | ✅ DONE（`merging/linear.py`；`_build_one` 委派） |
+| **A3** | `clustering/` strategy registry（freq_slice 原樣搬入，YAML 可選） | 中（碰 merge/cache 路徑） | ✅ DONE（`clustering/` registry；移除 `_assign_clusters`/`AUG_CLUSTER_LABELS`；freq_slice 對 25k 組與舊式逐一相同；q5 bit-exact 驗證中 job 248144） |
 | **A4** | env-var → YAML（merged_backend / early_pin / no_overload / cluster_uniform） | 低 | ⬜ TODO |
 | **A5** | 把放錯地方的搬回去:specmoe forward 出 adapters/、bmm helper 拆出 | 中（純搬移） | ⬜ TODO |
 | **B1** | co-occurrence 統計捕捉（scorer + per-layer accumulator） | 中（碰 capture 路徑） | ⬜ TODO |

@@ -25,6 +25,9 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from aug_spec.clustering import ClusterContext, ClusterMethod, get_cluster_method
+from aug_spec.merging import linear_merge
+
 
 class DraftStrategy:
     """Abstract draft strategy. Override only what you need."""
@@ -108,9 +111,16 @@ class ScoreBasedAvgDraft(DraftStrategy):
 
     def __init__(self, record_history: bool = False,
                  K: int = 1,
-                 draft_top_k: Optional[int] = None):
+                 draft_top_k: Optional[int] = None,
+                 cluster_method: Optional[ClusterMethod] = None):
         # layer_idx → CPU fp32 tensor [num_experts]
         self.target_score: Dict[int, torch.Tensor] = {}
+
+        # How active experts are partitioned into the K clusters. Defaults to
+        # frequency-slice (the original behaviour); the CLI injects another
+        # method when the YAML asks (A4). Only consulted when K > 1.
+        self.cluster_method: ClusterMethod = (
+            cluster_method or get_cluster_method("freq_slice"))
 
         # K: number of merged experts cached per layer.
         #   K == 1 → single dense expert (a plain Dict[str, Tensor] cache).
@@ -135,6 +145,11 @@ class ScoreBasedAvgDraft(DraftStrategy):
         self.record_history: bool = record_history
         self.history: List[Dict[str, Any]] = []
         self._cycle_in_question: int = -1
+
+    def prepare(self, adapter, blocks) -> None:
+        """Forward the once-per-layer hook to the cluster method (no-op for
+        freq_slice; used by methods that precompute, e.g. co-occurrence)."""
+        self.cluster_method.prepare(adapter, blocks)
 
     # --- history helpers ------------------------------------------------
     def _encode_score_vec(self, score_vec: torch.Tensor) -> List[Any]:
@@ -260,29 +275,21 @@ class ScoreBasedAvgDraft(DraftStrategy):
 
     def _build_one(self, adapter, block,
                    weights: List[float]) -> Dict[str, torch.Tensor]:
-        """Merge `weights` into a single expert by linear weighted average.
-
-        The offload-merge engine owns the merge when merge_offload built one
-        (tagged onto the block by the controller); otherwise the plain adapter
-        merge. The engine's build delegates to build_weighted_avg, so this is
-        behaviour-preserving.
-        """
-        engine = getattr(block, "_merge_engine", None)
-        if engine is not None:
-            return engine.build(block, weights)
-        return adapter.build_weighted_avg(block, weights)
+        """Merge `weights` into a single expert via the linear merge entry
+        (`merging/linear.py`); `member_ids` = the non-zero entries, carried so
+        a future cache can key on the member set."""
+        member_ids = [i for i, w in enumerate(weights) if w > 0.0]
+        return linear_merge(adapter, block, member_ids, weights)
 
     def _cluster_and_build(self, adapter, block,
                            weights: List[float],
                            layer_idx: int = -1) -> Dict[str, Any]:
         """Partition active experts into K clusters and merge each one.
 
-        Clustering (frequency-slice): active experts are sorted by weight
-        descending and cut into K contiguous slices, so each cluster groups
-        experts of comparable activation frequency. This is a fast,
-        calibration-free proxy — a stronger functional-similarity metric
-        (e.g. gate-vector clustering) can replace `_assign_clusters` later
-        without touching the rest of the pipeline.
+        The partition comes from `self.cluster_method` (default frequency-slice;
+        see `clustering/`). Cross-cluster mass and the within-cluster weighting
+        stay frequency-based here, so swapping the cluster method changes only
+        *which experts group together*, nothing else in the pipeline.
 
         Returns a "multi" cache dict consumed by `adapter._route_multi_expert`::
 
@@ -299,11 +306,13 @@ class ScoreBasedAvgDraft(DraftStrategy):
         """
         n = len(weights)
         active = [i for i, w in enumerate(weights) if w > 0.0]
-        groups = self._assign_clusters(active, weights, layer_idx)
+        ctx = ClusterContext(active=active, weights=weights,
+                             layer_idx=layer_idx)
+        groups = self.cluster_method.assign(ctx, self.K)
 
         # AUG_CLUSTER_UNIFORM experiment: merge each cluster with EQUAL weights
-        # (1/|group|) instead of frequency-proportional ones. The slicing
-        # (_assign_clusters) and the cross-cluster mass (`masses`) stay
+        # (1/|group|) instead of frequency-proportional ones. The partition
+        # (cluster_method) and the cross-cluster mass (`masses`) stay
         # frequency-based — only the within-cluster combine changes.
         uniform_merge = os.environ.get("AUG_CLUSTER_UNIFORM") is not None
 
@@ -335,53 +344,6 @@ class ScoreBasedAvgDraft(DraftStrategy):
             "weights": [masses[k] / total for k in order],
             "indices": [groups[k] for k in order],
         }
-
-    def _assign_clusters(self, active: List[int],
-                         weights: List[float],
-                         layer_idx: int = -1) -> List[List[int]]:
-        """Group active expert indices into at most K clusters.
-
-        Frequency-slice strategy (default): sort by weight descending, then cut
-        into K contiguous, near-equal-size slices. Returns a list of non-empty
-        index groups (fewer than K only when active experts < K).
-
-        AUG_CLUSTER_LABELS=<file> experiment override: load a *static* per-layer
-        partition (precomputed offline, e.g. co-occurrence or random — see
-        scripts/make_cluster_labels.py) and group this cycle's active experts by
-        their fixed cluster label. Lets us A/B the *partition* alone — cross-
-        cluster mass and within-cluster weights stay frequency-based, exactly as
-        the freq-slice path. Falls back to freq-slice when unset or the layer is
-        missing from the file.
-        """
-        labels = self._load_static_labels()
-        if labels is not None and layer_idx in labels:
-            lab = labels[layer_idx]
-            buckets: Dict[int, List[int]] = {}
-            for i in active:
-                buckets.setdefault(lab[i], []).append(i)
-            return [buckets[k] for k in sorted(buckets)]
-        ordered = sorted(active, key=lambda i: -weights[i])
-        m = len(ordered)
-        k = min(self.K, m)
-        return [ordered[j * m // k:(j + 1) * m // k] for j in range(k)]
-
-    def _load_static_labels(self) -> Optional[Dict[int, List[int]]]:
-        """Lazy-load (and cache) the AUG_CLUSTER_LABELS partition file, mapping
-        layer_idx -> [cluster_label per expert]. Returns None when the env var
-        is unset (the normal freq-slice path)."""
-        cache = getattr(self, "_static_labels_cache", "unset")
-        if cache != "unset":
-            return cache
-        path = os.environ.get("AUG_CLUSTER_LABELS")
-        if not path:
-            self._static_labels_cache = None
-            return None
-        import json
-        with open(path) as f:
-            data = json.load(f)
-        labels = {int(k): list(v) for k, v in data["labels"].items()}
-        self._static_labels_cache = labels
-        return labels
 
     def _postprocess_weights(self, weights: List[float]) -> List[float]:
         """Hook called once per layer per cycle, right before
