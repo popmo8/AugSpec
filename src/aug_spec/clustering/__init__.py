@@ -9,11 +9,15 @@ from __future__ import annotations
 from typing import Any, Dict, Type
 
 from .base import ClusterContext, ClusterMethod
+from .cooccur import CooccurPairCluster
 from .freq_slice import FreqSliceCluster
+from .random import RandomCluster
 
 
 _REGISTRY: Dict[str, Type[ClusterMethod]] = {
     "freq_slice": FreqSliceCluster,
+    "random": RandomCluster,
+    "cooccur_pair": CooccurPairCluster,
 }
 
 
@@ -29,5 +33,7 @@ __all__ = [
     "ClusterContext",
     "ClusterMethod",
     "FreqSliceCluster",
+    "RandomCluster",
+    "CooccurPairCluster",
     "get_cluster_method",
 ]

@@ -30,6 +30,10 @@ class ClusterMethod:
     methods that precompute on a coarser cadence than per-cycle (e.g. a
     windowed co-occurrence matrix). Default `prepare` is a no-op."""
 
+    # Set True by methods that need `ctx.cooccur`; the draft only pays the
+    # per-forward co-occurrence accumulation cost when this is True.
+    needs_cooccur: bool = False
+
     def prepare(self, adapter, blocks) -> None:
         pass
 

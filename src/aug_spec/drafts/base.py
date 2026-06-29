@@ -117,6 +117,13 @@ class ScoreBasedAvgDraft(DraftStrategy):
         # layer_idx → CPU fp32 tensor [num_experts]
         self.target_score: Dict[int, torch.Tensor] = {}
 
+        # layer_idx → CPU fp32 [num_experts, num_experts] co-occurrence,
+        # ACCUMULATED across the whole question (prefill + decode), cleared per
+        # question in reset(). Only populated when the cluster method needs it
+        # (cluster_method.needs_cooccur); otherwise stays empty (zero overhead).
+        self.cooccur: Dict[int, torch.Tensor] = {}
+        self._cooccur_scorer = None     # lazily built from count_top_k
+
         # How active experts are partitioned into the K clusters. Defaults to
         # frequency-slice (the original behaviour); the CLI injects another
         # method when the YAML asks (A4). Only consulted when K > 1.
@@ -223,6 +230,7 @@ class ScoreBasedAvgDraft(DraftStrategy):
     # --- DraftStrategy overrides ---------------------------------------
     def reset(self):
         self.target_score.clear()
+        self.cooccur.clear()           # co-occurrence accumulates per-question
         self._cycle_in_question = -1
         # AUG_DUMP_ACTIVE_SET diagnostic: a new question starts here, so bump
         # the question id and restart the per-layer cycle counter. This lets
@@ -236,10 +244,30 @@ class ScoreBasedAvgDraft(DraftStrategy):
     def capture(self, layer_idx, router_logits):
         score_vec = self._score_vector_from_logits(router_logits)
         self.target_score[layer_idx] = score_vec.float().detach().cpu()
+        if getattr(self.cluster_method, "needs_cooccur", False):
+            self._accumulate_cooccur(layer_idx, router_logits.softmax(dim=-1))
 
     def capture_softmax(self, layer_idx, softmax):
         score_vec = self._score_vector_from_softmax(softmax)
         self.target_score[layer_idx] = score_vec.float().detach().cpu()
+        if getattr(self.cluster_method, "needs_cooccur", False):
+            self._accumulate_cooccur(layer_idx, softmax)
+
+    def _accumulate_cooccur(self, layer_idx, probs):
+        """Add this forward's [n, n] token-level co-occurrence into the running
+        per-question table. `probs` is the router softmax [seq, n]. Fired on
+        every target forward (prefill + verify) when the cluster method needs
+        co-occurrence; reset() clears the table between questions."""
+        scorer = self._cooccur_scorer
+        if scorer is None:
+            top_k = getattr(self, "count_top_k", None)
+            if top_k is None:
+                return          # draft has no native top-k → can't build cooccur
+            from aug_spec.runtime.scorers import make_cooccurrence_scorer
+            scorer = self._cooccur_scorer = make_cooccurrence_scorer(top_k)
+        C = scorer(probs).detach().cpu()
+        cur = self.cooccur.get(layer_idx)
+        self.cooccur[layer_idx] = C if cur is None else cur + C
 
     def refresh(self, adapter, blocks, draft_cache):
         if not self.target_score:
@@ -313,7 +341,8 @@ class ScoreBasedAvgDraft(DraftStrategy):
         n = len(weights)
         active = [i for i, w in enumerate(weights) if w > 0.0]
         ctx = ClusterContext(active=active, weights=weights,
-                             layer_idx=layer_idx)
+                             layer_idx=layer_idx,
+                             cooccur=self.cooccur.get(layer_idx))
         groups = self.cluster_method.assign(ctx, self.K)
 
         # Within-cluster weighting: "uniform" merges each cluster with EQUAL
