@@ -1,4 +1,6 @@
-# topm qpc=5, no_overload ON, mnt=512 (matches old engine_bmm runs). P2+P3, vram 0.2.
+# topm qpc=5, mnt=512. P2+P3, vram 0.2. Self-contained after A4 — the run
+# knobs that used to be env vars are now YAML (env still overrides). Matches
+# the old engine_bmm 512 runs.
 model:
   id: Qwen/Qwen3-30B-A3B-Base
   backend: offload
@@ -8,8 +10,14 @@ model:
     vram_budget_ratio: 0.2
     merge_offload: true
     merge_during_verify: true
+    no_overload: true            # was AUG_NO_OVERLOAD=1 (C++ no-overload dispatch)
+    # merged_backend: engine_bmm # default; was AUG_MERGED_BACKEND (engine_bmm|dispatch|bmm)
 draft:
   name: topm_count
   args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+  # early_pin: 0                 # default; was AUG_EARLY_PIN (SpecMoE only)
+cluster:
+  name: freq_slice               # ClusterMethod registry key (only freq_slice today)
+  within_weight: freq            # freq (default) | uniform ; was AUG_CLUSTER_UNIFORM
 run: {T: 5, questions_per_cat: 5, max_new_tokens: 512}
 output: {label: q5_512_tm_on, dir: output/q5_512_tm_on}

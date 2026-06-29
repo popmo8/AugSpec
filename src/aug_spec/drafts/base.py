@@ -112,7 +112,8 @@ class ScoreBasedAvgDraft(DraftStrategy):
     def __init__(self, record_history: bool = False,
                  K: int = 1,
                  draft_top_k: Optional[int] = None,
-                 cluster_method: Optional[ClusterMethod] = None):
+                 cluster_method: Optional[ClusterMethod] = None,
+                 within_weight: str = "freq"):
         # layer_idx → CPU fp32 tensor [num_experts]
         self.target_score: Dict[int, torch.Tensor] = {}
 
@@ -121,6 +122,11 @@ class ScoreBasedAvgDraft(DraftStrategy):
         # method when the YAML asks (A4). Only consulted when K > 1.
         self.cluster_method: ClusterMethod = (
             cluster_method or get_cluster_method("freq_slice"))
+
+        # Within-cluster merge weighting: "freq" (∝ activation count, default)
+        # or "uniform" (1/|group|). YAML `cluster.within_weight`; the
+        # AUG_CLUSTER_UNIFORM env still forces uniform as an override (A4).
+        self.within_weight: str = within_weight
 
         # K: number of merged experts cached per layer.
         #   K == 1 → single dense expert (a plain Dict[str, Tensor] cache).
@@ -310,11 +316,13 @@ class ScoreBasedAvgDraft(DraftStrategy):
                              layer_idx=layer_idx)
         groups = self.cluster_method.assign(ctx, self.K)
 
-        # AUG_CLUSTER_UNIFORM experiment: merge each cluster with EQUAL weights
-        # (1/|group|) instead of frequency-proportional ones. The partition
-        # (cluster_method) and the cross-cluster mass (`masses`) stay
-        # frequency-based — only the within-cluster combine changes.
-        uniform_merge = os.environ.get("AUG_CLUSTER_UNIFORM") is not None
+        # Within-cluster weighting: "uniform" merges each cluster with EQUAL
+        # weights (1/|group|) instead of frequency-proportional ones. The
+        # partition (cluster_method) and the cross-cluster mass (`masses`) stay
+        # frequency-based — only the within-cluster combine changes. Set via
+        # YAML `cluster.within_weight`; AUG_CLUSTER_UNIFORM env forces it on.
+        uniform_merge = (self.within_weight == "uniform"
+                         or os.environ.get("AUG_CLUSTER_UNIFORM") is not None)
 
         experts: List[Dict[str, torch.Tensor]] = []
         masses: List[float] = []

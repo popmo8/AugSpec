@@ -51,6 +51,8 @@ import yaml
 
 from aug_spec import __version__
 from aug_spec.adapters import adapter_for_config, get_adapter
+from aug_spec.adapters.base import apply_offload_settings
+from aug_spec.clustering import get_cluster_method
 from aug_spec.controller import Controller
 from aug_spec.drafts import (
     ScoreBasedAvgDraft, SpecMoeDraft, get_draft, get_draft_class)
@@ -99,10 +101,21 @@ class RunConfig:
                                          # (archer@draft-start, merged@draft-end, P1)
     merge_overlap: bool                  # offload-merge: merge on side stream,
                                          # overlap with next-layer fetch (P4)
+    no_overload: bool                    # offload: C++ no-overload dispatch
+                                         # (was AUG_NO_OVERLOAD; A4)
+    merged_backend: Optional[str]        # offload: merged-expert draft kernel
+                                         # (was AUG_MERGED_BACKEND; None=default)
+    early_pin: Optional[int]             # SpecMoE early-pin stage (was
+                                         # AUG_EARLY_PIN; None=default)
 
     # draft
     draft_name: str
     draft_args: Dict[str, Any]
+
+    # clustering / within-cluster merge (A3/A4)
+    cluster_name: str                    # ClusterMethod registry key
+    cluster_within_weight: str           # "freq" | "uniform" (was
+                                         # AUG_CLUSTER_UNIFORM)
 
     # run
     T: int
@@ -127,11 +140,18 @@ class RunConfig:
         draft_cfg = raw.get("draft") or {}
         run_cfg = raw.get("run") or {}
         out_cfg = raw.get("output") or {}
+        cluster_cfg = raw.get("cluster") or {}
 
         if "id" not in model_cfg:
             raise ValueError("config: model.id is required")
         if "name" not in draft_cfg:
             raise ValueError("config: draft.name is required")
+
+        within_weight = str(cluster_cfg.get("within_weight", "freq")).lower()
+        if within_weight not in ("freq", "uniform"):
+            raise ValueError(
+                "config: cluster.within_weight must be 'freq' or 'uniform', "
+                f"got {within_weight!r}")
 
         dtype_str = str(model_cfg.get("dtype", "bfloat16")).lower()
         if dtype_str not in _DTYPES:
@@ -175,8 +195,15 @@ class RunConfig:
                 offload_cfg.get("flush_on_draft_end", False)),
             merge_overlap=bool(
                 offload_cfg.get("merge_overlap", False)),
+            no_overload=bool(offload_cfg.get("no_overload", False)),
+            merged_backend=(str(offload_cfg["merged_backend"]).lower()
+                            if offload_cfg.get("merged_backend") else None),
+            early_pin=(int(draft_cfg["early_pin"])
+                       if draft_cfg.get("early_pin") is not None else None),
             draft_name=str(draft_cfg["name"]),
             draft_args=dict(draft_cfg.get("args") or {}),
+            cluster_name=str(cluster_cfg.get("name", "freq_slice")),
+            cluster_within_weight=within_weight,
             T=int(run_cfg.get("T", 3)),
             questions_per_cat=int(run_cfg.get("questions_per_cat", 10)),
             max_new_tokens=int(run_cfg.get("max_new_tokens", 512)),
@@ -264,6 +291,11 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print(f"  Output     : {cfg.output_dir}")
     print("=" * 70)
 
+    # Apply YAML overrides for the offload knobs that used to be import-time
+    # env reads (A4). Must run before any forward; env vars still override.
+    apply_offload_settings(merged_backend=cfg.merged_backend,
+                           early_pin=cfg.early_pin)
+
     # ── load model + adapter ───────────────────────────────────────────
     # `moe` is the moe_infinity wrapper on the offload backend (None on hf);
     # its `_configure_hook` must run before every generate — wired below as
@@ -320,6 +352,7 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
             device_memory_ratio=device_memory_ratio,
             dtype=cfg.dtype, trust_remote_code=cfg.trust_remote_code,
             load_cpu_source=True,
+            no_overload=cfg.no_overload,
         )
     else:
         print(f"\nLoading {cfg.model_id} (single copy; target == draft) ...")
@@ -350,7 +383,14 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
         draft_args["num_experts"] = adapter.num_experts(first_block)
 
     draft = get_draft(cfg.draft_name, **draft_args)
-    print(f"  Resolved   : draft={cfg.draft_name}{draft_args}")
+    # Inject the clustering / within-cluster weighting (A3/A4) for the
+    # averaged-draft family; other drafts don't cluster. Set before
+    # draft.prepare() so the cluster method's prepare hook runs.
+    if isinstance(draft, ScoreBasedAvgDraft):
+        draft.cluster_method = get_cluster_method(cfg.cluster_name)
+        draft.within_weight = cfg.cluster_within_weight
+    print(f"  Resolved   : draft={cfg.draft_name}{draft_args} "
+          f"cluster={cfg.cluster_name} within_weight={cfg.cluster_within_weight}")
 
     # ── run ───────────────────────────────────────────────────────────
     controller = Controller(model, adapter, draft, cpu_source=cpu_source,

@@ -21,7 +21,7 @@
 | **A1** | draft「名單事實」移到類別屬性，cli 去三重列舉 | 低 | ✅ DONE（drafts 旗標 + cli 去 `_MERGE_DRAFTS`；順手修正 pruned_count 漏列） |
 | **A2** | 整理 merge 入口（**固定線性加權平均，不抽 strategy**）+ 預留 cache 包裝點 | 低 | ✅ DONE（`merging/linear.py`；`_build_one` 委派） |
 | **A3** | `clustering/` strategy registry（freq_slice 原樣搬入，YAML 可選） | 中（碰 merge/cache 路徑） | ✅ DONE（`clustering/` registry；移除 `_assign_clusters`/`AUG_CLUSTER_LABELS`；freq_slice 對 25k 組與舊式逐一相同；q5 bit-exact 驗證中 job 248144） |
-| **A4** | env-var → YAML（merged_backend / early_pin / no_overload / cluster_uniform） | 低 | ⬜ TODO |
+| **A4** | env-var → YAML（merged_backend / early_pin / no_overload / cluster_uniform） | 低 | ✅ DONE（`model.offload.no_overload`/`merged_backend`、`draft.early_pin`、`cluster.within_weight`；env 仍為 override） |
 | **A5** | 把放錯地方的搬回去:specmoe forward 出 adapters/、bmm helper 拆出 | 中（純搬移） | ⬜ TODO |
 | **B1** | co-occurrence 統計捕捉（scorer + per-layer accumulator） | 中（碰 capture 路徑） | ⬜ TODO |
 | **B2** | `CooccurCluster`（**cannot-link / 圖切割**,非 agglomerative — 見 0.5） | 低（新 strategy） | ⬜ TODO |
@@ -42,10 +42,12 @@ merge 入口外);B1 → B2(分群要吃 co-occurrence 統計)。A1 / A4 / A5 與
    → **群內權重預設必須是 freq;uniform 只能當消融開關。** 直接推翻 B 段「先拍板」原本的設計 (i)。
 
 2. **co-occurrence 當「併在一起」(must-link)是錯方向 —— 比隨機分群還差。** q5 partition A/B
-   (只換分群、群內仍用 freq):dynamic freq_slice 基準 acceptance≈0.59;靜態隨機分群 −8.6pp;
-   **凝聚式 co-occurrence(B2 原版)−28~−40pp,明顯輸給隨機。** 直覺:常共現 = 同一 token 各自
-   貢獻,硬併成一顆會同時丟掉兩邊資訊。→ **B2 方向要翻成 cannot-link(把高共現切開)。**
-   (cooccur 仍在補完整 q5 數字,但 −28pp 以上的差距已穩健。)
+   (5 組各 65 題完整,只換分群、群內仍用 freq;baseline acceptance 0.594):
+   隨機 0.508(−8.6pp/−14.5%)> 靜態頻率 statfreq 0.420(−17.4pp/−29.3%)> 平衡共現
+   cooccur_bal 0.377(−21.7pp/−36.6%)> 凝聚式共現 cooccur 0.205(−38.9pp/−65.5%)。
+   **兩個 co-occurrence 變體都輸給隨機,且平衡版 cooccur_bal 仍低於隨機/statfreq → 不是不平衡
+   造成的,是訊號方向本身錯。** 直覺:常共現 = 同一 token 各自貢獻,硬併成一顆會同時丟掉兩邊
+   資訊。→ **B2 方向要翻成 cannot-link(把高共現切開)。**
 
 3. **逐 cycle 的 selected set 變動大、但有穩定底盤。** 相鄰 cycle Jaccard≈0.46(約 38% 換新),
    沒有「每 cycle 都在」的硬核(僅~1 顆),但約 17/24 顆會出現在過半 cycle。→ **逐 cycle 的成員

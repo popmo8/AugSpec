@@ -20,7 +20,7 @@ An adapter encapsulates everything specific to one MoE family:
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -40,6 +40,20 @@ _MERGED_BACKEND = os.environ.get("AUG_MERGED_BACKEND", "engine_bmm").lower()
 # in refresh, so they stay resident for the next draft (draft re-fetch → 0).
 # 0=off, 1=pin-now, 2=keep last cycle's kept until after this layer's compute.
 _EARLY_PIN = int(os.environ.get("AUG_EARLY_PIN", "0"))
+
+
+def apply_offload_settings(merged_backend: Optional[str] = None,
+                           early_pin: Optional[int] = None) -> None:
+    """Apply YAML-sourced overrides for the two module-level offload knobs that
+    used to be import-time-only env reads (A4). The env vars still win — set
+    only when the corresponding env var is absent, so `AUG_MERGED_BACKEND` /
+    `AUG_EARLY_PIN` remain runtime overrides. `None` means "leave as is".
+    The CLI calls this once after parsing the config, before any forward."""
+    global _MERGED_BACKEND, _EARLY_PIN
+    if merged_backend is not None and "AUG_MERGED_BACKEND" not in os.environ:
+        _MERGED_BACKEND = str(merged_backend).lower()
+    if early_pin is not None and "AUG_EARLY_PIN" not in os.environ:
+        _EARLY_PIN = int(early_pin)
 
 
 def _stack_swiglu_weights(cache: Dict[str, Any],
