@@ -10,11 +10,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .base import (
-    MoEAdapter,
-    _stack_swiglu_weights,
-    _topk_substitute_forward,
-)
+from aug_spec.kernels.bmm import stack_swiglu_weights
+
+from .base import MoEAdapter
 
 
 class MixtralAdapter(MoEAdapter):
@@ -71,7 +69,7 @@ class MixtralAdapter(MoEAdapter):
 
     def _swiglu_stack(self, cache, experts):
         # gate=w1, up=w3, down=w2, stacked + transposed for bmm.
-        return _stack_swiglu_weights(cache, experts, "w1", "w3", "w2")
+        return stack_swiglu_weights(cache, experts, "w1", "w3", "w2")
 
     def _standard_routing(self, block, hs_flat, gate_logits,
                           batch_size, sequence_length, hidden_dim):
@@ -160,7 +158,10 @@ class MixtralAdapter(MoEAdapter):
         return fwd
 
     def make_substitute_forward(self, controller, layer_idx, block):
-        return _topk_substitute_forward(controller, layer_idx, block)
+        # Lazy import: the SpecMoE forward lives in drafts/specmoe.py (A5);
+        # importing it at module top would cycle (adapters <-> drafts).
+        from aug_spec.drafts.specmoe import topk_substitute_forward
+        return topk_substitute_forward(controller, layer_idx, block)
 
     def expert_flat_weights(self, block):
         return [

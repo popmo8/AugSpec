@@ -24,7 +24,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from aug_spec.kernels.bmm import bmm_swiglu
 
 
 # Draft compute backend for the merged "multi" experts on the offload engine:
@@ -54,158 +55,6 @@ def apply_offload_settings(merged_backend: Optional[str] = None,
         _MERGED_BACKEND = str(merged_backend).lower()
     if early_pin is not None and "AUG_EARLY_PIN" not in os.environ:
         _EARLY_PIN = int(early_pin)
-
-
-def _stack_swiglu_weights(cache: Dict[str, Any],
-                          experts: List[Dict[str, torch.Tensor]],
-                          gate_key: str, up_key: str, down_key: str):
-    """Stack K merged SwiGLU experts' weights, transposed as the right operand
-    of ``bmm(hidden, w)``, memoised on the per-cycle `cache` dict:
-      gate/up: [K, D, INTER]   down: [K, INTER, D].
-    The cache dict is rebuilt each verify cycle, so the memo invalidates with
-    the merged weights."""
-    stk = cache.get("_bmm_stack")
-    if stk is None:
-        gate = torch.stack([e[gate_key] for e in experts]).transpose(1, 2)
-        up = torch.stack([e[up_key] for e in experts]).transpose(1, 2)
-        down = torch.stack([e[down_key] for e in experts]).transpose(1, 2)
-        stk = (gate.contiguous(), up.contiguous(), down.contiguous())
-        cache["_bmm_stack"] = stk
-    return stk
-
-
-def _bmm_swiglu(hs_flat: torch.Tensor, gw: torch.Tensor,
-                uw: torch.Tensor, dw: torch.Tensor) -> torch.Tensor:
-    """[K, T, D] = SiLU(hs·gateᵀ) ⊙ (hs·upᵀ) · downᵀ for all K experts, where
-    gw/uw are [K, D, INTER] and dw is [K, INTER, D]."""
-    K, T = gw.shape[0], hs_flat.shape[0]
-    hsK = hs_flat.unsqueeze(0).expand(K, T, -1)            # [K, T, D]
-    hidden = F.silu(torch.bmm(hsK, gw)) * torch.bmm(hsK, uw)
-    return torch.bmm(hidden, dw)                           # [K, T, D]
-
-
-def _pairwise_l2(flats: List[torch.Tensor]) -> torch.Tensor:
-    """Pairwise L2 distance matrix [n, n] from per-expert flattened weights.
-
-    `flats` is a list of n 1-D tensors (each expert's concatenated weights).
-    Returns a CPU fp32 [n, n] matrix with a zero diagonal, so an argmin over
-    a kept-expert column maps an in-mask expert to itself. Computed via
-    `torch.cdist` on the stacked matrix (one pass on the experts' device).
-    """
-    stacked = torch.stack(flats, dim=0)               # [n, D]
-    D = torch.cdist(stacked.unsqueeze(0), stacked.unsqueeze(0)).squeeze(0)
-    D.fill_diagonal_(0.0)
-    return D.float().cpu()
-
-
-def _specmoe_engine_bmm(controller, layer_idx, block, hs_flat,
-                        selected, routing_weights):
-    """Run SpecMoE's pinned kept-N experts through the engine's batched bmm
-    (`DispatchBmm`). The draft supplies a per-cycle-memoised stack of the kept
-    weights plus a kept-id→column map; `selected` (already substituted to kept)
-    and `routing_weights` are scattered into a [T, N] routing matrix. Returns
-    None when the kept experts aren't resident, so the caller falls back to the
-    per-expert dispatch."""
-    disp = block.expert_executor.expert_dispatcher
-    gpu = hs_flat.device.index
-    st = controller.draft.kept_bmm_state(
-        layer_idx, disp, gpu, hs_flat.device)
-    if st is None:
-        return None
-    gw, uw, dw, kept_to_col = st
-    cols = kept_to_col[selected]                          # [T, k]
-    routing = hs_flat.new_zeros(hs_flat.shape[0], gw.shape[0])  # [T, N]
-    routing.scatter_add_(1, cols, routing_weights)
-    return disp.dispatch_bmm(hs_flat, gw, uw, dw, routing, gpu)
-
-
-def _topk_substitute_forward(controller, layer_idx: int, block: nn.Module):
-    """SpecMoE forward for the standard `block.gate` + `block.experts[e]`
-    layout (Mixtral / Qwen3).
-
-    Both phases route top-`controller.draft.route_top_k` (overriding the
-    model's native top-k). In draft phase each natural winner is remapped
-    through the substitute table cached at `draft_cache[layer_idx]`
-    (in-mask → itself, out-of-mask → L2-nearest in-mask neighbour). In
-    target phase the natural winners are routed and the per-position
-    softmax captured for the next mask refresh.
-    """
-
-    def fwd(block, hidden_states):
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hs_flat = hidden_states.view(-1, hidden_dim)
-        router_logits = block.gate(hs_flat)                     # [T, n_experts]
-        full_softmax = F.softmax(router_logits, dim=1, dtype=torch.float)
-
-        k = controller.draft.route_top_k
-        routing_weights, selected = torch.topk(full_softmax, k, dim=-1)  # [T, k]
-
-        if controller.in_draft_phase:
-            sub_table = controller.draft_cache.get(layer_idx)
-            if sub_table is not None:
-                selected = sub_table.to(selected.device)[selected]   # remap
-        else:
-            controller.draft.capture(layer_idx, full_softmax)
-            # AUG_EARLY_PIN: pin this layer's next-draft kept-N NOW (count is known
-            # the moment the gate runs) so they stay resident for the draft
-            # (draft_fetch → 0). Default (0) pins only in refresh (after verify).
-            #   mode 1 = pin new kept-N now (unpins old-dropped immediately).
-            #   mode 2 = also keep last cycle's kept pinned through this layer's
-            #            compute, then drop the dropped ones in late_unpin (after
-            #            dispatch) so an old-kept this verify still uses isn't
-            #            evicted early.
-            if _EARLY_PIN and hasattr(controller.draft, "early_pin"):
-                controller.draft.early_pin(layer_idx, block, _EARLY_PIN)
-
-        if getattr(block, "norm_topk_prob", True):
-            routing_weights = routing_weights / routing_weights.sum(
-                dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hs_flat.dtype)
-
-        # engine_bmm (offload, draft): run the resident pinned kept-N experts
-        # through the engine's batched bmm — the SAME entry topm's merged draft
-        # uses, so a bmm-vs-bmm comparison isolates the algorithm. Falls back to
-        # the per-expert dispatch below if the kept experts aren't resident.
-        if (controller.in_draft_phase and _MERGED_BACKEND == "engine_bmm"
-                and hasattr(block, "expert_executor")
-                and hasattr(controller.draft, "kept_bmm_state")):
-            out = _specmoe_engine_bmm(
-                controller, layer_idx, block, hs_flat, selected, routing_weights)
-            if out is not None:
-                return (out.reshape(batch_size, sequence_length, hidden_dim),
-                        router_logits)
-
-        # Offload: experts are placeholders — run the (remapped) winners
-        # through the archer engine's dispatch instead of the per-expert loop.
-        if hasattr(block, "expert_executor"):
-            final = controller.adapter._dispatch_selected(
-                block, hs_flat, selected, routing_weights)
-            # mode 2: this layer's experts are now computed → drop the old kept-N
-            # that the next draft won't use (kept pinned until here so they were
-            # not evicted mid-compute).
-            if (_EARLY_PIN == 2 and not controller.in_draft_phase
-                    and hasattr(controller.draft, "late_unpin")):
-                controller.draft.late_unpin(layer_idx, block)
-            return (final.reshape(batch_size, sequence_length, hidden_dim),
-                    router_logits)
-
-        final = torch.zeros(
-            (batch_size * sequence_length, hidden_dim),
-            dtype=hs_flat.dtype, device=hs_flat.device)
-        expert_mask = F.one_hot(
-            selected, num_classes=block.num_experts).permute(2, 1, 0)
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hit:
-            expert_layer = block.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-            current_state = hs_flat[None, top_x].reshape(-1, hidden_dim)
-            current_hidden = (
-                expert_layer(current_state)
-                * routing_weights[top_x, idx, None])
-            final.index_add_(0, top_x, current_hidden.to(hs_flat.dtype))
-        return final.reshape(batch_size, sequence_length, hidden_dim), router_logits
-
-    return fwd
 
 
 class MoEAdapter:
@@ -344,7 +193,7 @@ class MoEAdapter:
         stk = self._swiglu_stack(cache, experts)
         if stk is None:
             return None
-        return _bmm_swiglu(hs_flat, *stk)
+        return bmm_swiglu(hs_flat, *stk)
 
     @staticmethod
     def _merge_dispatcher(block):

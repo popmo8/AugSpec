@@ -22,7 +22,7 @@
 | **A2** | 整理 merge 入口（**固定線性加權平均，不抽 strategy**）+ 預留 cache 包裝點 | 低 | ✅ DONE（`merging/linear.py`；`_build_one` 委派） |
 | **A3** | `clustering/` strategy registry（freq_slice 原樣搬入，YAML 可選） | 中（碰 merge/cache 路徑） | ✅ DONE（`clustering/` registry；移除 `_assign_clusters`/`AUG_CLUSTER_LABELS`；freq_slice 對 25k 組與舊式逐一相同；q5 bit-exact 驗證中 job 248144） |
 | **A4** | env-var → YAML（merged_backend / early_pin / no_overload / cluster_uniform） | 低 | ✅ DONE（`model.offload.no_overload`/`merged_backend`、`draft.early_pin`、`cluster.within_weight`；env 仍為 override） |
-| **A5** | 把放錯地方的搬回去:specmoe forward 出 adapters/、bmm helper 拆出 | 中（純搬移） | ⬜ TODO |
+| **A5** | 把放錯地方的搬回去:specmoe forward 出 adapters/、bmm helper 拆出 | 中（純搬移） | ✅ DONE（bmm→`kernels/bmm.py`；specmoe forward + `pairwise_l2`→`drafts/specmoe.py`，adapter 改 lazy import） |
 | **B1** | co-occurrence 統計捕捉（scorer + per-layer accumulator） | 中（碰 capture 路徑） | ⬜ TODO |
 | **B2** | `CooccurCluster`（**cannot-link / 圖切割**,非 agglomerative — 見 0.5） | 低（新 strategy） | ⬜ TODO |
 | **B3** | `CachedMerge`（CPU、bounded LRU、key=成員集合） | 中（記憶體 + 數值） | ⬜ TODO |

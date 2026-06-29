@@ -23,8 +23,12 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from aug_spec.adapters.base import _pairwise_l2
+# Read the offload knobs at call time (apply_offload_settings mutates them, A4),
+# so reference attributes on the module rather than binding the values.
+from aug_spec.adapters import base as _adapter_base
 from aug_spec.runtime.scorers import make_count_scorer
 
 from .base import DraftStrategy
@@ -89,7 +93,7 @@ class SpecMoeDraft(DraftStrategy):
             # Offload: block.experts are placeholders — read real weights from
             # the CPU source the controller attached (hf: src is block itself).
             src = getattr(block, "_cpu_merge_source", block)
-            self._expert_dist[li] = _pairwise_l2(
+            self._expert_dist[li] = pairwise_l2(
                 adapter.expert_flat_weights(src))
         first = next(iter(self._expert_dist.values()))
         self.num_experts = first.shape[0]
@@ -242,3 +246,135 @@ class SpecMoeDraft(DraftStrategy):
         st = (gw, uw, dw, kept_to_col)
         self._kept_bmm[layer_idx] = st
         return st
+
+
+# ── SpecMoE substitute forward (moved out of adapters/base.py, A5) ──────────
+# This is SpecMoE-draft logic, not model-adapter logic: the adapter only exposes
+# the generic `gate` / `_dispatch_selected` hooks these call through. Moved here
+# next to SpecMoeDraft. The adapter `make_substitute_forward` lazy-imports
+# `topk_substitute_forward` (avoids an adapters<->drafts import cycle).
+
+def pairwise_l2(flats: List[torch.Tensor]) -> torch.Tensor:
+    """Pairwise L2 distance matrix [n, n] from per-expert flattened weights.
+
+    `flats` is a list of n 1-D tensors (each expert's concatenated weights).
+    Returns a CPU fp32 [n, n] matrix with a zero diagonal, so an argmin over
+    a kept-expert column maps an in-mask expert to itself. Computed via
+    `torch.cdist` on the stacked matrix (one pass on the experts' device).
+    """
+    stacked = torch.stack(flats, dim=0)               # [n, D]
+    D = torch.cdist(stacked.unsqueeze(0), stacked.unsqueeze(0)).squeeze(0)
+    D.fill_diagonal_(0.0)
+    return D.float().cpu()
+
+
+def specmoe_engine_bmm(controller, layer_idx, block, hs_flat,
+                       selected, routing_weights):
+    """Run SpecMoE's pinned kept-N experts through the engine's batched bmm
+    (`DispatchBmm`). The draft supplies a per-cycle-memoised stack of the kept
+    weights plus a kept-id→column map; `selected` (already substituted to kept)
+    and `routing_weights` are scattered into a [T, N] routing matrix. Returns
+    None when the kept experts aren't resident, so the caller falls back to the
+    per-expert dispatch."""
+    disp = block.expert_executor.expert_dispatcher
+    gpu = hs_flat.device.index
+    st = controller.draft.kept_bmm_state(
+        layer_idx, disp, gpu, hs_flat.device)
+    if st is None:
+        return None
+    gw, uw, dw, kept_to_col = st
+    cols = kept_to_col[selected]                          # [T, k]
+    routing = hs_flat.new_zeros(hs_flat.shape[0], gw.shape[0])  # [T, N]
+    routing.scatter_add_(1, cols, routing_weights)
+    return disp.dispatch_bmm(hs_flat, gw, uw, dw, routing, gpu)
+
+
+def topk_substitute_forward(controller, layer_idx: int, block: nn.Module):
+    """SpecMoE forward for the standard `block.gate` + `block.experts[e]`
+    layout (Mixtral / Qwen3).
+
+    Both phases route top-`controller.draft.route_top_k` (overriding the
+    model's native top-k). In draft phase each natural winner is remapped
+    through the substitute table cached at `draft_cache[layer_idx]`
+    (in-mask → itself, out-of-mask → L2-nearest in-mask neighbour). In
+    target phase the natural winners are routed and the per-position
+    softmax captured for the next mask refresh.
+    """
+
+    def fwd(block, hidden_states):
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hs_flat = hidden_states.view(-1, hidden_dim)
+        router_logits = block.gate(hs_flat)                     # [T, n_experts]
+        full_softmax = F.softmax(router_logits, dim=1, dtype=torch.float)
+
+        k = controller.draft.route_top_k
+        routing_weights, selected = torch.topk(full_softmax, k, dim=-1)  # [T, k]
+
+        if controller.in_draft_phase:
+            sub_table = controller.draft_cache.get(layer_idx)
+            if sub_table is not None:
+                selected = sub_table.to(selected.device)[selected]   # remap
+        else:
+            controller.draft.capture(layer_idx, full_softmax)
+            # AUG_EARLY_PIN: pin this layer's next-draft kept-N NOW (count is known
+            # the moment the gate runs) so they stay resident for the draft
+            # (draft_fetch → 0). Default (0) pins only in refresh (after verify).
+            #   mode 1 = pin new kept-N now (unpins old-dropped immediately).
+            #   mode 2 = also keep last cycle's kept pinned through this layer's
+            #            compute, then drop the dropped ones in late_unpin (after
+            #            dispatch) so an old-kept this verify still uses isn't
+            #            evicted early.
+            early_pin = _adapter_base._EARLY_PIN
+            if early_pin and hasattr(controller.draft, "early_pin"):
+                controller.draft.early_pin(layer_idx, block, early_pin)
+
+        if getattr(block, "norm_topk_prob", True):
+            routing_weights = routing_weights / routing_weights.sum(
+                dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hs_flat.dtype)
+
+        # engine_bmm (offload, draft): run the resident pinned kept-N experts
+        # through the engine's batched bmm — the SAME entry topm's merged draft
+        # uses, so a bmm-vs-bmm comparison isolates the algorithm. Falls back to
+        # the per-expert dispatch below if the kept experts aren't resident.
+        if (controller.in_draft_phase
+                and _adapter_base._MERGED_BACKEND == "engine_bmm"
+                and hasattr(block, "expert_executor")
+                and hasattr(controller.draft, "kept_bmm_state")):
+            out = specmoe_engine_bmm(
+                controller, layer_idx, block, hs_flat, selected, routing_weights)
+            if out is not None:
+                return (out.reshape(batch_size, sequence_length, hidden_dim),
+                        router_logits)
+
+        # Offload: experts are placeholders — run the (remapped) winners
+        # through the archer engine's dispatch instead of the per-expert loop.
+        if hasattr(block, "expert_executor"):
+            final = controller.adapter._dispatch_selected(
+                block, hs_flat, selected, routing_weights)
+            # mode 2: this layer's experts are now computed → drop the old kept-N
+            # that the next draft won't use (kept pinned until here so they were
+            # not evicted mid-compute).
+            if (_adapter_base._EARLY_PIN == 2 and not controller.in_draft_phase
+                    and hasattr(controller.draft, "late_unpin")):
+                controller.draft.late_unpin(layer_idx, block)
+            return (final.reshape(batch_size, sequence_length, hidden_dim),
+                    router_logits)
+
+        final = torch.zeros(
+            (batch_size * sequence_length, hidden_dim),
+            dtype=hs_flat.dtype, device=hs_flat.device)
+        expert_mask = F.one_hot(
+            selected, num_classes=block.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            expert_layer = block.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            current_state = hs_flat[None, top_x].reshape(-1, hidden_dim)
+            current_hidden = (
+                expert_layer(current_state)
+                * routing_weights[top_x, idx, None])
+            final.index_add_(0, top_x, current_hidden.to(hs_flat.dtype))
+        return final.reshape(batch_size, sequence_length, hidden_dim), router_logits
+
+    return fwd

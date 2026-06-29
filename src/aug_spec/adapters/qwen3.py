@@ -15,11 +15,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .base import (
-    MoEAdapter,
-    _stack_swiglu_weights,
-    _topk_substitute_forward,
-)
+from aug_spec.kernels.bmm import stack_swiglu_weights
+
+from .base import MoEAdapter
 
 # moe_infinity is an optional dependency: an hf-only environment must still
 # be able to import this adapter. When absent, _is_offload_block is always
@@ -117,7 +115,7 @@ class Qwen3MoeAdapter(MoEAdapter):
 
     def _swiglu_stack(self, cache, experts):
         # gate_proj / up_proj / down_proj, stacked + transposed for bmm.
-        return _stack_swiglu_weights(
+        return stack_swiglu_weights(
             cache, experts, "gate_proj", "up_proj", "down_proj")
 
     def _merged_tensor_lists(self, experts):
@@ -285,7 +283,10 @@ class Qwen3MoeAdapter(MoEAdapter):
         return fwd
 
     def make_substitute_forward(self, controller, layer_idx, block):
-        return _topk_substitute_forward(controller, layer_idx, block)
+        # Lazy import: the SpecMoE forward lives in drafts/specmoe.py (A5);
+        # importing it at module top would cycle (adapters <-> drafts).
+        from aug_spec.drafts.specmoe import topk_substitute_forward
+        return topk_substitute_forward(controller, layer_idx, block)
 
     def expert_flat_weights(self, block):
         return [
