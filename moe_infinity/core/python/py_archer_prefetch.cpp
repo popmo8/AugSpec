@@ -108,6 +108,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("evict_layer", &ExpertDispatcher::EvictLayer)
       .def("set_pinned", &ExpertDispatcher::SetPinned)
       .def("clear_pinned", &ExpertDispatcher::ClearPinned)
+      .def("set_capture_expert_out", &ExpertDispatcher::SetCaptureExpertOut)
+      .def("get_captured_expert_outputs",
+           &ExpertDispatcher::GetCapturedExpertOutputs)
       .def("clear_expert_cache_counts",
            &ExpertDispatcher::ClearExpertCacheCounts);
 }

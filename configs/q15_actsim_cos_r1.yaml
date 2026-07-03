@@ -1,4 +1,4 @@
-# topm qpc=5, no_overload ON, mnt=512 (matches old engine_bmm runs). P2+P3, vram 0.2.
+# q15: skip mt_bench, qpc=15, UNIFORM merge. method=actsim_cos, repeat r1.
 model:
   id: Qwen/Qwen3-30B-A3B-Base
   backend: offload
@@ -8,8 +8,13 @@ model:
     vram_budget_ratio: 0.2
     merge_offload: true
     merge_during_verify: true
+    no_overload: true
 draft:
   name: topm_count
   args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
-run: {T: 5, questions_per_cat: 5, max_new_tokens: 512}
-output: {label: q5_512_tm_cooccur, dir: output/q5_512_tm_cooccur}
+cluster:
+  name: activation_similarity
+  metric: cosine
+  within_weight: uniform
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, skip_categories: [mt_bench]}
+output: {label: q15_actsim_cos_r1, dir: output/q15_actsim_cos_r1}

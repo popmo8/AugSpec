@@ -11,8 +11,10 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -170,6 +172,14 @@ class ExpertDispatcher : public base::noncopyable {
   void SetPinned(int layer_idx, const std::vector<int>& expert_ids, int gpu_id);
   void ClearPinned(int gpu_id);
 
+  // aug_spec activation_similarity: when capture is on, OutputFunc stashes each
+  // expert's RAW (pre-weight) output + its token indices, so the draft can
+  // compute per-token pairwise output-cosine. get_captured returns + clears the
+  // per-forward buffer (call after wait_dispatch_local). No cost when off.
+  void SetCaptureExpertOut(bool on) { capture_expert_out_ = on; }
+  std::vector<std::tuple<int64_t, int64_t, torch::Tensor, torch::Tensor>>
+  GetCapturedExpertOutputs();
+
  private:
   void Enqueue(CallArgs& args);
   std::vector<CallResult> Wait();
@@ -259,6 +269,12 @@ class ExpertDispatcher : public base::noncopyable {
   // kept-N skipped) instead of the single-slot serialised "overload" borrow.
   // Restores prefetch depth and makes pinning actually keep kept-N resident.
   bool no_overload_ = false;
+
+  // aug_spec activation_similarity capture (see SetCaptureExpertOut).
+  bool capture_expert_out_ = false;
+  std::mutex capture_mutex_;
+  std::vector<std::tuple<int64_t, int64_t, torch::Tensor, torch::Tensor>>
+      captured_outputs_;
 };
 
 #define SET_TENSORS_AND_MODULE_FROM_BLOB(cls, module, node, device, \

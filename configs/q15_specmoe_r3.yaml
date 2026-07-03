@@ -1,0 +1,16 @@
+# q15 SpecMoE baseline (L2-nearest substitution; NOT a merge method, so no
+# cluster/within_weight). pin+no_overload so kept-N stay resident -> bmm engages.
+# skip mt_bench, qpc=15. repeat r3.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    no_overload: true
+draft:
+  name: specmoe
+  args: {N: 16, route_top_k: 8, pin: true}
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, skip_categories: [mt_bench]}
+output: {label: q15_specmoe_r3, dir: output/q15_specmoe_r3}

@@ -384,6 +384,7 @@ def run_specbench(
     before_generate: Optional[Callable[[Any], None]] = None,
     vram_limit_bytes: Optional[int] = None,
     vram_guard: bool = False,
+    skip_categories: Optional[List[str]] = None,
 ) -> SpecBenchResult:
     """Run SpecBench eval with a fixed-T speculative schedule.
 
@@ -428,8 +429,19 @@ def run_specbench(
     cache_dir = (spec_bench_cache if spec_bench_cache is not None
                  else Path.cwd() / "data" / "spec_bench")
     all_q = _load_spec_bench_questions(cache_dir)
+    # run.skip_categories: drop whole categories (or the "mt_bench" alias, which
+    # expands to its 8 sub-categories) before sampling — e.g. to run without
+    # mt_bench's 40 questions.
+    skip: set = set()
+    for c in (skip_categories or []):
+        if c == "mt_bench":
+            skip |= set(SPEC_BENCH_MT_BENCH_CATS)
+        else:
+            skip.add(c)
     by_cat: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for q in all_q:
+        if q["category"] in skip:
+            continue
         by_cat[q["category"]].append(q)
     rng = random.Random(seed)
     questions: List[Dict[str, Any]] = []
@@ -437,6 +449,8 @@ def run_specbench(
         pool = list(by_cat[cat])
         rng.shuffle(pool)
         questions.extend(pool[:questions_per_cat])
+    if skip:
+        print(f"  Skipped cats  : {sorted(skip)}")
 
     print("=" * 70)
     title = f"  SpecBench [{label}]" if label else "  SpecBench"

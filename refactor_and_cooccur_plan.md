@@ -23,9 +23,9 @@
 | **A3** | `clustering/` strategy registry（freq_slice 原樣搬入，YAML 可選） | 中（碰 merge/cache 路徑） | ✅ DONE（`clustering/` registry；移除 `_assign_clusters`/`AUG_CLUSTER_LABELS`；freq_slice 對 25k 組與舊式逐一相同；q5 bit-exact 驗證中 job 248144） |
 | **A4** | env-var → YAML（merged_backend / early_pin / no_overload / cluster_uniform） | 低 | ✅ DONE（`model.offload.no_overload`/`merged_backend`、`draft.early_pin`、`cluster.within_weight`；env 仍為 override） |
 | **A5** | 把放錯地方的搬回去:specmoe forward 出 adapters/、bmm helper 拆出 | 中（純搬移） | ✅ DONE（bmm→`kernels/bmm.py`；specmoe forward + `pairwise_l2`→`drafts/specmoe.py`，adapter 改 lazy import） |
-| **B1** | co-occurrence 統計捕捉（scorer + per-layer accumulator） | 中（碰 capture 路徑） | ⬜ TODO |
-| **B2** | `CooccurCluster`（**cannot-link / 圖切割**,非 agglomerative — 見 0.5） | 低（新 strategy） | ⬜ TODO |
-| **B3** | `CachedMerge`（CPU、bounded LRU、key=成員集合） | 中（記憶體 + 數值） | ⬜ TODO |
+| **B1** | co-occurrence 捕捉（`make_cooccurrence_scorer` + 題級累積器，prefill→decode） | 中（碰 capture 路徑） | ✅ DONE（2026-06-30） |
+| **B2** | `cooccur_pair`（**must-link 貪婪配對,max size 2**）+ `within_weight: uniform` | 低（新 strategy） | ✅ DONE（2026-06-30；結果見 0.6） |
+| **B3** | `CachedMerge`（純成員 key、immutable、bounded LRU；因 uniform 而最乾淨） | 中（offload engine 整合） | ⬜ TODO |
 
 **依賴**:A3 → B2(co-occurrence 分群插在 clustering registry 上);A2 → B3(cache 包在線性
 merge 入口外);B1 → B2(分群要吃 co-occurrence 統計)。A1 / A4 / A5 與其餘大致獨立。
@@ -47,15 +47,34 @@ merge 入口外);B1 → B2(分群要吃 co-occurrence 統計)。A1 / A4 / A5 與
    cooccur_bal 0.377(−21.7pp/−36.6%)> 凝聚式共現 cooccur 0.205(−38.9pp/−65.5%)。
    **兩個 co-occurrence 變體都輸給隨機,且平衡版 cooccur_bal 仍低於隨機/statfreq → 不是不平衡
    造成的,是訊號方向本身錯。** 直覺:常共現 = 同一 token 各自貢獻,硬併成一顆會同時丟掉兩邊
-   資訊。→ **B2 方向要翻成 cannot-link(把高共現切開)。**
+   資訊。→ **B2 方向要翻成 cannot-link(把高共現切開)。**（⚠️ 此結論已被 0.6 再翻回:token 級
+   動態 + uniform 下,must-link 配對其實 ≈ baseline、贏 random。最終採 must-link `cooccur_pair`。）
 
 3. **逐 cycle 的 selected set 變動大、但有穩定底盤。** 相鄰 cycle Jaccard≈0.46(約 38% 換新),
    沒有「每 cycle 都在」的硬核(僅~1 顆),但約 17/24 顆會出現在過半 cycle。→ **逐 cycle 的成員
    集合無法快取;靜態 per-layer 分群才是 cache 的前提**(影響 A3 的分群生命週期與 B3)。
 
 > 注:`statfreq` / `cooccur_bal` / `cooccur` 與其 env 標籤 harness(`AUG_CLUSTER_LABELS`、
-> `scripts/make_cluster_labels.py`)都是**一次性對照,不納入重構**。它們只負責產出上面的結論;
-> registry 只保留 `freq_slice` 與之後的 cannot-link `cooccur`(見 A3 / A4)。
+> `scripts/make_cluster_labels.py`)都是**一次性對照,不納入重構**,已刪。它們只負責產出上面的
+> 結論。registry 現有 `freq_slice`(預設)/ `random` / `cooccur_pair`(見 0.6)。
+
+## 0.6 co-occurrence 配對的正式結果(2026-06-30,q5,token 級動態 + uniform)
+
+把 0.5 的「靜態 proxy」換成正式版(token 級共現、每題 prefill→decode 累積、貪婪 size-2 配對、
+群內 uniform)後,**結論對 0.5 反轉**:
+
+| 分群 + 群內權重 | overall AccR | mt_bench(40q,最可信) | vs baseline |
+|---|---|---|---|
+| baseline:freq_slice + freq | 0.5829 | 0.4711 | — |
+| **cooccur_pair + uniform** | **0.5551** | **0.4659**（≈ baseline） | **−2.8pp** |
+| random + uniform | 0.5027 | 0.3943 | −8.0pp |
+
+- **must-link 配對在 token 級 + uniform 下其實 work**:cooccur_pair 贏 random+uniform **+5pp**,
+  且在最可信的 mt_bench(40q)**≈ baseline**。0.5 那個「must-link 比隨機差」是靜態 proxy 的假象。
+- overall −2.8pp ≈ 1–1.5σ(run-to-run 雜訊 ~±0.02–0.04)→ **可能與 baseline 無顯著差**;n=5 的
+  子類別(rag/math)雜訊大,別單看。**要定論需重跑 1–2 次取平均。**
+- **意義**:uniform 的 acceptance 代價小到可接受,而它換來乾淨可 cache 的 merged(見 B3)。
+  → 走 must-link `cooccur_pair` + uniform + cache 這條線。
 
 ---
 
@@ -65,7 +84,7 @@ merge 入口外);B1 → B2(分群要吃 co-occurrence 統計)。A1 / A4 / A5 與
 aug_spec/
   adapters/      # 維持原狀(不去重);只把 bmm helper 與 specmoe forward 移出(A5)
   drafts/        # draft 策略 + specmoe substitute forward(A5 搬入)
-  clustering/    # 新:ClusterMethod registry — freq_slice + cooccur(A3 / B2)
+  clustering/    # 新:ClusterMethod registry — freq_slice / random / cooccur_pair(A3 / B2)
   merging/       # 新:固定線性 merge 入口 + CachedMerge(A2 / B3,非 registry)
   kernels/       # 新:bmm helper(A5 從 adapters/base.py 拆出)
   runtime/       # loader, specbench, phase, offload_merge, scorers, profile
@@ -123,9 +142,10 @@ co-occurrence 分群就得改那個 method / 加 if 分支。**(0.5 的 partitio
 acceptance 差很大 —— 隨機 −8.6pp、co-occurrence −28~−40pp。分群確實值得抽成 registry,A3 不是
 過度設計。)**
 
-**做法**:把「分群」抽成可選策略,跟 `draft:` / `adapter:` 一樣用 YAML 選。**介面除了逐 cycle 的
-`assign`,要多一個比 per-cycle 粗的生命週期 hook**——因為未來的 cooccur(B2)是在 window/EMA 上
-累積、每隔一段才重算分群(不是每 cycle),需要一個「每層(或每 window)準備一次」的入口:
+**做法**:把「分群」抽成可選策略,跟 `draft:` / `adapter:` 一樣用 YAML 選。介面以逐 cycle 的
+`assign(ctx, K)` 為主,另保留一個 `prepare(adapter, blocks)` 作為「每層/每 window 準備一次」的
+預留 hook(目前 freq_slice/random/cooccur_pair 都 no-op;cooccur_pair 的共現是在 draft 的
+`capture` 累積、經 `ctx.cooccur` 餵入,不走 prepare):
 ```python
 # clustering/base.py
 class ClusterContext:           # 一個「統計袋子」,method 各取所需
@@ -146,7 +166,7 @@ cluster: {name: freq_slice}   # 預設;之後可換 cooccur
 - **要清掉的實驗 hack(不收編)**:0.5 的 partition A/B 為了快,在 `_assign_clusters` 塞了一條讀
   標籤檔的分支(`AUG_CLUSTER_LABELS` + `_load_static_labels`)。**那批一次性對照(statfreq /
   cooccur_bal / cooccur)都不納入 registry**;A3 要把這條 inline 分支與 `_load_static_labels`
-  移除,讓 registry 乾淨地只留 `freq_slice`(預設)+ 之後的 cannot-link `cooccur`(B2)。
+  移除,讓 registry 乾淨地只留 `freq_slice`(預設);其餘成員 `random` / `cooccur_pair` 之後加。
   (診斷 dump 仍需 `layer_idx`,該串接保留;`scripts/make_cluster_labels.py` 與標籤檔屬實驗產物,
   不進主程式。)
 - **驗證**:freq_slice 跑既有 K=16 config,分群結果與 MAT 與現在一致。
@@ -181,78 +201,86 @@ cluster: {name: freq_slice}   # 預設;之後可換 cooccur
 
 ---
 
-## B. 新功能:co-occurrence 分群 + CPU merge cache
+## B. 新功能:co-occurrence pair 分群(+uniform)+ merged-expert cache
 
-### ⚠️ 先拍板:cache 可重用性決定 merge 語意(**已被 0.5 修正**)
-merge 是逐 cycle count-weighted。若 cache key 含逐 cycle 權重 → 幾乎不命中。
+> **現況(2026-06-30)**:B1 + B2 已實作為 `cooccur_pair` + `within_weight: uniform`,q5 結果見
+> 0.6;B3(cache)待做。B 段方向經 0.6 二度修正:**must-link 配對(把高共現的併成 pair)在
+> token 級動態 + uniform 下其實 work**(≈ baseline、贏 random),所以走 must-link,不做 cannot-link。
 
-**原設計 (i)**(誰一群、群內權重都用穩定共現統計、且群內可齊頭式)**已被 0.5 部分否決**:
-A0 的 uniform 實驗顯示「群內齊頭式」掉 6.6pp,所以**群內權重不能是 uniform**。
+### ⚠️ 先拍板:uniform → merged 可 cache(設計 (i) 成立,取代 (i′))
+cooccur_pair + uniform 下,一個 cluster 的 merged expert
+`merged({i,j}) = (E_i + E_j)/2` —— **只跟成員集合有關,與逐 cycle 權重無關,且對整個 run 不變**。
 
-**修正後 (i′)**:cache 仍成立,但靠的是「**穩定但非均勻**」的群內權重 ——
-- 成員集合由**靜態/穩定**統計決定(整層固定,見 A3 的 static lifecycle);
-- 群內權重用該成員集合在當前 window 的**穩定 freq**(不是逐 cycle count,也不是 uniform),
-  是「成員集合 + window」的確定性函數;
-- 因此 cache key = 成員集合(+ window epoch)仍可高命中,且保住了 freq 加權的 6.6pp。
+- 0.5 曾擔心 uniform 掉 acceptance(在 freq-slice 分群上 −6.6pp),一度改採 (i′)「穩定但非均勻
+  freq + window-epoch key」。
+- **0.6 推翻這個顧慮**:在 **co-occurrence 配對分群**上,uniform 的代價小到可接受(overall
+  −2.8pp、mt_bench 40q ≈ baseline、贏 random+uniform +5pp,見 0.6)。
+- 所以回到最乾淨的 **設計 (i)**:**cache key = 純成員集合(不含權重、不含 window epoch)**,值
+  immutable。uniform 是這個乾淨 cache 的前提,acceptance 的小代價換的就是它。
 
-0.5 的 set-shift 也佐證:逐 cycle 成員無法快取(38% 換新),但有穩定底盤 → 靜態分群可快取。
+### B1 — co-occurrence 捕捉 ✅ 已實作(2026-06-30)
+- **`runtime/scorers.py`**:`make_cooccurrence_scorer(top_k)` — softmax 取 top-k →
+  `Σ_token onehot·onehotᵀ` → `[n,n]`。
+- **`drafts/base.py`**:`ScoreBasedAvgDraft.cooccur: Dict[int, Tensor[n,n]]`,**每題從 prefill
+  累積到 decode**(不是 EMA/window),`capture()` 累加、`reset()` 每題清空。**prefill 的 capture
+  本來就會觸發**(target 階段;`PrefillCountDraft` 即靠此),所以不需新 hook。
+- **gate**:只有 `cluster_method.needs_cooccur=True` 才累積 → 對其他分群法零開銷。
+- **接線**:`_cluster_and_build` 把 `self.cooccur.get(li)` 灌進 `ClusterContext.cooccur`。
 
-### B1 — co-occurrence 統計捕捉
-co-occurrence 需要**每 token 的 top-k 集合**,不只聚合 count。
-- **scorers.py**:加 `make_cooccurrence_scorer`:對 softmax 取 top-k → `Σ_token onehot·onehotᵀ` → `[n,n]`。
-- **drafts/base.py**:`target_score`(count `[n]`)旁邊加 `self.cooccur: Dict[int, Tensor[n,n]]`,
-  用 **window / EMA** 累積(讓它穩定 → 提高 cache 命中)。capture 時一併更新。
-- **接線**:把 `cooccur[li]` 灌進 `ClusterContext`。
-- **驗證**:不開 cooccur cluster 時行為不變;開了之後印共現矩陣 sanity check。
+### B2 — `cooccur_pair` 分群 ✅ 已實作(must-link,2026-06-30)
+- **`clustering/cooccur.py` `CooccurPairCluster`**:在 `ctx.cooccur` 上做**貪婪最大共現配對**——
+  反覆併「共現最高、且兩顆都還沒被配」的 pair,直到剩 K=16 群,所以每群是 **pair 或 singleton
+  (max size 2)**。`needs_cooccur=True`。
+- 搭 `within_weight: uniform`。YAML:`cluster: {name: cooccur_pair, within_weight: uniform}`。
+- **方向(對 0.5 再翻一次)**:0.5 用「靜態 per-cycle-set proxy + freq」測,must-link 輸 random
+  → 當時改提 cannot-link;但 0.6 用「**token 級動態 + size-2 + uniform**」測,must-link 配對
+  **贏 random +5pp、≈ baseline** → 最終採 **must-link 配對**,cannot-link/cut **不需要了**。
 
-### B2 — `CooccurCluster`(**方向已翻轉:cannot-link / cut,不是 agglomerative merge**)
-**0.5 的結果否決了原本的方向**:把高共現的 expert **併在一起**(凝聚式 must-link),acceptance
-比隨機還差(−28~−40pp)。原因見 0.5:常共現 = 同一 token 各自貢獻,併成一顆會同時丟掉兩邊資訊。
-
-- **clustering/cooccur.py**:在 `ctx.cooccur` 上做**圖切割 / 譜分群**,目標是**把高共現的 expert
-  切到不同 cluster**(cannot-link),而非併在一起;盡量讓「常一起 fire」的 expert 分散,使每個
-  token 的多顆貢獻能落在不同 cluster、被分別選用。回傳 `list[list[int]]`,介面與 freq_slice 一致。
-- **相似度**:用 frequency-weighted 共現(cosine / raw),**不要 lift/PMI**(lift 會放大對輸出
-  幾乎沒影響的稀有雙人組,見 0.5 的共現分析)。
-- **平衡**:0.5 顯示凝聚式會塌成一個巨群;切割法要保持各群大小相近(K=16)。
-- **YAML**:`cluster: {name: cooccur, window: 512, ...}`。
-- **先打的關卡(在投入 B1 token 級統計前)**:沿用 0.5 那套**一次性 harness**(env 標籤檔)只測
-  「反共現切割」這一個新方向對 acceptance 的影響,贏過隨機與 freq_slice 才值得做完整 dynamic 版;
-  harness 與標籤檔測完即丟,不進主程式。
-- **驗證**:MAT 對比 freq_slice / random;確認切割版 ≥ 兩者。
-
-### B3 — `CachedMerge`(CPU、bounded LRU)
-- **merging/cache.py**:包在固定的線性 merge 入口外(A2):
-  ```python
-  class CachedMerge:
-      def __init__(self, inner_merge, max_items, device="cpu"): ...
-      def merge(self, adapter, block, member_ids, weights):
-          key = frozenset(member_ids)          # (i′):成員集合(+window epoch),權重是其確定函數
-          hit = self.store.get(key)
-          if hit is not None: return hit.to(target_device)
-          out = self.inner_merge(adapter, block, member_ids, weights)
-          self.store.put(key, out.cpu())        # CPU 存、用時搬回 GPU
-          return out
-  ```
-- **記憶體**:n=128 → 子群數可能很大,`store` 必須 **bounded LRU**(只留反覆命中的)。
-  (i′) 的靜態成員 + 穩定 freq 權重才會讓常用子群重複命中、cache 小而有效。
-- **量測**:印 cache hit-rate / size / 省下的 merge 次數;對比有無 cache 的 TPS。
+### B3 — merged-expert cache(待做;因 uniform 而最乾淨)
+包在 A2 的 `linear_merge` 入口外:
+```python
+# merging/cache.py
+class CachedMerge:
+    def merge(self, adapter, block, layer_idx, member_ids, weights):
+        key = (layer_idx, frozenset(member_ids))   # uniform → 只用成員集合,不含權重
+        hit = self.store.get(key)
+        if hit is not None:
+            self.store.move_to_end(key); return _to_device(hit, block)
+        out = self.inner(adapter, block, member_ids, weights)   # = linear_merge
+        self.store[key] = _to_cpu(out)              # 存 CPU,bounded LRU
+        if len(self.store) > self.max_items: self.store.popitem(last=False)
+        return out
+```
+- **immutable,無需 invalidation**:`E_i` 是固定模型權重、uniform 平均也固定 → `{i,j}` 這顆
+  merged **整個 run 不變**,算一次用一輩子。只有 bounded LRU 因容量汰換。
+- **關鍵分離**:每題 `reset` 清的是「**共現表**」(決定這題要配哪些 pair),**不是 cache**
+  ——`pair → merged` 是 **run-level 永久**的,跨題重用。
+- **max size 2 → key space 小**:每層只可能 pair/singleton;共現穩定後反覆命中 →
+  **暖機後 ~100% hit、per-cycle merge 成本趨近 0**。
+- **接線**:把 `layer_idx` 串進 `_build_one` → cache;**gate 在 `within_weight=="uniform"`**
+  (freq 的 merged 依賴權重,純成員 key 會錯;freq 要嘛關 cache、要嘛把量化權重放進 key)。
+- **offload 風險(主要)**:offload 的 merge 走 C++ `engine.build`,它在 archer pool 記了帳;
+  cache 命中時繞過 engine、直接 CPU→GPU,要確認餵給 draft forward 的格式一致、不讓 residency
+  記帳 desync。→ **先在 hf backend 把 cache + 命中率/正確性跑通,再上 offload 驗 engine 整合。**
+- **GPU 常駐 vs CPU 存放**:cache 存 CPU(一顆 merged ≈ 一顆 expert ~9MB);每 cycle 只有
+  `draft_top_k×層` 的 merged 上 GPU,沿用既有 `cpu_source` 搬運。
 - **YAML**:`merge: {cache: {enabled: true, max_items: 4096}}`(merge 不可配置,只有 cache 開關)。
-- **驗證**:hit 時的 merged 結果 == 重算結果(數值一致);hit-rate 與 TPS 增益。
+- **量測(重點是 TPS,不是 acceptance)**:hit-rate / distinct pairs built / 省下的 merge 次數 /
+  **有無 cache 的 TPS** / hit==重算(數值一致)。論文命題:**「用 ~0–3pp acceptance 換掉幾乎全部
+  per-cycle merge 成本」淨 TPS 是否為正**(offload 上 merge/fetch 主導時間,很可能淨正)。
 
 ---
 
-## 2. 建議執行順序
+## 2. 進度與後續
 
-1. **A1**(低風險 cli 清理,行為不變)。
-2. **A3**(clustering registry;freq_slice 原樣搬入,並**移除** 0.5 的 `AUG_CLUSTER_LABELS`
-   實驗分支,行為不變驗)+ **A2**(整理線性 merge 入口)。
-3. **A4**(env → YAML;順手把 A0 的 uniform 開關正式化成 `cluster.within_weight`,預設 freq)。
-4. **決策關卡(B2 前置,便宜)**:用一次性 harness 測「反共現切割」vs random vs freq_slice 的
-   acceptance(harness 測完即丟,不留 statfreq/cooccur_bal/cooccur 那批)。贏不過 → 重想分群訊號
-   (或改試 functional-distance);贏得過才往下。
-5. **B1 → B2 → B3**(疊在 clustering 接縫 + 線性 merge 入口上,純新增成員;B2 為 cannot-link 版,
-   B3 用修正後的 (i′) 穩定 freq 權重)。
-6. **A5**(純搬移,可最後做)。
+**已完成**:A1–A5(2026-06-29)、B1 + B2(2026-06-30,`cooccur_pair` + uniform,結果見 0.6)。
 
-每步一個 commit;碰數值的步驟(A3/B3)附 q5 對照數據再合。
+**後續**:
+1. **重跑定論(便宜,先做)**:cooccur_pair + 一份新 baseline 各重跑 1–2 次取平均,把「overall
+   −2.8pp / mt_bench ≈ baseline」的 acceptance gap 釘住(目前單跑、在雜訊邊緣)。
+2. **B3 — merged-expert cache**:先在 **hf backend** 把 `CachedMerge` + 命中率 + 「hit==重算」跑通,
+   再上 **offload** 驗 `engine.build` 整合與 **TPS 增益**。這步才是 cooccur_pair + uniform 的真正
+   報酬(acceptance 已知,cache 換 TPS)。
+
+每步一個 commit;碰數值的步驟附 q5 對照數據再合(注意:因 offload run-to-run 非確定,bit-exact
+不可用,改看 aggregate + 多跑取平均,見 0.6)。

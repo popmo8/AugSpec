@@ -21,7 +21,7 @@
   - `runtime/` — `loader.py`(load_offload / VRAM 預算;A4 起接受 `no_overload` 並在 `MoE()` 前設環境變數)、`specbench.py`(跑 Spec-Bench)、`phase.py`(draft/verify 階段切換)、`offload_merge.py`(merge-during-verify 引擎)、`scorers.py`。
 - **C++ 引擎:`moe_infinity/`**(vendored,expert offloading)。核心 `core/parallel/expert_dispatcher.cpp`(fetch/cache/evict/merge)。
   - 改 C++ 後要重編:`cd moe_infinity && <venv> setup.py build_ext --inplace`(改 Python 不用)。
-- 計劃文件:`verify_merge_plan.md`(P1–P4 merge-during-verify)、`refactor_and_cooccur_plan.md`(重構 **A1–A5 已全部完成 2026-06-29** + co-occurrence/cache B1–B3 待做;見 0.5 前置實驗結論)。
+- 計劃文件:`verify_merge_plan.md`(P1–P4 merge-during-verify)、`refactor_and_cooccur_plan.md`(重構 **A1–A5 已全部完成 2026-06-29** + co-occurrence/cache B1–B3 待做;見 0.5 前置實驗結論)、**`ARCHITECTURE_REVIEW_AND_PAPER_PLAN.md`(2026-07-03 新增:全 repo 架構 review + 論文可重現性 P0–P4 roadmap;做 paper/repro/測試/打包相關工作前先讀它,並照它的狀態追蹤表更新進度)**、**`hybrid_cluster_plan.md`(2026-07-03 新增:`cluster.name: hybrid` 的完整實作規格——α 凸組合 prefill-only act-sim(L2) map 與 decode-only cosine-normalized co-occur map,greedy_pair 分群;含相位開關接線、q15 α sweep 實驗計劃)**。
 
 ## 怎麼跑實驗(一律用 sbatch,不要在 login node 跑 GPU)
 - venv:`/work/morrisliu07/aug_spec/.venv/bin/python`。

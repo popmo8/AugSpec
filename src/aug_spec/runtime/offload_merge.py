@@ -79,6 +79,17 @@ class OffloadMergeEngine:
         self.blocks = list(blocks)
         for _, block in self.blocks:
             block._merge_engine = self
+        # activation_similarity: turn on the C++ engine's per-expert output
+        # capture up front (must be on BEFORE any dispatch; on_verify_layer runs
+        # post-dispatch). The dispatcher is shared across blocks. Idempotent;
+        # no-op for other cluster methods.
+        draft = getattr(self.controller, "draft", None)
+        if draft is not None and getattr(
+                getattr(draft, "cluster_method", None),
+                "needs_activation_sim", False):
+            disp = self._dispatcher()
+            if disp is not None and hasattr(disp, "set_capture_expert_out"):
+                disp.set_capture_expert_out(True)
 
     # ── merge execution ─────────────────────────────────────────────────
     def build(self, block: nn.Module, weights: List[float]) -> Dict[str, Any]:
@@ -107,6 +118,16 @@ class OffloadMergeEngine:
         if not self.during_verify or self.controller is None:
             return
         draft = self.controller.draft
+        # activation_similarity: this layer's experts just ran (post-dispatch),
+        # so the C++ capture buffer holds their raw outputs — accumulate the
+        # pairwise output-cosine BEFORE the merge below reads ctx.pair_sim.
+        if getattr(getattr(draft, "cluster_method", None),
+                   "needs_activation_sim", False) and \
+                hasattr(draft, "accumulate_activation_sim"):
+            d = self._dispatcher()
+            if d is not None and hasattr(d, "get_captured_expert_outputs"):
+                draft.accumulate_activation_sim(
+                    layer_idx, d, self.adapter.num_experts(block))
         score = getattr(draft, "target_score", {}).get(layer_idx)
         if score is None or not hasattr(draft, "_refresh_layer"):
             return

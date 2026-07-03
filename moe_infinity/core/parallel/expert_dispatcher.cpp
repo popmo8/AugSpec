@@ -433,6 +433,14 @@ void ExpertDispatcher::EvictLayer(int layer_idx, int gpu_id) {
   }
 }
 
+std::vector<std::tuple<int64_t, int64_t, torch::Tensor, torch::Tensor>>
+ExpertDispatcher::GetCapturedExpertOutputs() {
+  std::lock_guard<std::mutex> lock(capture_mutex_);
+  std::vector<std::tuple<int64_t, int64_t, torch::Tensor, torch::Tensor>> out;
+  out.swap(captured_outputs_);
+  return out;
+}
+
 void ExpertDispatcher::SetProfilePhase(int phase) {
   profile_phase_.store(phase);
 }
@@ -902,6 +910,14 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output,
         router_weight_.index({torch::indexing::Slice(), expert_idx}));
   } else {
     auto token_indices = torch::nonzero(token_mask).squeeze(1);
+    // aug_spec activation_similarity: stash the RAW (pre-weight) expert output
+    // and its token indices for the draft's pairwise-cosine accumulation.
+    if (capture_expert_out_) {
+      std::lock_guard<std::mutex> lock(capture_mutex_);
+      captured_outputs_.emplace_back(
+          layer_idx, expert_idx, token_indices.to(torch::kCPU),
+          output_tensor.detach().to(torch::kCPU));
+    }
     auto weights = router_weight_.index({token_mask, expert_idx}).unsqueeze(1);
     auto weighted_output = output_tensor * weights;
     final_hidden_states_.index_add_(0, token_indices, weighted_output);

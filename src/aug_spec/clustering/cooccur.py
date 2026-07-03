@@ -14,40 +14,13 @@ acceptance.
 
 from __future__ import annotations
 
-import itertools
 from typing import List
 
-from .base import ClusterContext, ClusterMethod
+from .base import ClusterContext, ClusterMethod, greedy_pair
 
 
 class CooccurPairCluster(ClusterMethod):
     needs_cooccur = True
 
     def assign(self, ctx: ClusterContext, K: int) -> List[List[int]]:
-        active = list(ctx.active)
-        C = ctx.cooccur
-        # No table yet (e.g. very first refresh before any capture) or already
-        # at/under K experts → every active expert is its own cluster.
-        if C is None or len(active) <= K:
-            return [[e] for e in active]
-
-        # Rank all active pairs by co-occurrence desc, then greedily accept the
-        # highest while each expert stays unpaired (enforces max cluster size 2),
-        # stopping once enough merges land us at K clusters.
-        pairs = sorted(
-            ((float(C[i, j]), i, j) for i, j in itertools.combinations(active, 2)),
-            reverse=True)
-        need = len(active) - K          # merges required to reach K clusters
-        used: set = set()
-        groups: List[List[int]] = []
-        for _, i, j in pairs:
-            if need <= 0:
-                break
-            if i in used or j in used:
-                continue
-            groups.append([i, j])
-            used.add(i)
-            used.add(j)
-            need -= 1
-        groups.extend([e] for e in active if e not in used)
-        return groups
+        return greedy_pair(ctx.cooccur, list(ctx.active), K)

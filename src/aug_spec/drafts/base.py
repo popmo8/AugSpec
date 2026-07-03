@@ -124,6 +124,15 @@ class ScoreBasedAvgDraft(DraftStrategy):
         self.cooccur: Dict[int, torch.Tensor] = {}
         self._cooccur_scorer = None     # lazily built from count_top_k
 
+        # activation_similarity (cluster.name=activation_similarity): running
+        # sum of pairwise output-cosine (act_sim_num) and co-fire count
+        # (act_sim_cnt) per layer [n,n], accumulated from the C++ engine's
+        # captured per-expert outputs across the question, cleared in reset().
+        # ctx.pair_sim = num/cnt (-1 where cnt==0). Populated only when the
+        # cluster method needs it.
+        self.act_sim_num: Dict[int, torch.Tensor] = {}
+        self.act_sim_cnt: Dict[int, torch.Tensor] = {}
+
         # How active experts are partitioned into the K clusters. Defaults to
         # frequency-slice (the original behaviour); the CLI injects another
         # method when the YAML asks (A4). Only consulted when K > 1.
@@ -231,6 +240,8 @@ class ScoreBasedAvgDraft(DraftStrategy):
     def reset(self):
         self.target_score.clear()
         self.cooccur.clear()           # co-occurrence accumulates per-question
+        self.act_sim_num.clear()       # activation-similarity accumulates per-question
+        self.act_sim_cnt.clear()
         self._cycle_in_question = -1
         # AUG_DUMP_ACTIVE_SET diagnostic: a new question starts here, so bump
         # the question id and restart the per-layer cycle counter. This lets
@@ -240,6 +251,12 @@ class ScoreBasedAvgDraft(DraftStrategy):
         if os.environ.get("AUG_DUMP_ACTIVE_SET"):
             self._dump_qid = getattr(self, "_dump_qid", -1) + 1
             self._dump_active_cycle = {}
+        if os.environ.get("AUG_DUMP_PAIRS"):
+            self._pairdump_qid = getattr(self, "_pairdump_qid", -1) + 1
+            self._pairdump_cycle = {}
+        if os.environ.get("AUG_DUMP_CYCLE_SIM"):
+            self._cyclesim_qid = getattr(self, "_cyclesim_qid", -1) + 1
+            self._cyclesim_cycle = {}
 
     def capture(self, layer_idx, router_logits):
         score_vec = self._score_vector_from_logits(router_logits)
@@ -268,6 +285,74 @@ class ScoreBasedAvgDraft(DraftStrategy):
         C = scorer(probs).detach().cpu()
         cur = self.cooccur.get(layer_idx)
         self.cooccur[layer_idx] = C if cur is None else cur + C
+
+    def accumulate_activation_sim(self, layer_idx, dispatcher, n) -> None:
+        """Pull this layer's captured per-expert outputs from the C++ engine and
+        accumulate, per co-firing token, the pairwise output-cosine into
+        act_sim_num[n,n] and the co-fire count into act_sim_cnt[n,n]. Called from
+        on_verify_layer (post-dispatch) when cluster_method.needs_activation_sim.
+        captured = list of (layer_idx, expert_idx, token_indices[t], output[t,D]).
+        """
+        captured = dispatcher.get_captured_expert_outputs()
+        if not captured:
+            return
+        metric = getattr(self.cluster_method, "metric", "cosine")
+        # token id -> list of (expert, RAW output vec)
+        tok: Dict[int, List] = {}
+        for li, e, tok_idx, out in captured:
+            if int(li) != int(layer_idx):
+                continue
+            out = out.float()
+            for k, t in enumerate(tok_idx.tolist()):
+                tok.setdefault(int(t), []).append((int(e), out[k]))
+        if not tok:
+            return
+        # Build THIS CYCLE's contribution separately first, so we can dump the
+        # per-cycle similarity (for the cross-cycle-drift experiment) before
+        # folding it into the running per-question accumulator. num_c holds the
+        # raw per-pair metric (cosine, or L2 distance); _pair_sim_table converts.
+        num_c = torch.zeros(n, n)
+        cnt_c = torch.zeros(n, n)
+        for members in tok.values():
+            if len(members) < 2:
+                continue
+            es = [e for e, _ in members]
+            V = torch.stack([v for _, v in members])        # [k, D] raw outputs
+            if metric == "l2":
+                M = torch.cdist(V.unsqueeze(0), V.unsqueeze(0)).squeeze(0)  # [k,k]
+            else:
+                U = V / V.norm(dim=1, keepdim=True).clamp_min(1e-8)
+                M = U @ U.t()                               # [k,k] cosine
+            M = M.cpu()
+            idx = torch.tensor(es)
+            num_c[idx[:, None], idx[None, :]] += M
+            cnt_c[idx[:, None], idx[None, :]] += 1.0
+        self._maybe_dump_cycle_sim(layer_idx, num_c, cnt_c)
+        num = self.act_sim_num.get(layer_idx)
+        if num is None:
+            self.act_sim_num[layer_idx] = num_c
+            self.act_sim_cnt[layer_idx] = cnt_c
+        else:
+            num.add_(num_c)
+            self.act_sim_cnt[layer_idx].add_(cnt_c)
+
+    def _pair_sim_table(self, layer_idx):
+        """ctx.pair_sim for this layer from the running num/cnt. cosine →
+        mean cosine (unvisited sentinel -1, the cosine minimum). l2 → NEGATIVE
+        mean distance (unvisited sentinel -inf), so greedy's max = closest
+        outputs and unvisited pairs always rank last. None if no data."""
+        num = self.act_sim_num.get(layer_idx)
+        if num is None:
+            return None
+        cnt = self.act_sim_cnt[layer_idx]
+        nz = cnt > 0
+        if getattr(self.cluster_method, "metric", "cosine") == "l2":
+            sim = torch.full_like(num, float("-inf"))
+            sim[nz] = -(num[nz] / cnt[nz])     # negative mean L2 distance
+        else:
+            sim = torch.full_like(num, -1.0)
+            sim[nz] = num[nz] / cnt[nz]         # mean cosine
+        return sim
 
     def refresh(self, adapter, blocks, draft_cache):
         if not self.target_score:
@@ -342,8 +427,10 @@ class ScoreBasedAvgDraft(DraftStrategy):
         active = [i for i, w in enumerate(weights) if w > 0.0]
         ctx = ClusterContext(active=active, weights=weights,
                              layer_idx=layer_idx,
-                             cooccur=self.cooccur.get(layer_idx))
+                             cooccur=self.cooccur.get(layer_idx),
+                             pair_sim=self._pair_sim_table(layer_idx))
         groups = self.cluster_method.assign(ctx, self.K)
+        self._maybe_dump_pairs(layer_idx, active, groups)
 
         # Within-cluster weighting: "uniform" merges each cluster with EQUAL
         # weights (1/|group|) instead of frequency-proportional ones. The
@@ -387,6 +474,66 @@ class ScoreBasedAvgDraft(DraftStrategy):
         `adapter.build_weighted_avg`. Subclasses override to e.g. prune
         low-mass experts. Default = identity passthrough."""
         return weights
+
+    def _maybe_dump_cycle_sim(self, layer_idx: int, num_c, cnt_c) -> None:
+        """Diagnostic-only: when AUG_DUMP_CYCLE_SIM=<path> is set, append one
+        JSONL record per (layer, question, cycle) with THIS cycle's standalone
+        pairwise output-cosine (num_c/cnt_c over only this cycle's tokens, upper
+        triangle, visited pairs). Feeds the cross-cycle similarity-drift
+        analysis: does a pair's per-cycle similarity swing a lot between cycles?
+        No-op when unset."""
+        path = os.environ.get("AUG_DUMP_CYCLE_SIM")
+        if not path:
+            return
+        import json
+        counter = getattr(self, "_cyclesim_cycle", None)
+        if counter is None:
+            counter = self._cyclesim_cycle = {}
+        cyc = counter.get(layer_idx, -1) + 1
+        counter[layer_idx] = cyc
+        ii, jj = torch.triu_indices(cnt_c.shape[0], cnt_c.shape[1], offset=1)
+        c = cnt_c[ii, jj]
+        mask = c > 0
+        if not bool(mask.any()):
+            return
+        I = ii[mask].tolist()
+        J = jj[mask].tolist()
+        V = (num_c[ii, jj][mask] / c[mask]).tolist()
+        rec = {
+            "layer": int(layer_idx),
+            "qid": int(getattr(self, "_cyclesim_qid", 0)),
+            "cycle": int(cyc),
+            "sims": [[int(a), int(b), round(float(v), 5)]
+                     for a, b, v in zip(I, J, V)],
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def _maybe_dump_pairs(self, layer_idx: int, active: List[int],
+                          groups: List[List[int]]) -> None:
+        """Diagnostic-only: when AUG_DUMP_PAIRS=<path> is set, append one JSONL
+        record per (layer, question, cycle) with the active set M and the size-2
+        clusters (pairs) the clustering formed. Feeds the cache-reuse analysis:
+        does a pair {A,B} formed last cycle reappear (both members in M) this
+        cycle? No-op when unset."""
+        path = os.environ.get("AUG_DUMP_PAIRS")
+        if not path:
+            return
+        import json
+        counter = getattr(self, "_pairdump_cycle", None)
+        if counter is None:
+            counter = self._pairdump_cycle = {}
+        cyc = counter.get(layer_idx, -1) + 1
+        counter[layer_idx] = cyc
+        rec = {
+            "layer": int(layer_idx),
+            "qid": int(getattr(self, "_pairdump_qid", 0)),
+            "cycle": int(cyc),
+            "active": sorted(int(x) for x in active),
+            "pairs": [sorted(int(x) for x in g) for g in groups if len(g) == 2],
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
 
     def _maybe_dump_active_set(self, layer_idx: int, weights: List[float],
                                total: float) -> None:

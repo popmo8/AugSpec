@@ -44,7 +44,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import yaml
@@ -116,6 +116,8 @@ class RunConfig:
     cluster_name: str                    # ClusterMethod registry key
     cluster_within_weight: str           # "freq" | "uniform" (was
                                          # AUG_CLUSTER_UNIFORM)
+    cluster_args: Dict[str, Any]         # method-specific kwargs (e.g. metric,
+                                         # cache, seed) — forwarded to the method
 
     # run
     T: int
@@ -125,6 +127,7 @@ class RunConfig:
     warmup: bool
     emit_tokens_csv: bool
     spec_bench_cache: Optional[Path]
+    skip_categories: List[str]           # run.skip_categories (e.g. ["mt_bench"])
 
     # output
     output_dir: Path
@@ -204,6 +207,8 @@ class RunConfig:
             draft_args=dict(draft_cfg.get("args") or {}),
             cluster_name=str(cluster_cfg.get("name", "freq_slice")),
             cluster_within_weight=within_weight,
+            cluster_args={k: v for k, v in cluster_cfg.items()
+                          if k not in ("name", "within_weight")},
             T=int(run_cfg.get("T", 3)),
             questions_per_cat=int(run_cfg.get("questions_per_cat", 10)),
             max_new_tokens=int(run_cfg.get("max_new_tokens", 512)),
@@ -211,6 +216,7 @@ class RunConfig:
             warmup=bool(run_cfg.get("warmup", True)),
             emit_tokens_csv=bool(run_cfg.get("emit_tokens_csv", False)),
             spec_bench_cache=spec_cache_path,
+            skip_categories=[str(c) for c in (run_cfg.get("skip_categories") or [])],
             output_dir=output_dir,
             label=str(out_cfg.get("label", path.stem)),
         )
@@ -387,7 +393,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     # averaged-draft family; other drafts don't cluster. Set before
     # draft.prepare() so the cluster method's prepare hook runs.
     if isinstance(draft, ScoreBasedAvgDraft):
-        draft.cluster_method = get_cluster_method(cfg.cluster_name)
+        draft.cluster_method = get_cluster_method(cfg.cluster_name,
+                                                  **cfg.cluster_args)
         draft.within_weight = cfg.cluster_within_weight
     print(f"  Resolved   : draft={cfg.draft_name}{draft_args} "
           f"cluster={cfg.cluster_name} within_weight={cfg.cluster_within_weight}")
@@ -428,6 +435,7 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
                 warmup=cfg.warmup,
                 vram_limit_bytes=usable_vram_bytes,
                 vram_guard=cfg.vram_guard,
+                skip_categories=cfg.skip_categories,
                 **callbacks,
             )
     finally:

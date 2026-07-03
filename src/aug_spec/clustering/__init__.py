@@ -8,16 +8,20 @@ from __future__ import annotations
 
 from typing import Any, Dict, Type
 
+from .activation_sim import ActivationSimCluster
 from .base import ClusterContext, ClusterMethod
 from .cooccur import CooccurPairCluster
 from .freq_slice import FreqSliceCluster
 from .random import RandomCluster
+from .weight_sim import WeightSimCluster
 
 
 _REGISTRY: Dict[str, Type[ClusterMethod]] = {
     "freq_slice": FreqSliceCluster,
     "random": RandomCluster,
     "cooccur_pair": CooccurPairCluster,
+    "activation_similarity": ActivationSimCluster,
+    "weight_similarity": WeightSimCluster,
 }
 
 
@@ -35,5 +39,7 @@ __all__ = [
     "FreqSliceCluster",
     "RandomCluster",
     "CooccurPairCluster",
+    "ActivationSimCluster",
+    "WeightSimCluster",
     "get_cluster_method",
 ]
