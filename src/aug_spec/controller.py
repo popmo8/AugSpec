@@ -132,4 +132,6 @@ class Controller:
         self.draft.reset()
         self.draft_cache.clear()
         self.update_count = 0
+        if self.merge_engine is not None:
+            self.merge_engine.on_question_start()   # re-arm prefill capture
         self.draft.prepopulate(self.adapter, self.blocks, self.draft_cache)

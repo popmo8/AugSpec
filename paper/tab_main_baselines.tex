@@ -1,0 +1,165 @@
+% ==========================================================================
+% MAIN RESULTS TABLES — canonical record of the paper's official
+% performance numbers (PROJECT_GUIDE.md points here). When new official
+% numbers land, update the tables + provenance notes IN THIS FILE; do not
+% record paper numbers anywhere else.
+%   Table 1 (tab:main_baselines) — method axis: draft constructions.
+%   Table 2 (tab:throughput)     — system axis: offloading systems.
+% ==========================================================================
+%
+% Table 1: draft-construction baselines, {prune, merge} x {random,
+% static, dynamic}, on three MoE models. Acceptance rate per task + overall
+% TPS, all under the same 12.5% draft-side expert memory budget.
+%
+% Data provenance (do not edit numbers by hand):
+%   PREFILLED cells come from the AAAI27_MergeSpec draft (Tables 1-2):
+%     - Mixtral  : Random-prune = draft "Random"; Random-merge = draft
+%                  "Average" (for 8->1 the single group makes random
+%                  grouping + uniform weights coincide with plain average).
+%     - Qwen3    : SpecMoE / Ours rows (acc from draft Tab.1, TPS from Tab.2).
+%   They are placeholders until the final sweep replaces them.
+%   FINAL runs must use: full 80 q/subtask (fixes the mt_bench overweighting
+%   in `overall` when subsampling; see runtime/specbench.py sampling), T=5,
+%   max_new_tokens fixed across methods, offload backend + no_overload,
+%   vram budget identical for every row, no target-side expert cache.
+%   Coding = HumanEval (our extension beyond Spec-Bench's six subtasks).
+%   `Overall` = equal-weight mean over the seven tasks — recompute after
+%   Coding lands; the prefilled Overall values are six-task cycle-pooled
+%   numbers from the draft and WILL change.
+%   TODO(bold): after final numbers land, \textbf the per-column best within
+%   each model block (caption promises it).
+%   TODO(cite): this table carries NO citations by design. Baseline
+%   identities (DECIDED 2026-07-08): Static-prune = NAEE / Enumeration
+%   Pruning (Lu et al., ACL 2024, arXiv 2402.14800; greedy variant for
+%   128-expert models), Static-merge = HC-SMoE (Chen et al., ICML 2025,
+%   arXiv 2410.08589), Dynamic-prune = SpecMoE. Their cites MUST live in
+%   the Baselines paragraph of the experimental setup — cite Sub-MoE and
+%   Mosaic Pruning (both AAAI 2026) there as recent static refinements we
+%   deliberately do not instantiate. Swap the caption's "see Baselines in
+%   the experimental setup" for a concrete \ref{} once that section exists.
+%
+% Requires \usepackage{booktabs,multirow}.
+% ==========================================================================
+
+\begin{table*}[t]
+\centering
+\caption{Acceptance rate ($T{=}5$) across Spec-Bench subtasks and Coding
+(HumanEval), plus end-to-end throughput (tokens/sec), for six draft
+constructions spanning \{prune, merge\}\,$\times$\,\{random, static,
+dynamic\}. All rows share the same draft-side resident expert memory budget
+(12.5\% of total expert memory: $8{\to}1$ for Mixtral, $32{\to}4$ for
+GPT-OSS-20B, $128{\to}16$ for Qwen3), the same CPU-offloading backend with
+no target-side expert cache, and greedy target-exact verification; MT-Bench
+uses first turns only. Enumerate and HC-SMoE instantiate the static
+expert-pruning / expert-merging baselines, and SpecMoE the dynamic
+pruning policy; see Baselines in the experimental setup for details and
+citations. Higher is better. Best result per column within each model in
+\textbf{bold}.}
+\label{tab:main_baselines}
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.15}
+\footnotesize
+\begin{tabular}{l l l c c c c c c c c c}
+\toprule
+ & & & \multicolumn{8}{c}{\textbf{Acceptance Rate}} & \textbf{TPS} \\
+\cmidrule(lr){4-11}
+\textbf{Model} & \textbf{Draft} & \textbf{Policy}
+ & MT-Bench & Trans. & Summ. & QA & Math & RAG & Coding & Overall & Overall \\
+\midrule
+\multirow{6}{*}{\shortstack[l]{Mixtral-8x7B\\{\scriptsize (8E, top-2, $8{\to}1$)}}}
+ & \multirow{3}{*}{Prune}
+   & Random                    & 0.2066 & 0.3922 & 0.1417 & 0.3146 & 0.2594 & 0.2572 & -- & 0.2249 & -- \\
+ & & Enumerate                 & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & & SpecMoE                   & 0.6089 & 0.7680 & 0.8433 & 0.8240 & 0.8429 & 0.7235 & -- & 0.6719 & -- \\
+\cmidrule(lr){2-12}
+ & \multirow{3}{*}{Merge}
+   & Random                    & 0.1332 & 0.2553 & 0.1111 & 0.2344 & 0.2528 & 0.1481 & -- & 0.1532 & -- \\
+ & & HC-SMoE                   & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & & \textbf{Ours}             & 0.6120 & 0.8783 & 0.8203 & 0.6777 & 0.8697 & 0.7669 & -- & 0.6746 & -- \\
+\midrule
+\multirow{6}{*}{\shortstack[l]{GPT-OSS-20B\\{\scriptsize (32E, top-4, $32{\to}4$)}}}
+ & \multirow{3}{*}{Prune}
+   & Random                    & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & & Enumerate                 & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & & SpecMoE                   & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\cmidrule(lr){2-12}
+ & \multirow{3}{*}{Merge}
+   & Random                    & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & & HC-SMoE                   & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & & \textbf{Ours}             & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\midrule
+\multirow{6}{*}{\shortstack[l]{Qwen3-30B-A3B\\{\scriptsize (128E, top-8, $128{\to}16$)}}}
+ & \multirow{3}{*}{Prune}
+   & Random                    & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & & Enumerate                 & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & & SpecMoE                   & 0.2954 & 0.6995 & 0.4712 & 0.5641 & 0.3844 & 0.4558 & -- & 0.3801 & 3.4382 \\
+\cmidrule(lr){2-12}
+ & \multirow{3}{*}{Merge}
+   & Random                    & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & & HC-SMoE                   & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & & \textbf{Ours}             & 0.4711 & 0.8471 & 0.7734 & 0.8041 & 0.3815 & 0.7857 & -- & 0.5829 & 3.7172 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+% ==========================================================================
+% Table 2 (system axis): end-to-end throughput vs offloading systems.
+% Rows per model: MoE-Caching (non-speculative anchor) / SpecMoE / Ours.
+% Companion to tab:main_baselines (method axis); a batch-sweep figure
+% (fig:batch_sweep, batch 1-256) should accompany this table for the
+% scaling story — this table is the precise single-point read-out.
+%
+% Data provenance (do not edit numbers by hand):
+%   PREFILLED cells (Qwen3 SpecMoE/Ours) come from the AAAI27_MergeSpec
+%   draft Table 2 and are placeholders until the final sweep replaces them.
+%   *** WARNING: those draft numbers are in the 3-5 tokens/s range, which
+%   matches the q15 SINGLE-REQUEST runs (see tab_main_acc_tps.tex
+%   provenance: "single-request runs (batch size 1)"), NOT batch 64.
+%   The caption claims batch size 64 — either re-measure at batch 64 or
+%   change the caption. Do not ship the mismatch. ***
+%   FINAL runs must use: full 80 q/subtask, T=5, fixed max_new_tokens,
+%   offload backend + no_overload, identical total GPU memory budget for
+%   every row. MoE-Caching's cache policy + its VRAM cap must be defined
+%   in Baselines (e.g. hottest experts up to the same budget the
+%   speculative rows spend on draft experts).
+%   Coding = HumanEval (our extension beyond Spec-Bench's six subtasks).
+%   TODO(bold): draft bolds were dropped; after final numbers land,
+%   \textbf the per-column best within each model block.
+% ==========================================================================
+
+\begin{table*}[t]
+\centering
+\caption{End-to-end decoding throughput (tokens/sec) at batch size 64
+across Spec-Bench subtasks and Coding (HumanEval), on the same
+CPU-offloading backend and total GPU memory budget as
+Table~\ref{tab:main_baselines}. MoE-Caching spends the budget on a
+target-side expert cache; SpecMoE and Ours spend it on draft experts
+(12.5\% of expert memory) with greedy target-exact verification
+($T{=}5$). Higher is better. Best result per column within each model in
+\textbf{bold}.}
+\label{tab:throughput}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\small
+\begin{tabular}{l l c c c c c c c c}
+\toprule
+\textbf{Model} & \textbf{Method}
+ & MT-Bench & Trans. & Summ. & QA & Math & RAG & Coding & \textbf{Overall} \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{Mixtral-8x7B\\{\scriptsize (8E, top-2)}}}
+ & MoE-Caching   & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & SpecMoE       & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & \textbf{Ours} & -- & -- & -- & -- & -- & -- & -- & -- \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{GPT-OSS-20B\\{\scriptsize (32E, top-4)}}}
+ & MoE-Caching   & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & SpecMoE       & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & \textbf{Ours} & -- & -- & -- & -- & -- & -- & -- & -- \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{Qwen3-30B-A3B\\{\scriptsize (128E, top-8)}}}
+ & MoE-Caching   & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & SpecMoE       & 3.0173 & 4.9285 & 3.9962 & 4.3762 & 3.3378 & 3.9198 & -- & 3.4382 \\
+ & \textbf{Ours} & 3.3523 & 4.7977 & 4.7689 & 4.1619 & 2.9121 & 4.8652 & -- & 3.7172 \\
+\bottomrule
+\end{tabular}
+\end{table*}

@@ -252,8 +252,27 @@ merged. Ignored when `K=1` (single dense expert) or for non-averaged drafts.
 
 | key | type | default | notes |
 |---|---|---|---|
-| `name` | str | `freq_slice` | `ClusterMethod` registry key. Today only `freq_slice` (sort active experts by frequency, cut into `K` contiguous slices). |
+| `name` | str | `freq_slice` | `ClusterMethod` registry key: `freq_slice` (sort active experts by frequency, cut into `K` contiguous slices), `random`, `cooccur_pair`, `activation_similarity`, `weight_similarity`, `hybrid` (see below). |
 | `within_weight` | str | `freq` | Within-cluster merge weighting: `freq` (∝ activation count) or `uniform` (1/\|group\|). **A4** — was `AUG_CLUSTER_UNIFORM`. The partition and cross-cluster mass stay frequency-based either way; only the within-cluster combine changes. |
+
+Method-specific keys (everything except `name` / `within_weight` is forwarded
+to the method's constructor):
+
+| key | applies to | default | notes |
+|---|---|---|---|
+| `metric` | `activation_similarity`, `weight_similarity`, `hybrid` | `cosine` (`l2` for hybrid) | Pairwise similarity: output cosine, or negative L2 distance. |
+| `cache` | `weight_similarity` | (none) | Path to persist the static weight-sim tables. |
+| `seed` | `random` | `0` | Partition RNG seed. |
+| `alpha` | `hybrid` | `0.5` | Weight of the act-sim map: `R = alpha*N(actsim) + (1-alpha)*N(cooccur)`. `1.0` = prefill-only act-sim, `0.0` = pure co-occur. |
+| `norm` | `hybrid` | `rank` | Per-layer normalisation onto [0,1] before blending: `rank` (scale-free, robust to the act-sim L2 long tail) or `minmax` (ablation). Unobserved pairs → −1 (rank last). |
+| `cooccur_norm` | `hybrid` | `cosine` | `cosine` divides counts by the diagonal (removes hot-expert bias); `raw` keeps plain counts (`alpha: 0` + `raw` ≡ `cooccur_pair`). |
+| `cooccur_scope` | `hybrid` | `decode` | `decode` skips the prefill forward's contribution to the co-occur table; `all` accumulates prefill + decode. |
+
+`hybrid` collects act-sim **during prefill only** (the engine disarms the C++
+expert-output capture at the first draft start and re-arms it per question),
+so unlike `activation_similarity` the decode cycles pay no capture latency.
+Requires `merge_offload: true` + `merge_during_verify: true` (the capture is
+accumulated in the engine's `on_verify_layer` hook).
 
 ## `run`
 

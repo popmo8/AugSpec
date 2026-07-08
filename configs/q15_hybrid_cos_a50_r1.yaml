@@ -1,0 +1,25 @@
+# q15: skip mt_bench, qpc=15, UNIFORM merge. method=hybrid alpha=0.5, repeat r1.
+# hybrid = alpha*actsim(L2, prefill-only) + (1-alpha)*cooccur(cosine-normalized, decode-only).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+    no_overload: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+cluster:
+  name: hybrid
+  alpha: 0.5
+  metric: l2
+  norm: rank
+  cooccur_norm: cosine
+  cooccur_scope: decode
+  within_weight: uniform
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, skip_categories: [mt_bench]}
+output: {label: q15_hybrid_cos_a50_r1, dir: output/q15_hybrid_cos_a50_r1}

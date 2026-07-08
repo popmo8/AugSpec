@@ -37,6 +37,11 @@ class ClusterMethod:
     # needs_activation_sim -> ctx.pair_sim (the heavier expert-output capture).
     needs_cooccur: bool = False
     needs_activation_sim: bool = False
+    # act_sim_prefill_only: the offload-merge engine turns the C++ expert-output
+    # capture OFF at each question's first draft start (prefill→draft boundary)
+    # and back ON at question start — ctx.pair_sim freezes at the prefill state
+    # and decode cycles pay no capture latency (hybrid).
+    act_sim_prefill_only: bool = False
 
     def prepare(self, adapter, blocks) -> None:
         pass

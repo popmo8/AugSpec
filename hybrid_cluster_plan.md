@@ -147,11 +147,16 @@ self.merge_engine.on_question_start()`（2 行）。
 - 每組跑完用 `analyze_q15.py` 模式聚合 mean±std（非確定性 SD~0.018，單跑不下結論）。
 - 一組加 `AUG_PROFILE=1` 對照 q15_actsim_l2：確認 decode 期 capture 成本消失
   （profiling 表 capture/dispatch 相關 ms/cyc）。
-- **論文對應**：Expert Relation Map = α·(act-sim map) + (1−α)·(co-occur map)；
-  Table 3 加 hybrid 列；ablation 加 α sweep。
-  ⚠️ 草稿寫的是 "prefill-stage **attention** patterns"，實作是 prefill-stage
-  **activation**（expert output）similarity —— 論文措辭要改成 activation patterns
-  / expert output similarity，以免 reviewer 對不上。
+- **論文對應**：Expert Relation Map = λ·𝒩(act-sim map) + (1−λ)·𝒩(co-occur map)；
+  Table 3 加 hybrid 列；ablation 加 λ sweep。
+  **method 兩小節已寫好：`paper/method_relation_merge.tex`（2026-07-04，
+  "Expert Relation Map" + "Relation-Guided Cluster-and-Merge" + Algorithm 1；
+  第三小節 merge system optimization 留待下個 session）。**
+  ⚠️ 符號對應：**論文的混合係數是 λ，= code 的 `cluster.alpha`**（α 在論文
+  Eq. 5 已是 within-group merge weights，不可重用）。
+  ⚠️ 草稿 abstract/intro/related work 寫的是 "prefill-stage **attention**
+  patterns"，實作與新 method 節是 prefill-stage **activation**（expert output）
+  similarity —— 那三處措辭要改成 activation patterns，以免 reviewer 對不上。
 
 ## 5. 風險與備註
 
@@ -173,11 +178,33 @@ self.merge_engine.on_question_start()`（2 行）。
 
 | 項目 | 狀態 | 備註 |
 |---|---|---|
-| 3.1–3.3 hybrid method + registry | ⬜ | |
-| 3.8 unit tests | ⬜ | |
-| 3.4 decode-only cooccur | ⬜ | |
-| 3.5–3.6 prefill-only capture 接線 | ⬜ | |
-| 3.7 configs + 文件 | ⬜ | |
-| smoke 驗證（capture 相位正確） | ⬜ | |
-| q15 hybrid α sweep r1–r3 | ⬜ | |
-| 聚合 + 論文表更新 | ⬜ | |
+| 3.1–3.3 hybrid method + registry | ✅ 2026-07-04 | `clustering/hybrid.py`;**`norm` 預設改為 `rank`**（用戶決定,L2 長尾下比 minmax 穩） |
+| 3.8 unit tests | ✅ 2026-07-04 | `tests/unit/test_hybrid_cluster.py` 15 tests 全過（端點等價、α 翻轉單調、edge、norm01、registry） |
+| 3.4 decode-only cooccur | ✅ 2026-07-04 | `drafts/base.py` `_prefill_seen` 跳過每層 reset 後第一次 capture |
+| 3.5–3.6 prefill-only capture 接線 | ✅ 2026-07-04 | `offload_merge.py` `_set_capture`/`on_question_start`/`on_draft_start` disarm;`controller.reset()` 通知 engine |
+| 3.7 configs + 文件 | ✅ 2026-07-04 | `configs/q15_hybrid_a{00,25,50,75,100}_r{1,2,3}.yaml`(norm=rank);**每個 α 一支獨立 sbatch** `scripts/run_q15_hybrid_a*.sh`;configs/README + analyze_q15.py 已更新 |
+| smoke 驗證（capture 相位正確） | ⬜ | 首個 hybrid job 跑起來後看 AUG_PROFILE / log 確認 decode 期無 capture 開銷 |
+| q15 hybrid α sweep r1–r3 (raw) | ✅ 2026-07-04 完成 | jobs 252905–252909 全 COMPLETED,15 run 各 75 題。結果:見下「關鍵結論」;最佳 hybrid=a100(λ=1,prefill-only actsim)=0.6635,但輸給 freqslice/actsim_l2(~0.706) |
+| q15 hybrid α sweep r1–r3 (cosine) | 🔄 2026-07-04 已送出 | jobs a00=254157,a25=254158,a50=254159,a75=254160(cooccur_norm:cosine,只跑 a00–a75;a100 與 raw 相同故複用)。configs `q15_hybrid_cos_a*`,scripts `run_q15_hybrid_cos_a*.sh` |
+| 聚合 + 論文表更新 | 🔄 | `analyze_q15.py` 已含 raw+cosine hybrid 列;論文表待 cosine 跑完再定 |
+
+### 關鍵結論(cosine sweep,2026-07-06 完整 n=3;論文表 = `paper/tab_hybrid_ablation.tex`)
+- 最終數字(AccR mean±std / TPS):cos_a00 0.6603±.018/3.711、
+  **cos_a25 0.6724±.035/3.962**、cos_a50 0.6579±.018/3.798、
+  cos_a75 0.6528±.007/3.685;a100(=raw)0.6635±.035/3.935。
+- **cosine 正規化在低 λ 端有效**:vs raw,a00 +1.7pp、a25 +1.6pp、a50 +2.2pp、
+  a75 −0.8pp——提升集中在 co-occur 主導端,符合「去頻率偏差」的預測。
+- **出現贏過端點的 knee**:`hybrid_cos_a25` 在 **AccR 與 TPS 都是全 sweep 最佳**,
+  勝過兩端點(cos_a00 0.6603、a100 0.6635)——「co-occur 為主 + 少量 act-sim」
+  的混合優於任一純訊號。**cos_a25 是 hybrid 的指定操作點**,
+  也是 memory-hierarchy 實驗(memory_hierarchy_plan.md)的指定 λ。
+- 仍未勝 freqslice/actsim_l2(~0.706)——在無記憶體壓力的 benchmark 上 hybrid
+  的定位是「acceptance 可接受 + pair 重現率高」,系統收益見 hierarchy 計劃。
+
+### 關鍵結論(raw sweep,2026-07-04)
+- **核心主張成立**:所有方法(含最差 hybrid 0.636)遠勝 specmoe(0.477)。
+- **prefill-only actsim 掉 acceptance**:hybrid_a100(λ=1,凍在 prefill)=0.6635 vs actsim_l2(每 cycle 累積)=0.7066,**−4.3pp**;損失集中在長生成任務(qa/math/rag),短 prompt(translation)幾乎不掉 → 差距主因是 prefill 表較稀疏,非 drift。
+- **blending 沒出現贏過端點的 knee**:a25/a50/a75 都沒超過 a100;a50 甚至最差。temporal-locality(co-occur)在 raw 下沒補回 acceptance。
+- **latency 省下來了**:hybrid_a100 TPS 3.935 vs actsim_l2 3.623 = **+8.6%**(prefill-only capture 消掉 decode 期 capture 成本,如設計預期)。
+- **⚠️ freqslice Pareto 支配所有 hybrid**:freqslice(0.7064, TPS 4.114) 在 AccR 與 TPS 兩軸都優於最佳 hybrid_a100(0.6635, TPS 3.935)。零成本 baseline 在此 slice 難被打敗。
+- caveat:raw sweep 用 cooccur_norm=raw(未去熱門偏差);n=3 且 freqslice std 0.0515 偏高。cosine sweep(254157–60)測去偏差後低 λ 端能否幫上。

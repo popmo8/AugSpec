@@ -16,6 +16,9 @@ dependencies = [
     "numpy",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.scripts]
 aug_spec = "aug_spec.cli:main"
 

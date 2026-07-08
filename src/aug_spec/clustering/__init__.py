@@ -12,6 +12,7 @@ from .activation_sim import ActivationSimCluster
 from .base import ClusterContext, ClusterMethod
 from .cooccur import CooccurPairCluster
 from .freq_slice import FreqSliceCluster
+from .hybrid import HybridRelationCluster
 from .random import RandomCluster
 from .weight_sim import WeightSimCluster
 
@@ -22,6 +23,7 @@ _REGISTRY: Dict[str, Type[ClusterMethod]] = {
     "cooccur_pair": CooccurPairCluster,
     "activation_similarity": ActivationSimCluster,
     "weight_similarity": WeightSimCluster,
+    "hybrid": HybridRelationCluster,
 }
 
 
@@ -41,5 +43,6 @@ __all__ = [
     "CooccurPairCluster",
     "ActivationSimCluster",
     "WeightSimCluster",
+    "HybridRelationCluster",
     "get_cluster_method",
 ]

@@ -13,7 +13,13 @@ import os
 import statistics as s
 
 METHODS = ["freqslice", "random", "cooccur", "actsim_cos", "actsim_l2",
-           "weightsim_cos", "weightsim_l2", "specmoe"]
+           "weightsim_cos", "weightsim_l2", "specmoe",
+           "hybrid_a00", "hybrid_a25", "hybrid_a50", "hybrid_a75",
+           "hybrid_a100",
+           # cosine-normalized co-occur variant (a100 == raw a100: cooccur
+           # weight is 0 at lambda=1, so reuse the raw run rather than rerun).
+           "hybrid_cos_a00", "hybrid_cos_a25", "hybrid_cos_a50",
+           "hybrid_cos_a75"]
 SUBS = ["translation", "summarization", "qa", "math_reasoning", "rag", "overall"]
 
 

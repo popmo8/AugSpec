@@ -123,6 +123,10 @@ class ScoreBasedAvgDraft(DraftStrategy):
         # (cluster_method.needs_cooccur); otherwise stays empty (zero overhead).
         self.cooccur: Dict[int, torch.Tensor] = {}
         self._cooccur_scorer = None     # lazily built from count_top_k
+        # Layers whose prefill forward has been seen this question — used to
+        # skip the prefill contribution when the cluster method asks for
+        # decode-only co-occurrence (hybrid's cooccur_scope="decode").
+        self._prefill_seen: set = set()
 
         # activation_similarity (cluster.name=activation_similarity): running
         # sum of pairwise output-cosine (act_sim_num) and co-fire count
@@ -240,6 +244,7 @@ class ScoreBasedAvgDraft(DraftStrategy):
     def reset(self):
         self.target_score.clear()
         self.cooccur.clear()           # co-occurrence accumulates per-question
+        self._prefill_seen.clear()     # next capture per layer = new prefill
         self.act_sim_num.clear()       # activation-similarity accumulates per-question
         self.act_sim_cnt.clear()
         self._cycle_in_question = -1
@@ -274,7 +279,14 @@ class ScoreBasedAvgDraft(DraftStrategy):
         """Add this forward's [n, n] token-level co-occurrence into the running
         per-question table. `probs` is the router softmax [seq, n]. Fired on
         every target forward (prefill + verify) when the cluster method needs
-        co-occurrence; reset() clears the table between questions."""
+        co-occurrence; reset() clears the table between questions. Methods with
+        cooccur_scope="decode" (hybrid) skip each layer's FIRST post-reset
+        capture — exactly the prefill forward — so the table reflects only
+        decode-time temporal locality."""
+        if getattr(self.cluster_method, "cooccur_scope", "all") == "decode" \
+                and layer_idx not in self._prefill_seen:
+            self._prefill_seen.add(layer_idx)
+            return
         scorer = self._cooccur_scorer
         if scorer is None:
             top_k = getattr(self, "count_top_k", None)

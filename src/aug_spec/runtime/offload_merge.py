@@ -70,6 +70,11 @@ class OffloadMergeEngine:
         self.controller = None
         # layer_idx → blocks, filled by attach(); used by the lifecycle hooks.
         self.blocks: List[Tuple[int, nn.Module]] = []
+        # Whether the C++ per-expert output capture is currently ON. For
+        # act_sim_prefill_only methods (hybrid) it is armed per question
+        # (on_question_start) and disarmed at the first draft start — the
+        # prefill→draft boundary — so decode pays no capture cost.
+        self._capture_on = False
 
     # ── setup ───────────────────────────────────────────────────────────
     def attach(self, blocks: List[Tuple[int, nn.Module]]) -> None:
@@ -79,17 +84,32 @@ class OffloadMergeEngine:
         self.blocks = list(blocks)
         for _, block in self.blocks:
             block._merge_engine = self
-        # activation_similarity: turn on the C++ engine's per-expert output
-        # capture up front (must be on BEFORE any dispatch; on_verify_layer runs
-        # post-dispatch). The dispatcher is shared across blocks. Idempotent;
-        # no-op for other cluster methods.
+        # activation_similarity / hybrid: turn on the C++ engine's per-expert
+        # output capture up front (must be on BEFORE any dispatch;
+        # on_verify_layer runs post-dispatch). The dispatcher is shared across
+        # blocks. Idempotent; no-op for other cluster methods.
+        self._set_capture(True)
+
+    def _cluster_method(self):
+        """The draft's cluster method (or None) — the object whose class flags
+        (`needs_activation_sim`, `act_sim_prefill_only`) gate the capture."""
         draft = getattr(self.controller, "draft", None)
-        if draft is not None and getattr(
-                getattr(draft, "cluster_method", None),
-                "needs_activation_sim", False):
-            disp = self._dispatcher()
-            if disp is not None and hasattr(disp, "set_capture_expert_out"):
-                disp.set_capture_expert_out(True)
+        return getattr(draft, "cluster_method", None)
+
+    def _set_capture(self, on: bool) -> None:
+        """Toggle the C++ per-expert output capture (no-op unless the cluster
+        method needs it / the dispatcher supports it). Turning OFF also drains
+        the capture buffer so stale prefill outputs never leak into later
+        accumulation."""
+        if not getattr(self._cluster_method(), "needs_activation_sim", False):
+            return
+        disp = self._dispatcher()
+        if disp is None or not hasattr(disp, "set_capture_expert_out"):
+            return
+        disp.set_capture_expert_out(on)
+        if not on and hasattr(disp, "get_captured_expert_outputs"):
+            disp.get_captured_expert_outputs()      # swap-clears the buffer
+        self._capture_on = on
 
     # ── merge execution ─────────────────────────────────────────────────
     def build(self, block: nn.Module, weights: List[float]) -> Dict[str, Any]:
@@ -188,13 +208,30 @@ class OffloadMergeEngine:
                 disp.evict_layer(self._pending[0], 0)
             self._pending = None
 
+    def on_question_start(self) -> None:
+        """Called from Controller.reset() at each question start. Re-arms the
+        expert-output capture for act_sim_prefill_only methods (hybrid), so the
+        upcoming prefill forward is captured again after the previous question
+        disarmed it. No-op for always-on methods (already capturing) and for
+        methods without activation-sim."""
+        if getattr(self._cluster_method(), "act_sim_prefill_only", False) \
+                and not self._capture_on:
+            self._set_capture(True)
+
     def on_draft_start(self) -> None:
         """Called at the verify→draft transition (in_draft_phase set True).
-        P4: drain the deferred merge/evict + sync the merge stream (so the draft
-        reads valid merged). P1: flush the archer expert cache — the merged-dense
-        draft never dispatches, so the cache is idle here; freeing it (host
-        copies remain — just drops GPU mirrors) makes that budget available to
-        the merged, phase-exclusive (§1.4). flush no-op unless `flush`."""
+        Prefill-only act-sim (hybrid): the FIRST draft start of a question is
+        the prefill→draft boundary — disarm the expert-output capture here so
+        every decode cycle runs capture-free (the latency point of hybrid);
+        on_question_start re-arms it. P4: drain the deferred merge/evict + sync
+        the merge stream (so the draft reads valid merged). P1: flush the archer
+        expert cache — the merged-dense draft never dispatches, so the cache is
+        idle here; freeing it (host copies remain — just drops GPU mirrors)
+        makes that budget available to the merged, phase-exclusive (§1.4).
+        flush no-op unless `flush`."""
+        if self._capture_on and getattr(
+                self._cluster_method(), "act_sim_prefill_only", False):
+            self._set_capture(False)
         self._drain_pending()
         if not self.flush:
             return
