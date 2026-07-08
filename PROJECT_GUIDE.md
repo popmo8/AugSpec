@@ -30,8 +30,8 @@
 - sbatch header 慣例:`--partition=normal2 --account=MST114471 --gpus-per-node=1 --cpus-per-task=8`;log → `/work/morrisliu07/job_log/<name>_%j.log`,err → `/work/morrisliu07/job_err/`。
 - module:`ml load cuda/12.6 miniconda3/24.11.1 gcc/11.5.0`;env:`HF_HOME=/work/morrisliu07/.cache/huggingface`、`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
 - 一個實驗 = 一個 YAML:`configs/*.yaml`。跑法:`<venv> -m aug_spec.cli run --config configs/X.yaml`。
-- offload config 關鍵欄位:`model.backend: offload`、`offload.path: .../moe_infinity/offload_output/Qwen3-30B-A3B-Base`、`offload.vram_budget_ratio: 0.2`(論文預算)、`merge_offload: true`、`merge_during_verify: true`、**`offload.no_overload: true`(A4 起在 YAML,取代 `AUG_NO_OVERLOAD=1`)**;draft 用 `topm_count` args `{M:32, K:16, draft_top_k:8}`;**`cluster: {name: freq_slice, within_weight: freq}`(A4 新區塊)**。`configs/q5_512_tm_on.yaml` 是自包含的參考範例;欄位全表見 `configs/README.md`。
-- 既有 script 範例可參考:`scripts/run_q5_512_*.sh`(qpc=5、mnt=512),尾段會跑完印 compare 表。**注意:多數舊 script 仍 `export AUG_NO_OVERLOAD=1`(冗餘但無害);新 config 已把它放進 YAML。**
+- offload config 關鍵欄位:`model.backend: offload`、`offload.path: .../moe_infinity/offload_output/Qwen3-30B-A3B-Base`、`offload.vram_budget_ratio: 0.2`(論文預算)、`merge_offload: true`、`merge_during_verify: true`;draft 用 `topm_count` args `{M:32, K:16, draft_top_k:8}`;**`cluster: {name: freq_slice, within_weight: freq}`(A4 新區塊)**。`configs/q5_512_tm_on.yaml` 是自包含的參考範例;欄位全表見 `configs/README.md`。
+- 既有 script 範例可參考:`scripts/run_q5_512_*.sh`(qpc=5、mnt=512),尾段會跑完印 compare 表。**注意:舊 script 的 `export AUG_NO_OVERLOAD=1` 與舊 YAML 的 `offload.no_overload` 都已 inert(2026-07-08 起 overload 路徑整個刪除、該行為變成唯一預設;YAML 出現該欄位只印 deprecation 提示,見 `remove_overload_plan.md`)。**
 
 ## 讀結果
 - 輸出在 `aug_spec/output/<dir>/`:`per_question_summary.csv`、`overall_summary.csv`、`summary.json`。
@@ -39,13 +39,13 @@
 - **mnt(max_new_tokens)會影響 MAT/TPS**:acceptance 隨生成長度上升,所以跨 run 比較要固定 mnt(128 與 512 不可橫比)。
 
 ## Profiling(找瓶頸用)
-- 設 `AUG_PROFILE=1`,結尾會印 per-cycle breakdown:`verify_fetch / draft_fetch / overload_wait / expert_forward / draft_dispatch(bmm) / merge(P3) / evict`。
+- 設 `AUG_PROFILE=1`,結尾會印 per-cycle breakdown:`verify_fetch / draft_fetch / expert_forward / draft_dispatch(bmm) / merge(P3) / evict`(`overload_wait` row 已隨 overload 路徑刪除,2026-07-08)。
 - ⚠️ 解析 profiling 文字表時:row label 是 `draft_dispatch` 不是 `dispatch`,用「整行第一個 token 完全相等」比對,別用 `\s+dispatch\b`(會配不到 → 誤報 0,踩過)。
 - 這些 ms/cyc 是重疊的非加總值(fetch 在獨立 thread 跟 compute overlap),**不能當成相加 = cycle 時間**。
 
 ## 旋鈕:YAML 為主,env 為 override(A4 已收編,2026-06-29)
-這四個原本是 import/runtime 期讀的 env,A4 後都有 YAML 欄位;**env 仍可 override(env 設了就贏 YAML)**。全表見 `configs/README.md`。
-- `offload.no_overload`(env `AUG_NO_OVERLOAD`)— **重要,topm/specmoe 都應該開**。關掉 moe_infinity「cache 滿時帳外偷塞一個 slot、用完即丟、無視 pin、且驅逐有 race」的 overload 路徑,改走正規 FindExpertEvict。實測:消除 overload_wait、讓 pin 生效(specmoe bmm 才會 engage)、且修掉一個會壓低 MAT 的 verify race。topm +24% TPS、specmoe +33% TPS。
+這些原本是 import/runtime 期讀的 env,A4 後都有 YAML 欄位;**env 仍可 override(env 設了就贏 YAML)**。全表見 `configs/README.md`。
+- ~~`offload.no_overload`(env `AUG_NO_OVERLOAD`)~~ — **已刪除旋鈕、行為內建(2026-07-08,`remove_overload_plan.md`)**:moe_infinity「cache 滿時帳外偷塞一個 slot、用完即丟、無視 pin、且驅逐有 race」的 overload 路徑整段移除,pin-aware 的 FindExpertEvict(滿了必 evict、pinned 不可侵犯)成為唯一路徑。歷史實測(當年開 no_overload 的效果):消除 overload_wait、讓 pin 生效(specmoe bmm 才會 engage)、修掉壓低 MAT 的 verify race,topm +24% TPS、specmoe +33% TPS。舊 YAML 的該欄位與 env 均 inert(只印 deprecation 提示)。另有 pinned-starvation guard(2026-07-09):cache 全 pinned 時 fetch 立即 WARN;全 pinned + exec pipeline 排空持續 10s 判定為死結 → FATAL abort(細節見 remove_overload_plan.md §5)。
 - `offload.merged_backend`(env `AUG_MERGED_BACKEND`)— `engine_bmm`(預設,C++ DispatchBmm)/ `dispatch` / `bmm`。
 - `draft.early_pin`(env `AUG_EARLY_PIN`)— specmoe 用:0/1/2,verify 時提早 pin 下個 draft 的 kept-N。**實測(2026-07-08 §6-0 probe)**:ep1/2 把 draft_fetch 4.5TB→~0.95TB、kept 駐留 75%→99%(bmm 全程 engage)、TPS +22~26%,AccR 不受影響;**specmoe 對照一律開(建議 `early_pin: 2`)**。
 - `cluster.within_weight: freq|uniform`(env `AUG_CLUSTER_UNIFORM`)— K-cluster 的群內合併權重;`uniform` = `1/|group|`,slicing 與 cross-cluster mass 仍 frequency。
@@ -53,7 +53,7 @@
 - **已移除**:`AUG_CLUSTER_LABELS`(A3 拿掉的一次性 partition A/B harness)。
 
 ## 已知關鍵結論(別重新踩)
-- 公平對比要兩邊同 engine、同 mnt、同 vram budget、都開 no_overload。
+- 公平對比要兩邊同 engine、同 mnt、同 vram budget(no_overload 行為 2026-07-08 起已內建,不再是需要開的條件)。
 - topm 的 draft 幾乎全程走 bmm(每題第一個 cycle 因 merged 尚未建會 fallback);specmoe 要 kept-N 全 resident(配 no_overload + pin)bmm 才 engage。
 - SVD merge 已整包刪除(2026-06-28);**未來 merge 一律線性、只是權重不同,不做 configurable merge strategy**。
 - verify-time merge 的 P1–P3 已實作(`merge_during_verify`),P4(overlap)尚未做。
@@ -61,4 +61,4 @@
 - **群內 uniform 加權會傷 acceptance(2026-06-29)**:`cluster.within_weight: uniform` vs `freq`,q5 上 acceptance −6.6pp(−11.3%)、cycle +18.7%、TPS −13%。→ **群內預設一律 freq;uniform 只做消融。**
 - **co-occurrence 當「併在一起」(must-link)分群是錯方向(2026-06-29)**:partition A/B(只換分群、群內 freq),random −8.6pp、static-freq −17pp、cooccur(平衡)−22pp、cooccur(凝聚)−39pp,**兩個共現變體都輸給隨機**。→ 若要做共現分群,方向是 **cannot-link / 圖切割(把高共現切開)**,且相似度用 cosine 非 lift。這是 B2 的前置結論。
 - **重構 A1–A5 全部完成(2026-06-29)**,皆驗證為行為等價(結構等價 + import smoke;bit-exact 因上述非確定性不可用)。Mixtral / GPT-OSS / smoke configs 已退役,專案以 Qwen3 為主。
-- **SpecMoE 最優跑法 = pin + no_overload + early_pin(2026-07-08,§6-0 ep probe job 254248,詳見 memory_hierarchy_plan.md §5 末)**:ep0 下 kept 駐留只有 75%、draft_fetch 4.5TB/run,TPS 被低估;ep1/ep2 駐留 99%、draft_fetch ~0.95TB,q15 TPS 3.26→3.97/4.11。AccR 不受 ep 影響(ep 只改 residency/時序,substitute table 相同)。ep1 vs ep2 差距在 noise 內,單跑不可分;對照一律用 `early_pin: 2`。**注意:`q15_specmoe_r1–r3` 三重複是 ep0 跑的 → AccR 可沿用、TPS 低估;主表 Table 2 的 specmoe TPS(3.4382,`q5_512_sm_on`)是 ep1(script 用 env 開的,YAML 本身沒寫)。**
+- **SpecMoE 最優跑法 = pin + no_overload + early_pin(2026-07-08,§6-0 ep probe job 254248,詳見 memory_hierarchy_plan.md §5 末;no_overload 現已內建)**:ep0 下 kept 駐留只有 75%、draft_fetch 4.5TB/run,TPS 被低估;ep1/ep2 駐留 99%、draft_fetch ~0.95TB,q15 TPS 3.26→3.97/4.11。AccR 不受 ep 影響(ep 只改 residency/時序,substitute table 相同)。ep1 vs ep2 差距在 noise 內,單跑不可分;對照一律用 `early_pin: 2`。**注意:`q15_specmoe_r1–r3` 三重複是 ep0 跑的 → AccR 可沿用、TPS 低估;主表 Table 2 的 specmoe TPS(3.4382,`q5_512_sm_on`)是 ep1(script 用 env 開的,YAML 本身沒寫)。**

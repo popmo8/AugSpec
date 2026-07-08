@@ -101,8 +101,6 @@ class RunConfig:
                                          # (archer@draft-start, merged@draft-end, P1)
     merge_overlap: bool                  # offload-merge: merge on side stream,
                                          # overlap with next-layer fetch (P4)
-    no_overload: bool                    # offload: C++ no-overload dispatch
-                                         # (was AUG_NO_OVERLOAD; A4)
     merged_backend: Optional[str]        # offload: merged-expert draft kernel
                                          # (was AUG_MERGED_BACKEND; None=default)
     early_pin: Optional[int]             # SpecMoE early-pin stage (was
@@ -171,6 +169,13 @@ class RunConfig:
         spec_cache = run_cfg.get("spec_bench_cache")
         spec_cache_path = Path(spec_cache) if spec_cache else None
 
+        # remove_overload_plan.md (2026-07): the C++ overload path was deleted,
+        # so pin-aware evict-on-full is now the only behaviour. The old knob is
+        # accepted-but-ignored so pre-existing YAMLs keep loading.
+        if "no_overload" in offload_cfg:
+            print("[aug_spec] offload.no_overload is deprecated and ignored: "
+                  "the overload path was removed; evict-on-full is always on.")
+
         return cls(
             raw=raw,
             config_path=path.resolve(),
@@ -198,7 +203,6 @@ class RunConfig:
                 offload_cfg.get("flush_on_draft_end", False)),
             merge_overlap=bool(
                 offload_cfg.get("merge_overlap", False)),
-            no_overload=bool(offload_cfg.get("no_overload", False)),
             merged_backend=(str(offload_cfg["merged_backend"]).lower()
                             if offload_cfg.get("merged_backend") else None),
             early_pin=(int(draft_cfg["early_pin"])
@@ -229,8 +233,8 @@ class RunConfig:
 def _dump_profile(controller) -> None:
     """Print the engine's per-cycle time breakdown (AUG_PROFILE=1 only). Times
     are µs; normalised by refresh cycles so topm/specmoe rows are comparable.
-    Answers: where each cycle spends time, what serialises (overload_wait) vs
-    overlaps, and SpecMoE's avoidable draft re-fetches (draft_fetch)."""
+    Answers: where each cycle spends time, what overlaps, and SpecMoE's
+    avoidable draft re-fetches (draft_fetch)."""
     if os.environ.get("AUG_PROFILE") is None:
         return
     disp = None
@@ -255,7 +259,6 @@ def _dump_profile(controller) -> None:
     row("draft_fetch", "draft_fetch_n", "draft_fetch_us")   # SpecMoE re-fetch
     row("evict", "evict_n", "evict_us")
     row("evict_layer", "evict_layer_n", "evict_layer_us")
-    row("overload_wait", "overload_wait_n", "overload_wait_us")  # H1 serialise
     row("enqueue_wait", "enqueue_wait_n", "enqueue_wait_us")     # race-fix hits
     row("expert_forward", "forward_n", "forward_us")
     row("merge(P3)", "merge_n", "merge_us")
@@ -358,7 +361,6 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
             device_memory_ratio=device_memory_ratio,
             dtype=cfg.dtype, trust_remote_code=cfg.trust_remote_code,
             load_cpu_source=True,
-            no_overload=cfg.no_overload,
         )
     else:
         print(f"\nLoading {cfg.model_id} (single copy; target == draft) ...")

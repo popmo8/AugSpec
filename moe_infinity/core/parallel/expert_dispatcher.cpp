@@ -44,20 +44,15 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
       cache_mutex_(kNumDevices()),
       cache_cv_(kNumDevices()),
       input_queue_(kNumDevices()),
-      gpu_overload_(kNumDevices(), false),
       exec_queue_(kNumDevices()),
       cached_experts_(kNumDevices()),
       pinned_(kNumDevices()),
+      exec_active_(kNumDevices()),
       modules_(kNumDevices(), nullptr) {
   main_thread_stop_flag_.store(false);
   profile_enabled_ = (std::getenv("AUG_PROFILE") != nullptr);
-  no_overload_ = (std::getenv("AUG_NO_OVERLOAD") != nullptr);
 
   // module_ = new MoEMLP(dtype, expert_type);
-
-  // Futex<bool> initial_value(false);
-  // gpu_overload_ = std::move(std::vector<Futex<bool>>(kNumDevices(),
-  // initial_value));
 
   for (int i = 0; i < kNumDevices(); ++i) {
     auto thread_func = std::bind(&ExpertDispatcher::GPUFetchFunc, this, i);
@@ -71,7 +66,6 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
     cache_sizes_.push_back(cache_limit);
 
     modules_[i] = new MoEMLP(dtype, expert_type);
-    // gpu_overload_.emplace_back(false);
   }
 
   for (int i = 0; i < kNumDevices() * num_threads; ++i) {
@@ -182,7 +176,6 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
     expert_node->SetTensorsFromBlob(expert_node->node->device);
     exec_args.out_gpu_id = original_device.index();
     exec_args.out_dtype = c10::typeMetaToScalarType(hidden_states_.dtype());
-    exec_args.evict = false;
     exec_args.hit = true;
 
     // module_->SetTensorsFromIds(expert_node->node->tensor_ids);
@@ -449,7 +442,6 @@ void ExpertDispatcher::ResetProfile() {
   prof_.verify_fetch_n = 0; prof_.verify_fetch_us = 0; prof_.verify_fetch_bytes = 0;
   prof_.draft_fetch_n = 0; prof_.draft_fetch_us = 0; prof_.draft_fetch_bytes = 0;
   prof_.evict_n = 0; prof_.evict_us = 0;
-  prof_.overload_wait_n = 0; prof_.overload_wait_us = 0;
   prof_.enqueue_wait_n = 0; prof_.enqueue_wait_us = 0;
   prof_.forward_n = 0; prof_.forward_us = 0;
   prof_.merge_n = 0; prof_.merge_us = 0;
@@ -467,8 +459,6 @@ std::map<std::string, int64_t> ExpertDispatcher::DumpProfile() {
       {"draft_fetch_bytes", prof_.draft_fetch_bytes.load()},
       {"evict_n", prof_.evict_n.load()},
       {"evict_us", prof_.evict_us.load()},
-      {"overload_wait_n", prof_.overload_wait_n.load()},
-      {"overload_wait_us", prof_.overload_wait_us.load()},
       {"enqueue_wait_n", prof_.enqueue_wait_n.load()},
       {"enqueue_wait_us", prof_.enqueue_wait_us.load()},
       {"forward_n", prof_.forward_n.load()},
@@ -529,16 +519,19 @@ void ExpertDispatcher::ClearExpertCacheCounts() {
 //   }
 // }
 
-ExpertNodePtr ExpertDispatcher::FindExpertEvict(int gpu_id) {
+ExpertNodePtr ExpertDispatcher::FindExpertEvict(int gpu_id, bool* all_pinned) {
   uint64_t min_visit_count = INT_MAX;
   ExpertNodePtr evict_expert_node = nullptr;
+  size_t n_unpinned = 0;   // cached keys a pin does NOT protect
 
   for (auto& key : cached_experts_[gpu_id]) {
     // aug_spec / specmoe_pin_plan.md: never evict a pinned expert (the SpecMoE
-    // kept-N draft set). FindExpertEvict is the batch_size==1 (draft-step)
-    // eviction path, so skipping pinned here keeps the kept-N resident across
-    // draft steps → the draft reads them at 0 PCIe.
+    // kept-N draft set / topm merged slots). Since the overload-path removal
+    // this is the ONLY eviction path, so the pin set alone decides
+    // evictability; pinned experts stay resident → the draft reads them at
+    // 0 PCIe.
     if (pinned_[gpu_id].count(key) > 0) continue;
+    ++n_unpinned;
     auto layer_idx = key >> 32;
     auto expert_idx = key & 0xFFFFFFFF;
     auto node = experts_[expert_idx][layer_idx]->node;
@@ -555,6 +548,13 @@ ExpertNodePtr ExpertDispatcher::FindExpertEvict(int gpu_id) {
       min_visit_count = node->incache_visit_count;
     }
   }
+  // Starvation telemetry (remove_overload_plan.md §5): a nullptr because every
+  // unpinned candidate is transiently locked resolves itself once an exec
+  // finishes; a nullptr with ZERO unpinned candidates cannot — only a
+  // Python-side set_pinned can free a slot. The caller escalates warn → fatal
+  // on the latter.
+  if (all_pinned != nullptr)
+    *all_pinned = (!cached_experts_[gpu_id].empty() && n_unpinned == 0);
   return evict_expert_node;   // returned LOCKED (caller must unlock after evict)
 }
 
@@ -592,7 +592,6 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
     auto original_device = (args.remote) ? CPU_DEVICE : hidden_states_.device();
     int64_t layer_idx = args.layer_idx;
     int64_t expert_idx = args.expert_idx;
-    int64_t batch_size = hidden_states_.size(0);
 
     auto expert_node = experts_[expert_idx][layer_idx];
     bool cache_hit = expert_node->node->device.is_cuda();
@@ -606,121 +605,126 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
                "cache_size ", cache_sizes_[gpu_id], " incache count ",
                cached_experts_[gpu_id].size());
 
+    // Cache full -> must evict before fetching. This is the ONLY path for a
+    // cache-full fetch (batch 1 draft steps AND batch>1 prefill/verify): the
+    // old "overload" borrow (off-books slot, use-once-discard, single-slot
+    // serialised, pin-blind) was removed 2026-07 — see remove_overload_plan.md.
     if (!cache_hit && cache_sizes_[gpu_id] < expert_node->node->byte_size) {
-      if (batch_size > 1 && !no_overload_) {
-        // force fetch to GPU regardless of cache size, only for prefill
-        // only one extra cache slot for prefill
-        DLOG_DEBUG("overloading expert cache: gpu_id ", gpu_id, " cache size ",
-                   cache_sizes_[gpu_id], " incache count ",
-                   cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
-                   " expert_idx ", expert_idx);
-        // gpu_overload_[gpu_id].wait_and_set(false, true);
-        // busy wait for cache to be available
-        int64_t _ow_t0 = profile_enabled_ ? _prof_now_us() : 0;
-        while (gpu_overload_[gpu_id]) {
-          std::this_thread::sleep_for(std::chrono::microseconds(1));
-        }
-        if (profile_enabled_) {
-          prof_.overload_wait_us += _prof_now_us() - _ow_t0;
-          prof_.overload_wait_n += 1;
-        }
-        gpu_overload_[gpu_id] = true;
-      } else {
-        // find the expert in gpu and min incache_visit_count
-        ExpertNodePtr evict_expert_node = FindExpertEvict(gpu_id);
-        if (evict_expert_node == nullptr) {
-          // wait for notification that cache is available
-          DLOG_WARN(
-              "All cached expert locked, waiting for cache to be available. "
-              "gpu_id ",
-              gpu_id, " cache size ", cache_sizes_[gpu_id], " incache count ",
-              cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
-              " expert_idx ", expert_idx);
-        }
-        // aug_spec deadlock fix: FindExpertEvict above is lock-free, so a
-        // GPUExecFunc->OutputFunc notify_all (which frees an expert) can fire
-        // between the null-check and a plain cache_cv_.wait(lock) -> lost
-        // wakeup -> the fetch thread blocks forever (observed: SpecMoE offload
-        // hangs mid-run under heavy draft-dispatch cache churn). Use a *timed*
-        // wait in a retry loop instead: every 2 ms we re-poll FindExpertEvict,
-        // so even a missed notify cannot hang -- an expert becomes evictable as
-        // soon as any in-flight exec finishes and unlocks its node->mutex. The
-        // loop also replaces the old single-retry that could fall through with
-        // a null node into the DLOG_FATAL below.
-        while (evict_expert_node == nullptr) {
-          {
-            std::unique_lock<std::mutex> lock(cache_mutex_[gpu_id]);
-            cache_cv_[gpu_id].wait_for(lock, std::chrono::milliseconds(2));
-          }
-          evict_expert_node = FindExpertEvict(gpu_id);
-        }
-        // auto num_layers = experts_[0].size();
-        // auto num_experts = experts_.size();
-
-        // for (size_t i = 0; i < num_experts; ++i) {
-        //   for (size_t j = 0; j < num_layers; ++j) {
-        // auto node = experts_[i][j]->node;
-        // if (node == nullptr) {
-        //   // std::cerr << "ExpertDispatcher::GPUFetchFunc: node is nullptr"
-        //   //           << " layer_idx " << j << " expert_idx " << i <<
-        //   //           std::endl;
-        //   continue;
-        // }
-        // if (node->device.is_cuda() &&
-        //     node->incache_visit_count < min_visit_count &&
-        //     node->mutex.try_lock()) {
-        //   evict_node = node;
-        //   min_visit_count = node->incache_visit_count;
-        //   node->mutex.unlock();
-        //   // std::cerr << "ExpertDispatcher::GPUFetchFunc: evict node "
-        //   //           << evict_node->device.str() << " incache_visit_count "
-        //   //           << min_visit_count << std::endl;
-        // }
-        //   }
-        // }
-        DLOG_FATAL_IF(
-            evict_expert_node == nullptr,
-            "ExpertDispatcher::GPUFetchFunc: evict_node is nullptr, gpu_id",
-            gpu_id, "cache size", cache_sizes_[gpu_id], "in cache count",
-            cached_experts_[gpu_id].size());
-
-        DLOG_DEBUG("evicting expert: gpu_id ", gpu_id, " cache size ",
-                   cache_sizes_[gpu_id], " incache count ",
-                   cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
-                   " expert_idx ", expert_idx);
-
-        auto evict_node = evict_expert_node->node;
-        int64_t _ev_t0 = profile_enabled_ ? _prof_now_us() : 0;
-        evict_node->SetDevice(evict_node->default_host);
-        if (profile_enabled_) {
-          prof_.evict_us += _prof_now_us() - _ev_t0;
-          prof_.evict_n += 1;
-        }
-        cache_sizes_[gpu_id] += evict_node->byte_size;
-        int64_t evict_layer_idx = evict_expert_node->layer_idx;
-        int64_t evict_expert_idx = evict_expert_node->expert_idx;
-
-        // std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
-        uint64_t evict_key = (evict_layer_idx << 32) + evict_expert_idx;
-        auto it = cached_experts_[gpu_id].find(evict_key);
-        if (it != cached_experts_[gpu_id].end()) {
-          cached_experts_[gpu_id].erase(it);
-        } else {
-          DLOG_FATAL(
-              "ExpertDispatcher::GPUFetchFunc: evict_key not found. layer_idx ",
-              evict_layer_idx, " expert_idx ", evict_expert_idx);
-        }
-        // Eviction done — release the victim lock FindExpertEvict held (now on
-        // host, so a waiting Enqueue re-routes it to a re-fetch).
-        evict_node->mutex.unlock();
+      // find the expert in gpu and min incache_visit_count
+      bool all_pinned = false;
+      ExpertNodePtr evict_expert_node = FindExpertEvict(gpu_id, &all_pinned);
+      if (evict_expert_node == nullptr) {
+        // wait for notification that cache is available
+        DLOG_WARN(
+            "All cached expert locked, waiting for cache to be available. "
+            "gpu_id ",
+            gpu_id, " cache size ", cache_sizes_[gpu_id], " incache count ",
+            cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
+            " expert_idx ", expert_idx);
       }
+      // Pinned-starvation guard (remove_overload_plan.md §5): with EVERY
+      // cached expert pinned, no exec completion can ever free a slot — only
+      // a Python-side set_pinned can shrink the pin set. Warn the moment a
+      // fetch hits this state. If it then persists while the exec pipeline is
+      // fully drained (exec queue empty, nothing in flight), the Python
+      // thread is necessarily blocked in Wait() on this very fetch, no unpin
+      // can ever arrive, and waiting forever would hang the run silently —
+      // abort instead (DLOG_FATAL aborts via the Logger destructor).
+      if (all_pinned) {
+        DLOG_WARN("cache fully pinned on fetch: gpu_id ", gpu_id,
+                  " layer_idx ", layer_idx, " expert_idx ", expert_idx,
+                  " cached ", cached_experts_[gpu_id].size(), " pinned ",
+                  pinned_[gpu_id].size());
+      }
+      // aug_spec deadlock fix: FindExpertEvict above is lock-free, so a
+      // GPUExecFunc->OutputFunc notify_all (which frees an expert) can fire
+      // between the null-check and a plain cache_cv_.wait(lock) -> lost
+      // wakeup -> the fetch thread blocks forever (observed: SpecMoE offload
+      // hangs mid-run under heavy draft-dispatch cache churn). Use a *timed*
+      // wait in a retry loop instead: every 2 ms we re-poll FindExpertEvict,
+      // so even a missed notify cannot hang -- an expert becomes evictable as
+      // soon as any in-flight exec finishes and unlocks its node->mutex. The
+      // loop also replaces the old single-retry that could fall through with
+      // a null node into the DLOG_FATAL below.
+      constexpr int64_t kStarvationFatalUs = 10 * 1000 * 1000;   // 10 s
+      int64_t starved_since_us = -1;   // first us of CONTINUOUS pinned+drained
+      int64_t last_warn_us = 0;
+      while (evict_expert_node == nullptr) {
+        {
+          std::unique_lock<std::mutex> lock(cache_mutex_[gpu_id]);
+          cache_cv_[gpu_id].wait_for(lock, std::chrono::milliseconds(2));
+        }
+        evict_expert_node = FindExpertEvict(gpu_id, &all_pinned);
+        if (evict_expert_node != nullptr) break;
+        bool drained = all_pinned && exec_active_[gpu_id].load() == 0 &&
+                       exec_queue_[gpu_id].Empty();
+        if (!drained) {
+          starved_since_us = -1;   // any sign of life resets the fatal clock
+          continue;
+        }
+        int64_t now_us = _prof_now_us();
+        if (starved_since_us < 0) {
+          starved_since_us = now_us;
+          last_warn_us = now_us;
+        }
+        if (now_us - last_warn_us >= 1000 * 1000) {   // re-warn once per second
+          last_warn_us = now_us;
+          DLOG_WARN("cache fully pinned & exec pipeline drained for ",
+                    (now_us - starved_since_us) / 1000, " ms: gpu_id ", gpu_id,
+                    " layer_idx ", layer_idx, " expert_idx ", expert_idx,
+                    " pinned ", pinned_[gpu_id].size());
+        }
+        if (now_us - starved_since_us >= kStarvationFatalUs) {
+          DLOG_FATAL(
+              "pinned-starvation deadlock: cache fully pinned and exec "
+              "pipeline drained for 10 s — no eviction candidate can ever "
+              "appear (only set_pinned could free a slot and the caller is "
+              "blocked on this fetch). gpu_id ", gpu_id, " layer_idx ",
+              layer_idx, " expert_idx ", expert_idx, " cached ",
+              cached_experts_[gpu_id].size(), " pinned ",
+              pinned_[gpu_id].size(), ". Aborting run.");
+        }
+      }
+      DLOG_FATAL_IF(
+          evict_expert_node == nullptr,
+          "ExpertDispatcher::GPUFetchFunc: evict_node is nullptr, gpu_id",
+          gpu_id, "cache size", cache_sizes_[gpu_id], "in cache count",
+          cached_experts_[gpu_id].size());
+
+      DLOG_DEBUG("evicting expert: gpu_id ", gpu_id, " cache size ",
+                 cache_sizes_[gpu_id], " incache count ",
+                 cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
+                 " expert_idx ", expert_idx);
+
+      auto evict_node = evict_expert_node->node;
+      int64_t _ev_t0 = profile_enabled_ ? _prof_now_us() : 0;
+      evict_node->SetDevice(evict_node->default_host);
+      if (profile_enabled_) {
+        prof_.evict_us += _prof_now_us() - _ev_t0;
+        prof_.evict_n += 1;
+      }
+      cache_sizes_[gpu_id] += evict_node->byte_size;
+      int64_t evict_layer_idx = evict_expert_node->layer_idx;
+      int64_t evict_expert_idx = evict_expert_node->expert_idx;
+
+      // std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+      uint64_t evict_key = (evict_layer_idx << 32) + evict_expert_idx;
+      auto it = cached_experts_[gpu_id].find(evict_key);
+      if (it != cached_experts_[gpu_id].end()) {
+        cached_experts_[gpu_id].erase(it);
+      } else {
+        DLOG_FATAL(
+            "ExpertDispatcher::GPUFetchFunc: evict_key not found. layer_idx ",
+            evict_layer_idx, " expert_idx ", evict_expert_idx);
+      }
+      // Eviction done — release the victim lock FindExpertEvict held (now on
+      // host, so a waiting Enqueue re-routes it to a re-fetch).
+      evict_node->mutex.unlock();
     }
 
-    if (!gpu_overload_[gpu_id]) {
-      cache_sizes_[gpu_id] -= expert_node->node->byte_size;
-      uint64_t key = (layer_idx << 32) + expert_idx;
-      cached_experts_[gpu_id].insert(key);
-    }
+    cache_sizes_[gpu_id] -= expert_node->node->byte_size;
+    uint64_t key = (layer_idx << 32) + expert_idx;
+    cached_experts_[gpu_id].insert(key);
 
     int64_t _ft_t0 = profile_enabled_ ? _prof_now_us() : 0;
     expert_node->node->SetDevice(device, true, stream);
@@ -776,7 +780,6 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
       exec_args.expert_node = expert_node;
       exec_args.out_gpu_id = original_device.index();
       exec_args.out_dtype = c10::typeMetaToScalarType(hidden_states_.dtype());
-      exec_args.evict = gpu_overload_[gpu_id];
       exec_args.hit = cache_hit;
       // std::lock_guard<std::mutex> lock(exec_mutex_[gpu_id]);
       // exec_queue_[gpu_id].emplace_back(std::move(exec_args));
@@ -809,6 +812,9 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id) {
     if (args.expert_node == nullptr) {
       continue;
     }
+    // Pinned-starvation guard bookkeeping (see GPUFetchFunc): count this exec
+    // as in-flight from pop until OutputFunc returned (node unlocked).
+    exec_active_[gpu_id].fetch_add(1);
 
     int64_t batch_size = hidden_states_.size(0);
     auto device = CUDA_DEVICE(gpu_id);
@@ -850,6 +856,7 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id) {
       prof_.forward_n += 1;
     }
     OutputFunc(args, output, token_mask, gpu_id);
+    exec_active_[gpu_id].fetch_sub(1);
   }
 
   cudaStreamDestroy(stream);
@@ -871,38 +878,7 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output,
   int64_t batch_size = hidden_states_.size(0);
 
   args.expert_node->node->mutex.unlock();
-  if (args.evict) {
-    // pop out overloaded expert such that cache is not polluted
-    args.expert_node->node->SetDevice(args.expert_node->node->default_host,
-                                      true, nullptr);
-    // std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
-    // uint64_t key = (layer_idx << 32) + expert_idx;
-    // auto it = cached_experts_[gpu_id].find(key);
-    // if (it != cached_experts_[gpu_id].end()) {
-    //   cached_experts_[gpu_id].erase(it);
-    // } else {
-    //   DLOG_FATAL(
-    //       "ExpertDispatcher::OutputFunc: expert not found in cache. gpu_id",
-    //       gpu_id, "layer_idx ", layer_idx, "expert_idx ", expert_idx);
-    // }
-    // cache_sizes_[gpu_id] += args.expert_node->node->byte_size;
-    DLOG_DEBUG("pop out overloaded expert cache_sizes_[gpu_id] ",
-               cache_sizes_[gpu_id], "gpu_id ", gpu_id, "layer_idx ", layer_idx,
-               "expert_idx ", expert_idx);
-    // std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
-    // gpu_overload_[gpu_id].set_and_wake(true);
-    gpu_overload_[gpu_id] = false;
-  }
   cache_cv_[gpu_id].notify_all();
-
-  // if (args.evict) {
-  //   args.expert_node->node->SetDevice(args.expert_node->node->default_host,
-  //                                     true, nullptr);
-  //   {
-  //     std::lock_guard<std::mutex> lock(gpu_overload_mutex_);
-  //     gpu_overload_[gpu_id] = false;
-  //   }
-  // }
 
   if (batch_size == 1) {
     final_hidden_states_.add_(
@@ -922,17 +898,6 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output,
     auto weighted_output = output_tensor * weights;
     final_hidden_states_.index_add_(0, token_indices, weighted_output);
   }
-  // {
-  //   std::lock_guard<std::mutex> lock(output_mutex_);
-  //   output_queue_.emplace_back(std::move(output_tensor),
-  //                              args.expert_node->layer_idx,
-  //                              args.expert_node->expert_idx, args.hit);
-  //   DLOG_TRACE("ExpertDispatcher::OutputFunc: output_queue_",
-  //              output_queue_.size(), "output",
-  //              std::get<0>(output_queue_.back()).device().str(), "evict",
-  //              args.evict, "(", args.expert_node->layer_idx,
-  //              args.expert_node->expert_idx, gpu_id, args.hit, ")");
-  // }
 
   // stream.synchronize();
   pending_.fetch_sub(1);

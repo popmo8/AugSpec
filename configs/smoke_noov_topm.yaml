@@ -1,0 +1,21 @@
+# remove_overload_plan.md §4-3 smoke — topm (K=16, P2+P3 merge) on the
+# post-removal engine. Deliberately NO offload.no_overload key: evict-on-full
+# is the built-in behaviour now. qpc=1 / mnt=64 = fast liveness check,
+# NOT an AccR/TPS run.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+cluster:
+  name: freq_slice
+  within_weight: freq
+run: {T: 5, questions_per_cat: 1, max_new_tokens: 64}
+output: {label: smoke_noov_topm, dir: output/smoke_noov_topm}

@@ -389,7 +389,7 @@ h(λ) 與 §6-7 矩陣的 specmoe 對照一律用實測出來的最佳 ep 設定
 | 1 | AUG_DUMP_PAIRS λ∈{0,.5,1} 量 h(λ)(免費,先做) | 3 jobs | 無 |
 | 2 | 節點 disk 頻寬校準 | 1 job | 無 |
 | 3 | HostMemoryPool 上限 runtime 化 + YAML `cpu_budget_ratio` | C++ 小 + rebuild | 低 |
-| 4 | 小上限 smoke:demand-load 路徑 × 我們的 no_overload/evict 改動 | 1 job | **高——最可能出 race/deadlock 的點** |
+| 4 | 小上限 smoke:demand-load 路徑 × 我們的 evict 改動(overload 路徑已於 2026-07-08 整個刪除,見 `remove_overload_plan.md`;此項只需驗 demand-load × FindExpertEvict) | 1 job | **高——最可能出 race/deadlock 的點** |
 | 4.5 | **GPU L1 delta-rebuild(§3.1,~30 行 Python;不依賴 #3/#4,可隨時先做)** | Python 小 | 低(engine_bmm 審計先行) |
 | 5 | Python CPU L2 merged cache(§3.2)+ AUG_PROFILE 新 rows | Python 中 | 中 |
 | 6 | `load_cpu_source=False` 斷言 + 記帳審計(B_cpu 真的只有 c×58GB) | 小 | 低 |

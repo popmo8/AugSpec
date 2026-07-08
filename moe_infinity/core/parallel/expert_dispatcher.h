@@ -45,7 +45,6 @@ class ExpertDispatcher : public base::noncopyable {
     ExpertNodePtr expert_node = nullptr;
     int out_gpu_id = -1;
     torch::ScalarType out_dtype = torch::kFloat32;
-    bool evict = false;
     bool hit = false;
   } ExecArgs;
   typedef std::tuple<torch::Tensor, int, int, int> CallResult;
@@ -193,7 +192,7 @@ class ExpertDispatcher : public base::noncopyable {
   void OutputFunc(ExecArgs args, torch::Tensor output, torch::Tensor token_mask,
                   int gpu_id);
 
-  ExpertNodePtr FindExpertEvict(int gpu_id);
+  ExpertNodePtr FindExpertEvict(int gpu_id, bool* all_pinned = nullptr);
 
  private:
   std::vector<std::unique_ptr<base::Thread>> threads_;
@@ -226,11 +225,8 @@ class ExpertDispatcher : public base::noncopyable {
 
   std::mutex output_mutex_;
   // std::mutex exec_mutex_;
-  // std::mutex gpu_overload_mutex_;
 
   std::vector<cudaStream_t> exec_streams_;
-
-  std::vector<bool> gpu_overload_;
 
   torch::Tensor hidden_states_;
   torch::Tensor final_hidden_states_;
@@ -240,6 +236,10 @@ class ExpertDispatcher : public base::noncopyable {
   std::vector<int64_t> cache_sizes_;
   std::vector<std::unordered_set<uint64_t>> cached_experts_;
   std::vector<std::unordered_set<uint64_t>> pinned_;   // specmoe kept-N (no evict)
+  // Per-GPU in-flight exec count (pop -> OutputFunc returned). Part of the
+  // pinned-starvation guard in GPUFetchFunc: all-pinned cache + drained exec
+  // pipeline = provable deadlock (remove_overload_plan.md §5).
+  std::vector<std::atomic<int64_t>> exec_active_;
 
   int cache_capacity_ = 0;
 
@@ -253,7 +253,6 @@ class ExpertDispatcher : public base::noncopyable {
     std::atomic<int64_t> draft_fetch_n{0}, draft_fetch_us{0},
         draft_fetch_bytes{0};
     std::atomic<int64_t> evict_n{0}, evict_us{0};
-    std::atomic<int64_t> overload_wait_n{0}, overload_wait_us{0};
     std::atomic<int64_t> enqueue_wait_n{0}, enqueue_wait_us{0};
     std::atomic<int64_t> forward_n{0}, forward_us{0};
     std::atomic<int64_t> merge_n{0}, merge_us{0};
@@ -263,12 +262,6 @@ class ExpertDispatcher : public base::noncopyable {
   ProfileCounters prof_;
   std::atomic<int> profile_phase_{0};   // 0 = verify, 1 = draft
   bool profile_enabled_ = false;
-
-  // aug_spec (AUG_NO_OVERLOAD): route batch>1 cache-full fetches through the
-  // normal FindExpertEvict path (evict one LFU non-pinned per fetch, pinned
-  // kept-N skipped) instead of the single-slot serialised "overload" borrow.
-  // Restores prefetch depth and makes pinning actually keep kept-N resident.
-  bool no_overload_ = false;
 
   // aug_spec activation_similarity capture (see SetCaptureExpertOut).
   bool capture_expert_out_ = false;

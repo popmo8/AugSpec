@@ -20,7 +20,6 @@ model:
     vram_budget_ratio: 0.2              # usable VRAM / model VRAM (overrides device_memory_ratio)
     merge_offload: true                 # GPU resident-merge via archer dispatcher
     merge_during_verify: true           # per-layer merge during verify (vs after)
-    no_overload: true                   # default: false  — C++ no-overload dispatch (A4)
     # merged_backend: engine_bmm        # engine_bmm (default) | dispatch | bmm  (A4)
 
 draft:
@@ -79,8 +78,13 @@ on GPU. Only read when `model.backend: offload`.
 | `merge_during_verify` | bool | `false` | Merge each layer *during* verify (experts still resident → 0 re-fetch) vs an after-verify refresh. |
 | `flush_on_draft_end` | bool | `false` | Phase-exclusive flush (archer@draft-start, merged@draft-end). |
 | `merge_overlap` | bool | `false` | Merge on a side stream, overlap with next-layer fetch. |
-| `no_overload` | bool | `false` | C++ no-overload dispatch for batch>1 cache-full fetches. **A4** — was `AUG_NO_OVERLOAD`. |
 | `merged_backend` | str | `engine_bmm` | Merged-expert draft kernel: `engine_bmm` (C++ DispatchBmm) / `dispatch` (per-expert MoEMLP) / `bmm` (Python). **A4** — was `AUG_MERGED_BACKEND`. |
+
+Deprecated: `no_overload` (and env `AUG_NO_OVERLOAD`). The C++ "overload"
+path was removed in 2026-07 (`remove_overload_plan.md`), so pin-aware
+evict-on-full is now the only behaviour — what `no_overload: true` used to
+select. The key is accepted-but-ignored (a deprecation line is printed) so
+older YAMLs keep loading; don't write it in new configs.
 
 ## `draft`
 
@@ -303,7 +307,6 @@ config.
 
 | env var | overrides | values |
 |---|---|---|
-| `AUG_NO_OVERLOAD` | `model.offload.no_overload` | set (any value) = on |
 | `AUG_MERGED_BACKEND` | `model.offload.merged_backend` | `engine_bmm` / `dispatch` / `bmm` |
 | `AUG_EARLY_PIN` | `draft.early_pin` | `0` / `1` / `2` |
 | `AUG_CLUSTER_UNIFORM` | `cluster.within_weight` | set (any value) = force `uniform` |
@@ -329,7 +332,7 @@ retired). A few canonical entry points:
 | `qwen3_topm_count.yaml` | topm_count | bounded fetch; M defaults to 8 |
 | `qwen3_topm_count_k16.yaml` | topm_count | + `K=16` cluster mini-MoE |
 | `qwen3_prefill_topm_count.yaml` | prefill_topm_count | prefill-only + top-M cutoff |
-| `q5_512_tm_on.yaml` | topm_count | **offload + K=16 cluster reference**; self-contained A4 knobs (`no_overload`, `cluster`) |
+| `q5_512_tm_on.yaml` | topm_count | **offload + K=16 cluster reference**; self-contained A4 knobs (`cluster`; its `no_overload` is now a deprecated no-op) |
 | `q5_512_tm_unif.yaml` | topm_count | as `q5_512_tm_on` but `cluster.within_weight: uniform` (ablation) |
 | `base_specmoe_offload.yaml` / `base_topm_offload.yaml` | specmoe / topm_count | offload baselines |
 

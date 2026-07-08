@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import gc
 import inspect
-import os
 import types
 from typing import Any, Optional, Tuple
 
@@ -173,7 +172,6 @@ def load_offload(
     trust_remote_code: bool = True,
     device: Optional[torch.device] = None,
     load_cpu_source: bool = True,
-    no_overload: bool = False,
 ) -> Tuple[nn.Module, Any, Any, Optional[nn.Module]]:
     """Load a MoE model with moe_infinity expert offloading.
 
@@ -198,12 +196,6 @@ def load_offload(
     calls this function does not need it installed.
     """
     from moe_infinity import MoE  # lazy: hf-only env doesn't need it
-
-    # no_overload (YAML model.offload.no_overload, A4): the C++ dispatcher reads
-    # AUG_NO_OVERLOAD via getenv at MoE() construction below, so set it here
-    # first. setdefault keeps an existing env value as an override.
-    if no_overload:
-        os.environ.setdefault("AUG_NO_OVERLOAD", "1")
 
     if device is None:
         device = torch.device("cuda:0")
