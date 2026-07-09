@@ -123,6 +123,14 @@ class RunConfig:
     max_new_tokens: int
     seed: int
     warmup: bool
+    prefill_warmup: bool                 # run.prefill_warmup (C-BOOT): empty
+                                         # first candidate round → target pure
+                                         # prefill builds the draft state before
+                                         # the first real draft. Default TRUE;
+                                         # false = paper ablation (old
+                                         # draft-first + first-cycle fallback).
+                                         # Distinct from run.warmup (compile
+                                         # warm-up generate before timing).
     emit_tokens_csv: bool
     spec_bench_cache: Optional[Path]
     skip_categories: List[str]           # run.skip_categories (e.g. ["mt_bench"])
@@ -218,6 +226,7 @@ class RunConfig:
             max_new_tokens=int(run_cfg.get("max_new_tokens", 512)),
             seed=int(run_cfg.get("seed", 0)),
             warmup=bool(run_cfg.get("warmup", True)),
+            prefill_warmup=bool(run_cfg.get("prefill_warmup", True)),
             emit_tokens_csv=bool(run_cfg.get("emit_tokens_csv", False)),
             spec_bench_cache=spec_cache_path,
             skip_categories=[str(c) for c in (run_cfg.get("skip_categories") or [])],
@@ -258,7 +267,6 @@ def _dump_profile(controller) -> None:
     row("verify_fetch", "verify_fetch_n", "verify_fetch_us")
     row("draft_fetch", "draft_fetch_n", "draft_fetch_us")   # SpecMoE re-fetch
     row("evict", "evict_n", "evict_us")
-    row("evict_layer", "evict_layer_n", "evict_layer_us")
     row("enqueue_wait", "enqueue_wait_n", "enqueue_wait_us")     # race-fix hits
     row("expert_forward", "forward_n", "forward_us")
     row("merge(P3)", "merge_n", "merge_us")
@@ -406,7 +414,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
                             merge_offload=cfg.merge_offload,
                             merge_during_verify=cfg.merge_during_verify,
                             flush_on_draft_end=cfg.flush_on_draft_end,
-                            merge_overlap=cfg.merge_overlap)
+                            merge_overlap=cfg.merge_overlap,
+                            prefill_warmup=cfg.prefill_warmup)
 
     # One-time, model-derived precomputation (e.g. SpecMoE expert distances).
     draft.prepare(adapter, controller.blocks)
@@ -435,6 +444,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
                 spec_bench_cache=cfg.spec_bench_cache,
                 emit_tokens_csv=cfg.emit_tokens_csv,
                 warmup=cfg.warmup,
+                prefill_warmup=cfg.prefill_warmup,
+                on_prefill_warmup=controller.update_masks,
                 vram_limit_bytes=usable_vram_bytes,
                 vram_guard=cfg.vram_guard,
                 skip_categories=cfg.skip_categories,

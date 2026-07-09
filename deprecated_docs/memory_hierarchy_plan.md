@@ -1,5 +1,11 @@
 # Merged-Expert Memory Hierarchy 計劃（2026-07-04 起草）
 
+> **⛔ 已作廢(2026-07-09)**:CPU 三層 hierarchy 的方向不做了。論文已改為
+> **GPU merged-expert cache + CPU backing store** 的兩層設計
+> (`paper/method_reconstruct.tex`),新計劃見 **`merged_cache_plan.md`**。
+> 本檔只保留當歷史紀錄;唯一仍被引用的產出是 §6-0 early_pin probe 的實測結論
+> (§5 末的結果表,PROJECT_GUIDE 已收錄)。
+
 > 系統優化:把記憶體切成 **disk / CPU / GPU** 三層。GPU 維持 `vram_budget_ratio: 0.2`;
 > CPU 改為「放不下全部 expert」(新預算 c);disk 存完整 checkpoint。
 > specmoe 把 CPU 全部拿來當 raw expert cache;topm/hybrid 把一部分 CPU 撥給

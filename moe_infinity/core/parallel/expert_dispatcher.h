@@ -151,16 +151,6 @@ class ExpertDispatcher : public base::noncopyable {
   // verify and draft), like the read/merge methods above.
   void FlushCache(int gpu_id);
 
-  // aug_spec / verify_merge_plan.md P2+P3: evict every GPU-resident expert of
-  // layer `layer_idx` back to host. Called right after on_verify_layer merges
-  // the layer (experts still resident, dispatch-quiescent between layers). By
-  // freeing each layer once verify+merge are done with it, the sparse cache
-  // never fills → the overload evict-after-use path never triggers → the
-  // per-layer merge reads resident experts with no concurrent-eviction race
-  // (the P3 crash), and the footprint stays ~1 layer (low peak). Caller must
-  // sync the merge's GPU reads before this frees the source memory.
-  void EvictLayer(int layer_idx, int gpu_id);
-
   // aug_spec / specmoe_pin_plan.md: mark layer `layer_idx`'s `expert_ids` as
   // pinned (the SpecMoE kept-N draft set) so FindExpertEvict never evicts them.
   // SetPinned replaces the whole pinned set for that layer; ClearPinned drops
@@ -256,7 +246,6 @@ class ExpertDispatcher : public base::noncopyable {
     std::atomic<int64_t> enqueue_wait_n{0}, enqueue_wait_us{0};
     std::atomic<int64_t> forward_n{0}, forward_us{0};
     std::atomic<int64_t> merge_n{0}, merge_us{0};
-    std::atomic<int64_t> evict_layer_n{0}, evict_layer_us{0};
     std::atomic<int64_t> dispatch_n{0}, dispatch_us{0};
   };
   ProfileCounters prof_;

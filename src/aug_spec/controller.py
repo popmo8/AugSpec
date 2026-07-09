@@ -39,7 +39,8 @@ class Controller:
                  merge_offload: bool = False,
                  merge_during_verify: bool = False,
                  flush_on_draft_end: bool = False,
-                 merge_overlap: bool = False):
+                 merge_overlap: bool = False,
+                 prefill_warmup: bool = True):
         self.model = model
         self.adapter = adapter
         self.draft = draft
@@ -83,6 +84,12 @@ class Controller:
         self.cycle_misses: List[int] = []  # populated by drafts that track it
 
         self.in_draft_phase: bool = False
+        # run.prefill_warmup (C-BOOT, merged_cache_plan.md §2.4): the warmup
+        # round guarantees the draft state exists before the first real draft,
+        # so a missing draft cache in draft phase is a bug — adapter forwards
+        # raise instead of silently falling back to standard routing (the
+        # fallback stays legal only for the prefill_warmup=false ablation).
+        self.prefill_warmup: bool = prefill_warmup
         self._installed: bool = False
 
     # ── install / uninstall ────────────────────────────────────────────

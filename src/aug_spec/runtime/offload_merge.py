@@ -58,13 +58,11 @@ class OffloadMergeEngine:
         # flush the merged experts (dead during verify). So merged residency and
         # the verify cache never coexist → peak = max(them), not sum (§1.4).
         self.flush = flush
-        # P4: run the per-layer merge on a side CUDA stream and defer that
-        # layer's evict by one layer, so the merge overlaps with the next
-        # layer's PCIe fetch (instead of a per-layer full device sync). Ablation
-        # flag merge_overlap.
+        # P4: run the per-layer merge on a side CUDA stream so it overlaps with
+        # the next layer's PCIe fetch (instead of a per-layer full device sync).
+        # Ablation flag merge_overlap.
         self.overlap = overlap
         self._merge_stream = None                 # lazily created side stream
-        self._pending = None                      # (layer_idx, event) deferred evict
         # Back-reference to the Controller (set by it after construction): gives
         # on_verify_layer access to the draft (per-layer merge logic) + draft_cache.
         self.controller = None
@@ -159,34 +157,27 @@ class OffloadMergeEngine:
                                  self.controller.draft_cache)
 
         if not self.overlap or disp is None:
-            # P2 (synchronous): merge on the default stream, sync its async
-            # reads, then evict this layer. Evicting each layer once verify+merge
-            # are done keeps the sparse cache from filling → no overload
-            # evict-after-use → no concurrent-eviction race (the P3 crash),
-            # footprint ~1 layer.
+            # P2 (synchronous): merge on the default stream. C-DEL
+            # (merged_cache_plan.md §2.5): NO per-layer eviction any more —
+            # verify residents stay in the pool and are reclaimed on demand by
+            # the pin-aware LFU (FindExpertEvict); the old rationale (avoid the
+            # overload evict-after-use race) died with the overload path. The
+            # synchronize stays for now so this change is eviction-only
+            # (attribution); C1 removes it with the cache mode.
             _merge()
             if disp is not None:
                 torch.cuda.synchronize()
-                disp.evict_layer(layer_idx, 0)
             return
 
         # P4: run the merge on a side stream so it overlaps the next layer's PCIe
-        # fetch (default stream), and defer this layer's evict by one layer — by
-        # the time we evict L, layer L+1's fetch has hidden L's merge, so the
-        # event is already complete (no critical-path sync). The merge result in
-        # draft_cache is read only in the next draft phase, after on_draft_start
-        # syncs the side stream.
+        # fetch (default stream). The merge result in draft_cache is read only
+        # in the next draft phase, after on_draft_start syncs the side stream.
+        # (The old deferred per-layer evict went with C-DEL — eviction is
+        # demand-driven now.)
         if self._merge_stream is None:
             self._merge_stream = torch.cuda.Stream()
         with torch.cuda.stream(self._merge_stream):
             _merge()
-        ev = torch.cuda.Event()
-        ev.record(self._merge_stream)
-        if self._pending is not None:
-            pl, pe = self._pending
-            pe.synchronize()           # done by now (overlapped with this layer)
-            disp.evict_layer(pl, 0)
-        self._pending = (layer_idx, ev)
 
     def _dispatcher(self):
         """The archer ExpertDispatcher (shared across blocks), or None."""
@@ -196,17 +187,11 @@ class OffloadMergeEngine:
         return getattr(ex, "expert_dispatcher", None) if ex is not None else None
 
     def _drain_pending(self) -> None:
-        """P4: finish any deferred (side-stream) merge + evict its layer. Called
-        at the verify→draft boundary so (a) the last layer's evict isn't left
-        hanging and (b) the side stream is synced before the draft reads the
-        merged experts off the default stream. No-op unless overlap ran."""
+        """P4: sync the side merge stream at the verify→draft boundary so the
+        draft reads valid merged tensors off the default stream. No-op unless
+        overlap ran. (The old deferred per-layer evict went with C-DEL.)"""
         if self._merge_stream is not None:
             self._merge_stream.synchronize()
-        if self._pending is not None:
-            disp = self._dispatcher()
-            if disp is not None:
-                disp.evict_layer(self._pending[0], 0)
-            self._pending = None
 
     def on_question_start(self) -> None:
         """Called from Controller.reset() at each question start. Re-arms the

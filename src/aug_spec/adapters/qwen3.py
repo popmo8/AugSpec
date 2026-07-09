@@ -235,6 +235,17 @@ class Qwen3MoeAdapter(MoEAdapter):
                     avg = controller.draft.lazy_build(layer_idx, block, adapter)
                     if avg is not None:
                         controller.draft_cache[layer_idx] = avg
+                # C-BOOT (merged_cache_plan.md §2.4): with run.prefill_warmup
+                # the warmup round builds every layer's draft state before the
+                # first real draft — reaching here without one is a bug, and
+                # the silent standard-routing fallback below would mask it as
+                # a slowdown (~47GB/question of draft fetch). Fail fast.
+                if avg is None and getattr(controller, "prefill_warmup", False):
+                    raise RuntimeError(
+                        f"draft cache missing for MoE layer {layer_idx} in "
+                        f"draft phase despite run.prefill_warmup=true — the "
+                        f"warmup prefill should have built it "
+                        f"(merged_cache_plan.md §2.4)")
                 if avg is not None:
                     if avg.get("kind") == "multi":
                         top_k = controller.draft.draft_top_k or block.top_k
@@ -245,7 +256,8 @@ class Qwen3MoeAdapter(MoEAdapter):
                         out = adapter._run_dense_expert(avg, hs_flat)
                     return out.reshape(
                         batch_size, sequence_length, hidden_dim), router_logits
-                # First cycle, no cache → fall through to standard routing.
+                # prefill_warmup=false ablation: first cycle has no cache →
+                # fall through to standard routing (the legacy behaviour).
             else:
                 controller.draft.capture(layer_idx, router_logits)
 

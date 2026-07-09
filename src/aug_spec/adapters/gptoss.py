@@ -131,6 +131,13 @@ class GptOssAdapter(MoEAdapter):
                     avg = controller.draft.lazy_build(layer_idx, mlp, adapter)
                     if avg is not None:
                         controller.draft_cache[layer_idx] = avg
+                # C-BOOT: see qwen3.py — missing draft cache under
+                # run.prefill_warmup is a bug; fail fast, don't fall back.
+                if avg is None and getattr(controller, "prefill_warmup", False):
+                    raise RuntimeError(
+                        f"draft cache missing for MoE layer {layer_idx} in "
+                        f"draft phase despite run.prefill_warmup=true "
+                        f"(merged_cache_plan.md §2.4)")
                 if avg is not None:
                     if avg.get("kind") == "multi":
                         # Run the gate (one linear) for per-token cluster scores.

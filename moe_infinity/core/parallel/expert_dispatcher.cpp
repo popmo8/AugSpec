@@ -397,35 +397,6 @@ void ExpertDispatcher::FlushCache(int gpu_id) {
       kTopologyHandle->GetSparseCacheLimit(CUDA_DEVICE(gpu_id));
 }
 
-void ExpertDispatcher::EvictLayer(int layer_idx, int gpu_id) {
-  int64_t _el_t0 = profile_enabled_ ? _prof_now_us() : 0;
-  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
-  std::vector<uint64_t> to_evict;
-  for (auto key : cached_experts_[gpu_id]) {
-    if (static_cast<int>(key >> 32) == layer_idx) {
-      to_evict.push_back(key);
-    }
-  }
-  for (auto key : to_evict) {
-    int64_t expert_idx = static_cast<int64_t>(key & 0xFFFFFFFF);
-    if (expert_idx < 0 || expert_idx >= static_cast<int64_t>(experts_.size())) {
-      continue;
-    }
-    auto expert_node = experts_[expert_idx][layer_idx];
-    if (expert_node == nullptr || expert_node->node == nullptr) continue;
-    if (expert_node->node->device.is_cuda()) {
-      // Host copy is the offload source — frees the GPU mirror, no D2H.
-      expert_node->node->SetDevice(expert_node->node->default_host);
-      cache_sizes_[gpu_id] += expert_node->node->byte_size;
-    }
-    cached_experts_[gpu_id].erase(key);
-  }
-  if (profile_enabled_) {
-    prof_.evict_layer_us += _prof_now_us() - _el_t0;
-    prof_.evict_layer_n += 1;
-  }
-}
-
 std::vector<std::tuple<int64_t, int64_t, torch::Tensor, torch::Tensor>>
 ExpertDispatcher::GetCapturedExpertOutputs() {
   std::lock_guard<std::mutex> lock(capture_mutex_);
@@ -445,7 +416,6 @@ void ExpertDispatcher::ResetProfile() {
   prof_.enqueue_wait_n = 0; prof_.enqueue_wait_us = 0;
   prof_.forward_n = 0; prof_.forward_us = 0;
   prof_.merge_n = 0; prof_.merge_us = 0;
-  prof_.evict_layer_n = 0; prof_.evict_layer_us = 0;
   prof_.dispatch_n = 0; prof_.dispatch_us = 0;
 }
 
@@ -465,8 +435,6 @@ std::map<std::string, int64_t> ExpertDispatcher::DumpProfile() {
       {"forward_us", prof_.forward_us.load()},
       {"merge_n", prof_.merge_n.load()},
       {"merge_us", prof_.merge_us.load()},
-      {"evict_layer_n", prof_.evict_layer_n.load()},
-      {"evict_layer_us", prof_.evict_layer_us.load()},
       {"dispatch_n", prof_.dispatch_n.load()},
       {"dispatch_us", prof_.dispatch_us.load()},
   };

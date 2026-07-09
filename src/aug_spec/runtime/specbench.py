@@ -164,12 +164,25 @@ class SpecBenchResult:
 @contextmanager
 def _locked_assist_patch(T: int,
                          lm_topk: int,
-                         on_verify: Callable[[CycleStats], None]):
+                         on_verify: Callable[[CycleStats], None],
+                         prefill_warmup: bool = False,
+                         on_prefill_warmup: Optional[Callable[[], None]] = None):
     """Monkey-patch AssistedCandidateGenerator to:
       - lock `num_assistant_tokens = T` (defeat HF's heuristic ±),
       - clip if HF ever returns more than T candidates,
       - capture per-cycle CycleStats and call `on_verify` after each
-        `update_candidate_strategy`.
+        `update_candidate_strategy`,
+      - `prefill_warmup` (C-BOOT, merged_cache_plan.md §2.4): make the FIRST
+        candidate round of each question return zero candidates, so the target
+        does a pure prefill (capturing routing stats + building the draft
+        state) before the first real draft. The early return happens BEFORE
+        the phase patch (`shared_model_phase_patch` wraps `orig_get`), so
+        `in_draft_phase` never flips and `on_draft_start`/`on_draft_end` do
+        not fire for the warmup round — the hybrid act-sim capture stays
+        armed through the prefill. `on_prefill_warmup` fires once after the
+        warmup round's target forward (from `update_candidate_strategy`), so
+        backends without the offload-merge engine (hf) can build the draft
+        cache there.
     """
     from transformers.generation.candidate_generator import (
         AssistedCandidateGenerator,
@@ -187,6 +200,17 @@ def _locked_assist_patch(T: int,
 
     def patched_get(self, input_ids):
         self.num_assistant_tokens = T
+        # C-BOOT empty first round: a fresh AssistedCandidateGenerator is
+        # built per generate() call, so instance attrs track per-question
+        # state. Returning (input_ids, None) = zero candidates → HF runs the
+        # target on input_ids alone (pure prefill) and greedily emits one
+        # exact token (the TTFT token). No draft forward runs this round.
+        if prefill_warmup and not getattr(self, "_aug_warmed", False):
+            self._aug_warmed = True
+            state["draft_tokens"] = []
+            state["draft_top_vals"] = None
+            state["draft_top_ids"] = None
+            return input_ids, None
         cand, lg = orig_get(self, input_ids)
         target_len = input_ids.shape[1] + T
         if cand.shape[1] > target_len:
@@ -257,6 +281,16 @@ def _locked_assist_patch(T: int,
             )
             on_verify(cs)
             state["cycle_idx"] += 1
+        elif (prefill_warmup and getattr(self, "_aug_warmed", False)
+                and not getattr(self, "_aug_warmup_done", False)):
+            # The warmup round's target forward just finished (routing stats
+            # captured for every layer) — build the draft state now so the
+            # first real draft never falls back. On the offload-merge engine
+            # this is a no-op rebuild-skip (merged already built per layer in
+            # on_verify_layer); on hf it does the actual merge.
+            self._aug_warmup_done = True
+            if on_prefill_warmup is not None:
+                on_prefill_warmup()
 
         result = orig_upd(self, input_ids, scores, num_matches)
         self.num_assistant_tokens = T
@@ -378,6 +412,8 @@ def run_specbench(
     emit_tokens_csv: bool = True,
     progress_every: int = 5,
     warmup: bool = True,
+    prefill_warmup: bool = True,
+    on_prefill_warmup: Optional[Callable[[], None]] = None,
     lm_topk: int = LM_TOPK_DEFAULT,
     on_cycle: Optional[Callable[[QuestionResult, CycleStats], None]] = None,
     on_question_start: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -494,10 +530,19 @@ def run_specbench(
         with torch.no_grad():
             if before_generate is not None:
                 before_generate(warm_in["input_ids"])
-            target_model.generate(
-                **warm_in, max_new_tokens=8, do_sample=False,
-                assistant_model=draft_model,
-            )
+            # C-BOOT: the compile-warmup generate must run under the same
+            # assist patch as the questions — with prefill_warmup the draft
+            # would otherwise run first with an empty draft cache and trip the
+            # adapters' fail-fast assert.
+            with _locked_assist_patch(
+                num_speculative, lm_topk, lambda cs: None,
+                prefill_warmup=prefill_warmup,
+                on_prefill_warmup=on_prefill_warmup,
+            ):
+                target_model.generate(
+                    **warm_in, max_new_tokens=8, do_sample=False,
+                    assistant_model=draft_model,
+                )
         print("    warmup done")
 
     per_question: List[QuestionResult] = []
@@ -543,6 +588,8 @@ def run_specbench(
                     before_generate(inputs["input_ids"])
                 with _locked_assist_patch(
                     num_speculative, lm_topk, _on_verify,
+                    prefill_warmup=prefill_warmup,
+                    on_prefill_warmup=on_prefill_warmup,
                 ):
                     out = target_model.generate(
                         **inputs,

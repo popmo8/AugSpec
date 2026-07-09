@@ -38,6 +38,7 @@ run:
   max_new_tokens: 512                   # default: 512    — generation budget per question
   seed: 0                               # default: 0      — RNG seed for question sampling
   warmup: true                          # default: true   — one tiny generate() before timed eval
+  prefill_warmup: true                  # default: true   — C-BOOT empty first round (false = ablation)
   emit_tokens_csv: false                # default: false  — per-cycle CSV; ~100 MB / run when on
   spec_bench_cache: data/spec_bench     # default: <cwd>/data/spec_bench
   reasoning_effort: low                 # GPT-OSS only — injected into chat template
@@ -287,6 +288,7 @@ accumulated in the engine's `on_verify_layer` hook).
 | `max_new_tokens` | int | `512` | Per-question generation budget. |
 | `seed` | int | `0` | RNG for per-category sampling. |
 | `warmup` | bool | `true` | Run one tiny `generate()` before timed eval to amortize compile. Disable in smoke tests. |
+| `prefill_warmup` | bool | `true` | **C-BOOT** (merged_cache_plan.md §2.4): the first candidate round of every question returns zero candidates, so the target does a pure prefill that captures routing stats and builds the draft state *before* the first real draft — the first-cycle standard-routing fallback (and its ~47GB/question draft fetch) never triggers, and reaching it raises. `false` = paper ablation (legacy draft-first + first-cycle fallback). Applies to every method (loop-level). Distinct from `warmup` above. |
 | `emit_tokens_csv` | bool | `false` | Per-cycle per-position dump. Useful for offline analysis; ~100 MB / full run. |
 | `spec_bench_cache` | str | `<cwd>/data/spec_bench` | Override where `question.jsonl` is downloaded / loaded. |
 | `reasoning_effort` | str | (none) | **GPT-OSS only** — injected into the chat template by `GptOssAdapter.post_load`. |

@@ -105,7 +105,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("dump_profile", &ExpertDispatcher::DumpProfile)
       .def("reset_profile", &ExpertDispatcher::ResetProfile)
       .def("flush_cache", &ExpertDispatcher::FlushCache)
-      .def("evict_layer", &ExpertDispatcher::EvictLayer)
       .def("set_pinned", &ExpertDispatcher::SetPinned)
       .def("clear_pinned", &ExpertDispatcher::ClearPinned)
       .def("set_capture_expert_out", &ExpertDispatcher::SetCaptureExpertOut)
