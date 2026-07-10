@@ -186,6 +186,22 @@
     (= 論文 λ=1 端點),cycle 2 起自動回正常 blend。
   - hf backend 同樣適用(空首輪 patch 在 specbench,backend 無關;該輪
     target forward 後 refresh 建 merged)。
+  - **KV-copy(2026-07-10 追加,空首輪的必要配套)**:HF assisted decoding
+    的 assistant 有**獨立 KV cache**,不會繼承 target prefill 的 KV;空首輪
+    後它的第一個 forward 會在 draft 相位把整個 prompt 用 merged/substitute
+    重 encode → context KV 劣化 → AccR 崩到 0.01(jobs 258368/258378,
+    兩法兩 backend 同崩)。**設計教訓:「draft 權重不變 ⇒ acceptance 不變」
+    只對單步成立,draft 的 context KV 品質是 first-order——歷史上 cycle-1
+    fallback 一直默默扮演「真 routing prompt KV」的角色。** 修法:共權重
+    單模型下 target 的 prompt KV 就是 draft 的最優 context → 空首輪結束時
+    stash target cache(透明包 `target_model.forward`,assistant 呼叫以
+    in_draft_call 旗標排除),第一次真 get_candidates 時 deepcopy 注入
+    `assistant_kwargs["past_key_values"]` → draft 免重 encode prompt、直接
+    投機。修復實測(258444):offload AccR 0.028→0.455、hf 0.011→0.302、
+    token 對齊率 0.27→0.665、TPS +11%。殘餘 ~6pp AccR 差距 = 每題首 cycle
+    不再是 ~100% accept(fallback=target 本人)的已知語意變化,mnt=64 下
+    佔比 ~1/6 被放大,mnt=512 稀釋至 <1pp(最終驗收量化)。
+    per-cycle accepted-token 的 re-encode 維持 merged(歷史行為)。
   - stale warm start(沿用上一題 partition)降級為 optional 加速器,
     非正確性需求。
   - 驗收:draft_fetch GB/題 → ~0;MAT 預期持平(首 token 由 target 生成,
@@ -285,7 +301,15 @@ model:
 
 ### 4.3 Telemetry(C1 起)
 - AUG_PROFILE 新 rows:`merged_hit / merged_miss / merge_elided_GB /
-  singleton_verify_hit(雙重身分命中)/ pipeline_reorder_n`。
+  singleton_verify_hit / pipeline_reorder_n`。
+- **`singleton_verify_hit` 精確定義(C1 驗收指標)**:verify routing 要求
+  某 expert 時,`cache_hit ∧ 該 expert ∈ pinned_`(= 當前工作集的 singleton)
+  → +1(併計 bytes)。每次命中 = verify 省一次 9.44MB fetch,是「雙重身分」
+  的直接證據。實作在 C++ Enqueue/fetch 的 hit 路徑(hit 與 pinned 都已在手,
+  一個 set 查詢)。判讀:singleton 是 top-count expert,verify 大機率重複
+  route → 數字理應每層每 cycle 數次的量級;**≈0 = pin 時序或驅逐有 bug**,
+  比 TPS 更早暴露問題。sanity 基準:同 counter 對 specmoe 的 pinned kept-N
+  也有效,兩法 hit 率應同量級。
 - budget 印表:模式(auto/ratio)/ floor bytes / S / K′ /
   當前 draft-side pinned 佔用 + unpinned history 佔用。
 
@@ -335,9 +359,9 @@ model:
 
 | 項目 | 狀態 |
 |---|---|
-| C-DEL EvictLayer 全刪(§2.5;驗收 = smoke + q15 topm 對照) | ⬜ |
-| C-BOOT 空首輪 + `run.prefill_warmup`(預設 true)+ assert(§2.4;驗收 draft_fetch→~0、MAT 持平、flag off 可重現舊行為) | ⬜ |
-| C0 C++ slot 機制(行為不變) | ⬜ |
+| C-DEL EvictLayer 全刪(§2.5) | ✅ 2026-07-10:code 全刪、cdel_tm_off liveness 過(4.95GB pool 沖 1.1TB ≈ 12 萬次 demand-evict 零異常、AccR 0.51 健康);**效能 A/B(TPS/verify_fetch vs 歷史)併入最終驗收** |
+| C-BOOT 空首輪 + `run.prefill_warmup` + assert + KV-copy(§2.4) | ✅ 2026-07-10:含兩顆 bug 修復(assistant mask 失同步 → crash;draft 重 encode prompt → AccR 崩,KV-copy 解);診斷 258444 過(offload 0.455 / 對齊率 0.665 / TPS +11%);mnt=512 規模的 MAT 持平驗證併入最終驗收 |
+| C0 C++ slot 機制(行為不變) | ✅ 2026-07-10:MergedSlot 表 + 5 API + 兩段式回收 hook;binding 檢查 + 六項功能 probe(258137)全過;smoke 行為不變 |
 | C1 auto 模式 + content index + 工作集 pin | ⬜ |
 | C2 retention + history + warm start | ⬜ |
 | C3 pipelining v1 | ⬜ |

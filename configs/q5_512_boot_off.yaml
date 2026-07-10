@@ -1,6 +1,5 @@
-# C-DEL 驗證 A(merged_cache_plan.md §2.5)— liveness only(qpc=1/mnt=64):
-# prefill_warmup 關 = 舊 fallback 路徑 + EvictLayer 刪除後的 demand 驅逐,
-# 確認能跑完、不 hang。非 AccR/TPS 對照跑。
+# C-BOOT 規模驗證 B — 同 q5_512_boot_on 但 prefill_warmup OFF(舊 fallback
+# 語意;stack 上仍含 C-DEL)。作為 on 的對照組。
 model:
   id: Qwen/Qwen3-30B-A3B-Base
   backend: offload
@@ -18,8 +17,8 @@ cluster:
   within_weight: freq
 run:
   T: 5
-  questions_per_cat: 1
-  max_new_tokens: 64
+  questions_per_cat: 5
+  max_new_tokens: 512
   prefill_warmup: false
   skip_categories: [mt_bench]
-output: {label: cdel_tm_off, dir: output/cdel_tm_off}
+output: {label: q5_512_boot_off, dir: output/q5_512_boot_off}

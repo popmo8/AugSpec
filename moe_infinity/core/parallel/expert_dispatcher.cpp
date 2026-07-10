@@ -254,12 +254,9 @@ std::vector<torch::Tensor> ExpertDispatcher::GetResidentExpertWeights(
   return out;
 }
 
-std::vector<torch::Tensor> ExpertDispatcher::MergeExpertsLocal(
+std::vector<torch::Tensor> ExpertDispatcher::MergeAccumulate(
     int layer_idx, const std::vector<int>& expert_ids,
-    const std::vector<double>& weights, int gpu_id) {
-  int64_t _mg_t0 = profile_enabled_ ? _prof_now_us() : 0;
-  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
-  auto device = torch::Device(torch::kCUDA, gpu_id);
+    const std::vector<double>& weights, const torch::Device& device) {
   std::vector<torch::Tensor> acc;          // fp32 accumulators per weight matrix
   c10::ScalarType out_dtype = torch::kBFloat16;
   bool sized = false;
@@ -302,11 +299,177 @@ std::vector<torch::Tensor> ExpertDispatcher::MergeExpertsLocal(
   for (auto& a : acc) {
     if (a.defined()) out.push_back(a.to(out_dtype));
   }
+  return out;
+}
+
+std::vector<torch::Tensor> ExpertDispatcher::MergeExpertsLocal(
+    int layer_idx, const std::vector<int>& expert_ids,
+    const std::vector<double>& weights, int gpu_id) {
+  int64_t _mg_t0 = profile_enabled_ ? _prof_now_us() : 0;
+  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+  auto out = MergeAccumulate(layer_idx, expert_ids, weights,
+                             torch::Device(torch::kCUDA, gpu_id));
   if (profile_enabled_) {
     prof_.merge_us += _prof_now_us() - _mg_t0;
     prof_.merge_n += 1;
   }
   return out;
+}
+
+// ── merged-expert slots (merged_cache_plan.md C0) ───────────────────────────
+// Persistent per-(layer, slot) GPU buffers for merged draft experts. Same byte
+// ledger as the expert cache (cache_sizes_); reclaim = DISCARD (buffers freed,
+// content reconstructible by re-merge — no host backing, no D2H). Concurrency
+// follows the existing convention: Python calls these dispatch-quiescent
+// (between layers / phases); the fetch thread only touches slots via
+// TryDiscardUnpinnedSlot while a dispatch is in flight, so the two never
+// overlap. Zero slots until InitMergedSlots — existing runs are unaffected.
+
+void ExpertDispatcher::InitMergedSlots(int num_layers, int slots_per_layer) {
+  if (!merged_slots_.empty()) {
+    DLOG_WARN("InitMergedSlots: already initialised, ignoring");
+    return;
+  }
+  if (num_layers <= 0 || slots_per_layer <= 0) return;
+  merged_slots_.resize(num_layers);
+  for (auto& layer : merged_slots_) {
+    layer.resize(slots_per_layer);
+  }
+}
+
+bool ExpertDispatcher::TryDiscardUnpinnedSlot(int gpu_id) {
+  for (auto& layer : merged_slots_) {
+    for (auto& s : layer) {
+      if (s.cached && !s.pinned) {
+        s.tensors.clear();                    // frees the GPU buffers
+        cache_sizes_[gpu_id] += s.byte_size;
+        s.byte_size = 0;
+        s.cached = false;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool ExpertDispatcher::MergeExpertsToSlot(int layer_idx, int slot_idx,
+                                          const std::vector<int>& expert_ids,
+                                          const std::vector<double>& weights,
+                                          int gpu_id) {
+  int64_t _mg_t0 = profile_enabled_ ? _prof_now_us() : 0;
+  if (layer_idx < 0 ||
+      layer_idx >= static_cast<int>(merged_slots_.size())) {
+    return false;
+  }
+  if (slot_idx < 0 ||
+      slot_idx >= static_cast<int>(merged_slots_[layer_idx].size())) {
+    return false;
+  }
+  auto& slot = merged_slots_[layer_idx][slot_idx];
+  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+  auto merged = MergeAccumulate(layer_idx, expert_ids, weights,
+                                torch::Device(torch::kCUDA, gpu_id));
+  if (merged.empty()) return false;
+
+  if (slot.cached) {
+    // Rebuild in place: shapes are invariant (every expert has the same
+    // layout), so copy into the stable buffers — no allocator churn.
+    if (slot.tensors.size() != merged.size()) return false;
+    for (size_t i = 0; i < merged.size(); ++i) {
+      slot.tensors[i].copy_(merged[i]);
+    }
+  } else {
+    int64_t need = 0;
+    for (auto& t : merged) need += t.numel() * t.element_size();
+    // Make room on the shared ledger: unpinned slots first (cheap discard),
+    // then originals via the pin-aware LFU. Calls are dispatch-quiescent, so
+    // a locked candidate is a finishing exec — retry briefly; bail out after
+    // 10 s instead of hanging (caller treats it as a failed merge).
+    int retries = 0;
+    while (cache_sizes_[gpu_id] < need) {
+      if (TryDiscardUnpinnedSlot(gpu_id)) continue;
+      ExpertNodePtr victim = FindExpertEvict(gpu_id);
+      if (victim == nullptr) {
+        if (++retries > 5000) {          // 5000 × 2 ms = 10 s
+          DLOG_WARN("MergeExpertsToSlot: no evictable room after 10s, "
+                    "layer ", layer_idx, " slot ", slot_idx, " need ", need);
+          return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        continue;
+      }
+      auto node = victim->node;
+      node->SetDevice(node->default_host);
+      cache_sizes_[gpu_id] += node->byte_size;
+      uint64_t key = (static_cast<uint64_t>(victim->layer_idx) << 32) +
+                     victim->expert_idx;
+      cached_experts_[gpu_id].erase(key);
+      node->mutex.unlock();   // FindExpertEvict returned it locked
+    }
+    slot.tensors = std::move(merged);
+    slot.byte_size = need;
+    slot.cached = true;
+    cache_sizes_[gpu_id] -= need;
+  }
+  if (profile_enabled_) {
+    prof_.merge_us += _prof_now_us() - _mg_t0;
+    prof_.merge_n += 1;
+  }
+  return true;
+}
+
+std::vector<torch::Tensor> ExpertDispatcher::GetMergedSlot(int layer_idx,
+                                                           int slot_idx,
+                                                           int gpu_id) {
+  std::vector<torch::Tensor> out;
+  (void)gpu_id;
+  if (layer_idx < 0 ||
+      layer_idx >= static_cast<int>(merged_slots_.size())) {
+    return out;
+  }
+  if (slot_idx < 0 ||
+      slot_idx >= static_cast<int>(merged_slots_[layer_idx].size())) {
+    return out;
+  }
+  auto& slot = merged_slots_[layer_idx][slot_idx];
+  if (!slot.cached) return out;             // probe miss
+  return slot.tensors;                      // refs valid while pinned
+}
+
+void ExpertDispatcher::SetMergedSlotPinned(int layer_idx,
+                                           const std::vector<int>& slot_ids,
+                                           int gpu_id) {
+  if (layer_idx < 0 ||
+      layer_idx >= static_cast<int>(merged_slots_.size())) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+  for (auto& s : merged_slots_[layer_idx]) s.pinned = false;
+  for (int sid : slot_ids) {
+    if (sid >= 0 &&
+        sid < static_cast<int>(merged_slots_[layer_idx].size())) {
+      merged_slots_[layer_idx][sid].pinned = true;
+    }
+  }
+}
+
+void ExpertDispatcher::DiscardMergedSlot(int layer_idx, int slot_idx,
+                                         int gpu_id) {
+  if (layer_idx < 0 ||
+      layer_idx >= static_cast<int>(merged_slots_.size())) {
+    return;
+  }
+  if (slot_idx < 0 ||
+      slot_idx >= static_cast<int>(merged_slots_[layer_idx].size())) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+  auto& slot = merged_slots_[layer_idx][slot_idx];
+  if (!slot.cached) return;
+  slot.tensors.clear();
+  cache_sizes_[gpu_id] += slot.byte_size;
+  slot.byte_size = 0;
+  slot.cached = false;
 }
 
 torch::Tensor ExpertDispatcher::DispatchMergedLocal(
@@ -577,6 +740,14 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
     // cache-full fetch (batch 1 draft steps AND batch>1 prefill/verify): the
     // old "overload" borrow (off-books slot, use-once-discard, single-slot
     // serialised, pin-blind) was removed 2026-07 — see remove_overload_plan.md.
+    // Two-tier reclaim (merged_cache_plan.md §2.2): unpinned merged slots are
+    // the cheap first victims (discard — no D2H, reconstructible); originals
+    // go second via the pin-aware LFU below. No-op until slots exist (C1).
+    if (!cache_hit && cache_sizes_[gpu_id] < expert_node->node->byte_size) {
+      while (cache_sizes_[gpu_id] < expert_node->node->byte_size &&
+             TryDiscardUnpinnedSlot(gpu_id)) {
+      }
+    }
     if (!cache_hit && cache_sizes_[gpu_id] < expert_node->node->byte_size) {
       // find the expert in gpu and min incache_visit_count
       bool all_pinned = false;

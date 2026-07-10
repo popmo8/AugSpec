@@ -99,6 +99,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_resident_expert_weights",
            &ExpertDispatcher::GetResidentExpertWeights)
       .def("merge_experts_local", &ExpertDispatcher::MergeExpertsLocal)
+      .def("init_merged_slots", &ExpertDispatcher::InitMergedSlots)
+      .def("merge_experts_to_slot", &ExpertDispatcher::MergeExpertsToSlot)
+      .def("get_merged_slot", &ExpertDispatcher::GetMergedSlot)
+      .def("set_merged_slot_pinned", &ExpertDispatcher::SetMergedSlotPinned)
+      .def("discard_merged_slot", &ExpertDispatcher::DiscardMergedSlot)
       .def("dispatch_merged_local", &ExpertDispatcher::DispatchMergedLocal)
       .def("dispatch_bmm", &ExpertDispatcher::DispatchBmm)
       .def("set_profile_phase", &ExpertDispatcher::SetProfilePhase)

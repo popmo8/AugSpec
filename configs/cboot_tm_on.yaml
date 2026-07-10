@@ -21,4 +21,5 @@ run:
   questions_per_cat: 1
   max_new_tokens: 64
   prefill_warmup: true
+  skip_categories: [mt_bench]
 output: {label: cboot_tm_on, dir: output/cboot_tm_on}

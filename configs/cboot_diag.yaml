@@ -1,6 +1,5 @@
-# C-DEL 驗證 A(merged_cache_plan.md §2.5)— liveness only(qpc=1/mnt=64):
-# prefill_warmup 關 = 舊 fallback 路徑 + EvictLayer 刪除後的 demand 驅逐,
-# 確認能跑完、不 hang。非 AccR/TPS 對照跑。
+# C-BOOT 診斷 — 同 cboot_tm_on(warmup on,AccR 崩潰重現)+ emit_tokens_csv,
+# 供 token 級移位分析(draft[i] vs real[i±1])。
 model:
   id: Qwen/Qwen3-30B-A3B-Base
   backend: offload
@@ -20,6 +19,7 @@ run:
   T: 5
   questions_per_cat: 1
   max_new_tokens: 64
-  prefill_warmup: false
+  prefill_warmup: true
   skip_categories: [mt_bench]
-output: {label: cdel_tm_off, dir: output/cdel_tm_off}
+  emit_tokens_csv: true
+output: {label: cboot_diag, dir: output/cboot_diag}

@@ -13,5 +13,5 @@ draft:
   name: specmoe
   args: {N: 16, route_top_k: 8, pin: true}
   early_pin: 2
-run: {T: 5, questions_per_cat: 1, max_new_tokens: 64}
+run: {T: 5, questions_per_cat: 1, max_new_tokens: 64, skip_categories: [mt_bench]}
 output: {label: smoke_noov_specmoe, dir: output/smoke_noov_specmoe}

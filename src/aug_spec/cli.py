@@ -584,7 +584,20 @@ def main(argv: Optional[list] = None) -> int:
                   file=sys.stderr)
             return 2
         cfg = RunConfig.from_yaml(args.config)
-        run_experiment(cfg)
+        try:
+            run_experiment(cfg)
+        except BaseException:
+            import traceback
+            traceback.print_exc()
+            if cfg.backend == "offload":
+                # Same shutdown hang as the success path below — a CRASHED
+                # offload run must also force-exit, or the exception turns
+                # into a walltime burn (observed: jobs 258082/258090 sat at
+                # a traceback until TIMEOUT).
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
+            raise
         if cfg.backend == "offload":
             # moe_infinity's C++ thread pool hangs on interpreter shutdown;
             # force-exit after outputs are written (same as examples/*.py).

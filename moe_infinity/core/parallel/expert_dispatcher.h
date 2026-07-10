@@ -111,6 +111,26 @@ class ExpertDispatcher : public base::noncopyable {
       int layer_idx, const std::vector<int>& expert_ids,
       const std::vector<double>& weights, int gpu_id);
 
+  // ── merged-expert slots (merged_cache_plan.md C0) ─────────────────────────
+  // Persistent per-(layer, slot) GPU buffers for merged draft experts, on the
+  // SAME byte ledger as the expert cache (cache_sizes_). Reclaim = DISCARD
+  // (buffers freed; content reconstructible by re-merge — no host backing).
+  // Python owns ALL policy (which member set lives in which slot, retention,
+  // pin choice); C++ only stores, merges-into, pins and discards. Concurrency
+  // convention as the merge/read APIs above: Python calls dispatch-quiescent;
+  // the fetch thread touches slots only via the two-tier reclaim while a
+  // dispatch is in flight. Zero slots until InitMergedSlots → existing runs
+  // are byte-for-byte unaffected.
+  void InitMergedSlots(int num_layers, int slots_per_layer);
+  bool MergeExpertsToSlot(int layer_idx, int slot_idx,
+                          const std::vector<int>& expert_ids,
+                          const std::vector<double>& weights, int gpu_id);
+  std::vector<torch::Tensor> GetMergedSlot(int layer_idx, int slot_idx,
+                                           int gpu_id);   // empty = probe miss
+  void SetMergedSlotPinned(int layer_idx, const std::vector<int>& slot_ids,
+                           int gpu_id);   // replaces the layer's slot pins
+  void DiscardMergedSlot(int layer_idx, int slot_idx, int gpu_id);
+
   // aug_spec: run K merged dense draft experts through the SAME MoEMLP::forward
   // kernel the archer dispatch uses, so the merged-expert draft and the SpecMoE
   // (substitute) draft share one expert-execution engine — the comparison then
@@ -183,6 +203,14 @@ class ExpertDispatcher : public base::noncopyable {
                   int gpu_id);
 
   ExpertNodePtr FindExpertEvict(int gpu_id, bool* all_pinned = nullptr);
+  // Shared fp32 accumulation body of MergeExpertsLocal / MergeExpertsToSlot.
+  std::vector<torch::Tensor> MergeAccumulate(
+      int layer_idx, const std::vector<int>& expert_ids,
+      const std::vector<double>& weights, const torch::Device& device);
+  // Two-tier reclaim, stage 1: discard one unpinned merged slot (cheap — no
+  // D2H, reconstructible). Returns false when none exists (→ caller falls to
+  // the pin-aware LFU over originals).
+  bool TryDiscardUnpinnedSlot(int gpu_id);
 
  private:
   std::vector<std::unique_ptr<base::Thread>> threads_;
@@ -226,6 +254,15 @@ class ExpertDispatcher : public base::noncopyable {
   std::vector<int64_t> cache_sizes_;
   std::vector<std::unordered_set<uint64_t>> cached_experts_;
   std::vector<std::unordered_set<uint64_t>> pinned_;   // specmoe kept-N (no evict)
+  // Merged-expert slot table [layer][slot] (merged_cache_plan.md C0). Sized by
+  // InitMergedSlots; empty by default. See the public API block for semantics.
+  struct MergedSlot {
+    std::vector<torch::Tensor> tensors;   // persistent GPU buffers
+    int64_t byte_size = 0;
+    bool cached = false;   // currently holds pool bytes
+    bool pinned = false;   // draft working set / protected history (no evict)
+  };
+  std::vector<std::vector<MergedSlot>> merged_slots_;
   // Per-GPU in-flight exec count (pop -> OutputFunc returned). Part of the
   // pinned-starvation guard in GPUFetchFunc: all-pinned cache + drained exec
   // pipeline = provable deadlock (remove_overload_plan.md §5).

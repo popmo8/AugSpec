@@ -20,7 +20,9 @@
 
 from __future__ import annotations
 
+import copy
 import csv
+import functools
 import json
 import random
 import time
@@ -166,7 +168,8 @@ def _locked_assist_patch(T: int,
                          lm_topk: int,
                          on_verify: Callable[[CycleStats], None],
                          prefill_warmup: bool = False,
-                         on_prefill_warmup: Optional[Callable[[], None]] = None):
+                         on_prefill_warmup: Optional[Callable[[], None]] = None,
+                         target_model=None):
     """Monkey-patch AssistedCandidateGenerator to:
       - lock `num_assistant_tokens = T` (defeat HF's heuristic ±),
       - clip if HF ever returns more than T candidates,
@@ -183,9 +186,20 @@ def _locked_assist_patch(T: int,
         warmup round's target forward (from `update_candidate_strategy`), so
         backends without the offload-merge engine (hf) can build the draft
         cache there.
+      - KV copy (needs `target_model`): the first REAL candidate round seeds
+        the assistant's cache with a COPY of the target's warmup-prefill KV.
+        Target and draft share weights, so the target's prompt KV is the best
+        possible draft context (real-routing hidden states); without it the
+        assistant would re-encode the whole prompt through the merged/
+        substitute draft routing, and the degraded context collapses
+        acceptance (0.5 → 0.01 observed, jobs 258368/258378). The target's
+        cache is stashed by a transparent `target_model.forward` wrapper
+        (assistant calls are excluded via an in-draft flag).
     """
     from transformers.generation.candidate_generator import (
         AssistedCandidateGenerator,
+        _prepare_attention_mask,
+        _prepare_token_type_ids,
     )
 
     state: Dict[str, Any] = {
@@ -193,6 +207,8 @@ def _locked_assist_patch(T: int,
         "draft_tokens": None,        # List[int]
         "draft_top_vals": None,      # [T, K] fp16 cpu
         "draft_top_ids": None,       # [T, K] int64 cpu
+        "target_past": None,         # target's live KV cache (KV-copy source)
+        "in_draft_call": False,      # True inside orig_get (assistant forwards)
     }
 
     orig_get = AssistedCandidateGenerator.get_candidates
@@ -211,7 +227,35 @@ def _locked_assist_patch(T: int,
             state["draft_top_vals"] = None
             state["draft_top_ids"] = None
             return input_ids, None
-        cand, lg = orig_get(self, input_ids)
+        if prefill_warmup and not getattr(self, "_aug_kv_injected", False):
+            # KV copy (merged_cache_plan.md §2.4): seed the assistant with a
+            # COPY of the target's warmup-prefill KV — the draft then starts
+            # speculating directly instead of re-encoding the whole prompt
+            # through the merged/substitute routing (degraded context ⇒
+            # acceptance collapse, 0.5 → 0.01). deepcopy keeps the two caches
+            # independent (both sides crop/append their own).
+            self._aug_kv_injected = True
+            tgt = state.get("target_past")
+            if tgt is not None:
+                self.assistant_kwargs["past_key_values"] = copy.deepcopy(tgt)
+        if prefill_warmup and not getattr(self, "_aug_mask_synced", False):
+            # Belt-and-braces (also the fallback when target_past was never
+            # stashed): the skipped warmup round let the target grow input_ids
+            # past the assistant_kwargs snapshot taken at generator init. With
+            # a past injected above, orig_get's _update_past_and_masks does
+            # this itself; without one, HF's no-past first call would see a
+            # stale, one-short attention mask (rotary length mismatch).
+            self._aug_mask_synced = True
+            self.assistant_kwargs = _prepare_attention_mask(
+                self.assistant_kwargs, input_ids.shape[-1],
+                self.assistant_model.config.is_encoder_decoder)
+            self.assistant_kwargs = _prepare_token_type_ids(
+                self.assistant_kwargs, input_ids.shape[-1])
+        state["in_draft_call"] = True
+        try:
+            cand, lg = orig_get(self, input_ids)
+        finally:
+            state["in_draft_call"] = False
         target_len = input_ids.shape[1] + T
         if cand.shape[1] > target_len:
             cand = cand[:, :target_len]
@@ -296,6 +340,24 @@ def _locked_assist_patch(T: int,
         self.num_assistant_tokens = T
         return result
 
+    # KV-copy source: transparently stash the TARGET's live cache from its
+    # forward kwargs. Target and assistant are the SAME module here, so
+    # assistant forwards (inside orig_get) are excluded via `in_draft_call`.
+    wrapped_forward = False
+    if prefill_warmup and target_model is not None:
+        orig_forward = target_model.forward
+
+        @functools.wraps(orig_forward)
+        def stash_forward(*fargs, **fkwargs):
+            if not state["in_draft_call"]:
+                pkv = fkwargs.get("past_key_values")
+                if pkv is not None:
+                    state["target_past"] = pkv
+            return orig_forward(*fargs, **fkwargs)
+
+        target_model.forward = stash_forward
+        wrapped_forward = True
+
     AssistedCandidateGenerator.get_candidates = patched_get
     AssistedCandidateGenerator.update_candidate_strategy = patched_upd
     try:
@@ -303,6 +365,8 @@ def _locked_assist_patch(T: int,
     finally:
         AssistedCandidateGenerator.get_candidates = orig_get
         AssistedCandidateGenerator.update_candidate_strategy = orig_upd
+        if wrapped_forward:
+            target_model.forward = orig_forward
 
 
 # =============================================================================
@@ -538,6 +602,7 @@ def run_specbench(
                 num_speculative, lm_topk, lambda cs: None,
                 prefill_warmup=prefill_warmup,
                 on_prefill_warmup=on_prefill_warmup,
+                target_model=target_model,
             ):
                 target_model.generate(
                     **warm_in, max_new_tokens=8, do_sample=False,
@@ -590,6 +655,7 @@ def run_specbench(
                     num_speculative, lm_topk, _on_verify,
                     prefill_warmup=prefill_warmup,
                     on_prefill_warmup=on_prefill_warmup,
+                    target_model=target_model,
                 ):
                     out = target_model.generate(
                         **inputs,
