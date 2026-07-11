@@ -40,7 +40,11 @@ class Controller:
                  merge_during_verify: bool = False,
                  flush_on_draft_end: bool = False,
                  merge_overlap: bool = False,
-                 prefill_warmup: bool = True):
+                 prefill_warmup: bool = True,
+                 cache_mode: bool = False,
+                 slots_per_layer: int = 0,
+                 expert_bytes: int = 0,
+                 singleton_pin_budget=None):
         self.model = model
         self.adapter = adapter
         self.draft = draft
@@ -75,7 +79,10 @@ class Controller:
             from aug_spec.runtime.offload_merge import OffloadMergeEngine
             self.merge_engine = OffloadMergeEngine(
                 adapter, model, during_verify=merge_during_verify,
-                flush=flush_on_draft_end, overlap=merge_overlap)
+                flush=flush_on_draft_end, overlap=merge_overlap,
+                cache_mode=cache_mode, slots_per_layer=slots_per_layer,
+                expert_bytes=expert_bytes,
+                singleton_pin_budget=singleton_pin_budget)
             self.merge_engine.controller = self   # on_verify_layer → draft/cache
             self.merge_engine.attach(self.blocks)
 

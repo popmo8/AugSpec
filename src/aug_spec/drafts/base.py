@@ -400,7 +400,17 @@ class ScoreBasedAvgDraft(DraftStrategy):
         weights = self._postprocess_weights(weights)
         self._maybe_dump_active_set(li, weights, total)
         if self.K > 1:
-            draft_cache[li] = self._cluster_and_build(adapter, block, weights, li)
+            # C1 (merged_cache_plan.md): in cache mode the merged-cache policy
+            # builds the layer (adopt-first + slot merges + working-set pins);
+            # otherwise the legacy per-cycle rebuild below.
+            engine = getattr(block, "_merge_engine", None)
+            mc = getattr(engine, "merged_cache", None) if engine else None
+            if mc is not None:
+                draft_cache[li] = mc.build_layer(li, block, weights, self,
+                                                 adapter)
+            else:
+                draft_cache[li] = self._cluster_and_build(adapter, block,
+                                                          weights, li)
         else:
             draft_cache[li] = self._build_one(adapter, block, weights)
 

@@ -23,6 +23,14 @@ def stack_swiglu_weights(cache: Dict[str, Any],
     the merged weights."""
     stk = cache.get("_bmm_stack")
     if stk is None:
+        devs = {t.device for e in experts for t in
+                (e[gate_key], e[up_key], e[down_key])}
+        if len(devs) > 1:
+            detail = "; ".join(
+                f"[{i}] g={e[gate_key].device} u={e[up_key].device} "
+                f"d={e[down_key].device}" for i, e in enumerate(experts))
+            raise RuntimeError(
+                f"stack_swiglu_weights: mixed devices {devs} — {detail}")
         gate = torch.stack([e[gate_key] for e in experts]).transpose(1, 2)
         up = torch.stack([e[up_key] for e in experts]).transpose(1, 2)
         down = torch.stack([e[down_key] for e in experts]).transpose(1, 2)

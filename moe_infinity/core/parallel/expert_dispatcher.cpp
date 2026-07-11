@@ -168,6 +168,19 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
   if (expert_node->node->device.is_cuda()) {
     args.gpu_id = expert_node->node->device.index();
 
+    // singleton_verify_hit (merged_cache_plan.md §4.3): a verify-phase request
+    // served by a resident PINNED expert = the dual-identity payoff — the
+    // draft working-set pin elided this verify fetch. Draft-phase requests
+    // are excluded via profile_phase_ (1 = draft).
+    if (profile_enabled_ && profile_phase_.load() == 0) {
+      uint64_t key = (static_cast<uint64_t>(args.layer_idx) << 32) +
+                     args.expert_idx;
+      if (pinned_[args.gpu_id].count(key) > 0) {
+        prof_.pinned_hit_n += 1;
+        prof_.pinned_hit_bytes += expert_node->node->byte_size;
+      }
+    }
+
     auto original_device = (args.remote) ? CPU_DEVICE : hidden_states_.device();
 
     ExecArgs exec_args;
@@ -337,21 +350,6 @@ void ExpertDispatcher::InitMergedSlots(int num_layers, int slots_per_layer) {
   }
 }
 
-bool ExpertDispatcher::TryDiscardUnpinnedSlot(int gpu_id) {
-  for (auto& layer : merged_slots_) {
-    for (auto& s : layer) {
-      if (s.cached && !s.pinned) {
-        s.tensors.clear();                    // frees the GPU buffers
-        cache_sizes_[gpu_id] += s.byte_size;
-        s.byte_size = 0;
-        s.cached = false;
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 bool ExpertDispatcher::MergeExpertsToSlot(int layer_idx, int slot_idx,
                                           const std::vector<int>& expert_ids,
                                           const std::vector<double>& weights,
@@ -371,6 +369,11 @@ bool ExpertDispatcher::MergeExpertsToSlot(int layer_idx, int slot_idx,
                                 torch::Device(torch::kCUDA, gpu_id));
   if (merged.empty()) return false;
 
+  // Slots are TORCH-allocator memory inside the slot budget the cli carved
+  // out of `usable` at load (pool = usable − S×L×expert). They never touch
+  // the archer ledger (cache_sizes_): the 2026-07-10 hang was exactly this —
+  // ghost debits drained the ledger, the fetch thread evicted every unpinned
+  // original and then live-locked waiting for room that physically existed.
   if (slot.cached) {
     // Rebuild in place: shapes are invariant (every expert has the same
     // layout), so copy into the stable buffers — no allocator churn.
@@ -381,35 +384,9 @@ bool ExpertDispatcher::MergeExpertsToSlot(int layer_idx, int slot_idx,
   } else {
     int64_t need = 0;
     for (auto& t : merged) need += t.numel() * t.element_size();
-    // Make room on the shared ledger: unpinned slots first (cheap discard),
-    // then originals via the pin-aware LFU. Calls are dispatch-quiescent, so
-    // a locked candidate is a finishing exec — retry briefly; bail out after
-    // 10 s instead of hanging (caller treats it as a failed merge).
-    int retries = 0;
-    while (cache_sizes_[gpu_id] < need) {
-      if (TryDiscardUnpinnedSlot(gpu_id)) continue;
-      ExpertNodePtr victim = FindExpertEvict(gpu_id);
-      if (victim == nullptr) {
-        if (++retries > 5000) {          // 5000 × 2 ms = 10 s
-          DLOG_WARN("MergeExpertsToSlot: no evictable room after 10s, "
-                    "layer ", layer_idx, " slot ", slot_idx, " need ", need);
-          return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        continue;
-      }
-      auto node = victim->node;
-      node->SetDevice(node->default_host);
-      cache_sizes_[gpu_id] += node->byte_size;
-      uint64_t key = (static_cast<uint64_t>(victim->layer_idx) << 32) +
-                     victim->expert_idx;
-      cached_experts_[gpu_id].erase(key);
-      node->mutex.unlock();   // FindExpertEvict returned it locked
-    }
     slot.tensors = std::move(merged);
     slot.byte_size = need;
     slot.cached = true;
-    cache_sizes_[gpu_id] -= need;
   }
   if (profile_enabled_) {
     prof_.merge_us += _prof_now_us() - _mg_t0;
@@ -466,8 +443,7 @@ void ExpertDispatcher::DiscardMergedSlot(int layer_idx, int slot_idx,
   std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
   auto& slot = merged_slots_[layer_idx][slot_idx];
   if (!slot.cached) return;
-  slot.tensors.clear();
-  cache_sizes_[gpu_id] += slot.byte_size;
+  slot.tensors.clear();   // frees torch memory (slot budget, not the ledger)
   slot.byte_size = 0;
   slot.cached = false;
 }
@@ -576,6 +552,7 @@ void ExpertDispatcher::ResetProfile() {
   prof_.verify_fetch_n = 0; prof_.verify_fetch_us = 0; prof_.verify_fetch_bytes = 0;
   prof_.draft_fetch_n = 0; prof_.draft_fetch_us = 0; prof_.draft_fetch_bytes = 0;
   prof_.evict_n = 0; prof_.evict_us = 0;
+  prof_.pinned_hit_n = 0; prof_.pinned_hit_bytes = 0;
   prof_.enqueue_wait_n = 0; prof_.enqueue_wait_us = 0;
   prof_.forward_n = 0; prof_.forward_us = 0;
   prof_.merge_n = 0; prof_.merge_us = 0;
@@ -592,6 +569,8 @@ std::map<std::string, int64_t> ExpertDispatcher::DumpProfile() {
       {"draft_fetch_bytes", prof_.draft_fetch_bytes.load()},
       {"evict_n", prof_.evict_n.load()},
       {"evict_us", prof_.evict_us.load()},
+      {"pinned_hit_n", prof_.pinned_hit_n.load()},
+      {"pinned_hit_bytes", prof_.pinned_hit_bytes.load()},
       {"enqueue_wait_n", prof_.enqueue_wait_n.load()},
       {"enqueue_wait_us", prof_.enqueue_wait_us.load()},
       {"forward_n", prof_.forward_n.load()},
@@ -654,6 +633,7 @@ ExpertNodePtr ExpertDispatcher::FindExpertEvict(int gpu_id, bool* all_pinned) {
   uint64_t min_visit_count = INT_MAX;
   ExpertNodePtr evict_expert_node = nullptr;
   size_t n_unpinned = 0;   // cached keys a pin does NOT protect
+  std::vector<uint64_t> stale;   // ledger says cached, node is NOT on GPU
 
   for (auto& key : cached_experts_[gpu_id]) {
     // aug_spec / specmoe_pin_plan.md: never evict a pinned expert (the SpecMoE
@@ -667,7 +647,17 @@ ExpertNodePtr ExpertDispatcher::FindExpertEvict(int gpu_id, bool* all_pinned) {
     auto expert_idx = key & 0xFFFFFFFF;
     auto node = experts_[expert_idx][layer_idx]->node;
     if (node == nullptr) continue;
-    if (node->device.is_cuda() && node->incache_visit_count < min_visit_count &&
+    // Zombie reap (2026-07-10): archer's prefetcher relocates nodes without
+    // touching this ledger, leaving keys whose node is no longer on GPU.
+    // They hold ledger bytes forever and starve the evict loop (job 258694:
+    // 231 stale keys locked up 2.2GB). Reap them here — the scan already
+    // visits every key — and refund the ledger after the loop.
+    if (!node->device.is_cuda()) {
+      stale.push_back(key);
+      --n_unpinned;
+      continue;
+    }
+    if (node->incache_visit_count < min_visit_count &&
         node->mutex.try_lock()) {
       // Keep the chosen victim LOCKED through the actual eviction (the caller
       // unlocks after SetDevice) so it can't be re-acquired + computed between
@@ -678,6 +668,12 @@ ExpertNodePtr ExpertDispatcher::FindExpertEvict(int gpu_id, bool* all_pinned) {
       evict_expert_node = experts_[expert_idx][layer_idx];
       min_visit_count = node->incache_visit_count;
     }
+  }
+  for (auto key : stale) {
+    auto expert_idx = key & 0xFFFFFFFF;
+    auto layer_idx = key >> 32;
+    cached_experts_[gpu_id].erase(key);
+    cache_sizes_[gpu_id] += experts_[expert_idx][layer_idx]->node->byte_size;
   }
   // Starvation telemetry (remove_overload_plan.md §5): a nullptr because every
   // unpinned candidate is transiently locked resolves itself once an exec
@@ -740,14 +736,6 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
     // cache-full fetch (batch 1 draft steps AND batch>1 prefill/verify): the
     // old "overload" borrow (off-books slot, use-once-discard, single-slot
     // serialised, pin-blind) was removed 2026-07 — see remove_overload_plan.md.
-    // Two-tier reclaim (merged_cache_plan.md §2.2): unpinned merged slots are
-    // the cheap first victims (discard — no D2H, reconstructible); originals
-    // go second via the pin-aware LFU below. No-op until slots exist (C1).
-    if (!cache_hit && cache_sizes_[gpu_id] < expert_node->node->byte_size) {
-      while (cache_sizes_[gpu_id] < expert_node->node->byte_size &&
-             TryDiscardUnpinnedSlot(gpu_id)) {
-      }
-    }
     if (!cache_hit && cache_sizes_[gpu_id] < expert_node->node->byte_size) {
       // find the expert in gpu and min incache_visit_count
       bool all_pinned = false;
@@ -786,8 +774,11 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
       // loop also replaces the old single-retry that could fall through with
       // a null node into the DLOG_FATAL below.
       constexpr int64_t kStarvationFatalUs = 10 * 1000 * 1000;   // 10 s
+      constexpr int64_t kAnyWaitFatalUs = 60 * 1000 * 1000;      // 60 s
       int64_t starved_since_us = -1;   // first us of CONTINUOUS pinned+drained
       int64_t last_warn_us = 0;
+      int64_t wait_since_us = -1;      // first us of THIS whole wait
+      int64_t last_forensic_us = 0;
       while (evict_expert_node == nullptr) {
         {
           std::unique_lock<std::mutex> lock(cache_mutex_[gpu_id]);
@@ -795,6 +786,44 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
         }
         evict_expert_node = FindExpertEvict(gpu_id, &all_pinned);
         if (evict_expert_node != nullptr) break;
+        // Blind-spot guard (2026-07-10): the all-pinned+drained fatal below
+        // misses live-locks where unpinned candidates exist but are stale
+        // (cached key, node not on GPU) or locked forever. ANY evict wait
+        // over 10 s dumps forensics; over 60 s is fatal — no silent hangs.
+        {
+          int64_t now_any = _prof_now_us();
+          if (wait_since_us < 0) {
+            wait_since_us = now_any;
+            last_forensic_us = now_any;
+          }
+          if (now_any - last_forensic_us >= 10 * 1000 * 1000) {
+            last_forensic_us = now_any;
+            size_t n_pin = 0, n_stale = 0, n_locked = 0;
+            for (auto& k : cached_experts_[gpu_id]) {
+              if (pinned_[gpu_id].count(k) > 0) { ++n_pin; continue; }
+              int64_t e2 = static_cast<int64_t>(k & 0xFFFFFFFF);
+              int64_t l2 = static_cast<int64_t>(k >> 32);
+              if (e2 < 0 || e2 >= static_cast<int64_t>(experts_.size())) {
+                ++n_stale; continue;
+              }
+              auto n2 = experts_[e2][l2] ? experts_[e2][l2]->node : nullptr;
+              if (n2 == nullptr || !n2->device.is_cuda()) { ++n_stale; continue; }
+              if (!n2->mutex.try_lock()) { ++n_locked; continue; }
+              n2->mutex.unlock();
+            }
+            DLOG_WARN("GPUFetchFunc: evict wait ",
+                      (now_any - wait_since_us) / 1000000, "s — cached ",
+                      cached_experts_[gpu_id].size(), " pinned ", n_pin,
+                      " stale ", n_stale, " locked ", n_locked,
+                      " cache_sizes ", cache_sizes_[gpu_id], " need ",
+                      expert_node->node->byte_size);
+          }
+          if (now_any - wait_since_us >= kAnyWaitFatalUs) {
+            DLOG_FATAL("GPUFetchFunc: evict starvation >60s (forensics "
+                       "above). gpu_id ", gpu_id, " layer_idx ", layer_idx,
+                       " expert_idx ", expert_idx, ". Aborting run.");
+          }
+        }
         bool drained = all_pinned && exec_active_[gpu_id].load() == 0 &&
                        exec_queue_[gpu_id].Empty();
         if (!drained) {
@@ -861,9 +890,14 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
       evict_node->mutex.unlock();
     }
 
-    cache_sizes_[gpu_id] -= expert_node->node->byte_size;
+    // Debit the ledger only on a REAL insert: a zombie key (prefetcher moved
+    // the node out without touching the ledger) being re-fetched would
+    // otherwise be double-debited every relocation cycle — ~3GB leaked in
+    // job 258694.
     uint64_t key = (layer_idx << 32) + expert_idx;
-    cached_experts_[gpu_id].insert(key);
+    if (cached_experts_[gpu_id].insert(key).second) {
+      cache_sizes_[gpu_id] -= expert_node->node->byte_size;
+    }
 
     int64_t _ft_t0 = profile_enabled_ ? _prof_now_us() : 0;
     expert_node->node->SetDevice(device, true, stream);

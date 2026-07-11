@@ -58,7 +58,7 @@ from aug_spec.drafts import (
     ScoreBasedAvgDraft, SpecMoeDraft, get_draft, get_draft_class)
 from aug_spec.runtime.loader import (
     compute_merged_bytes, compute_model_vram_bytes, free_model,
-    get_peak_vram_gb, load_model, load_offload,
+    compute_expert_geometry, get_peak_vram_gb, load_model, load_offload,
 )
 
 from aug_spec.runtime.phase import shared_model_phase_patch, specbench_callbacks
@@ -275,6 +275,21 @@ def _dump_profile(controller) -> None:
     print(f"  fetched {gb:.2f} GB total "
           f"(verify {p.get('verify_fetch_bytes',0)/1e9:.2f} + "
           f"draft {p.get('draft_fetch_bytes',0)/1e9:.2f})")
+    # merged_cache_plan.md §4.3 telemetry.
+    ph_n = p.get("pinned_hit_n", 0)
+    print(f"  singleton_verify_hit: {ph_n/cyc:.2f} /cyc, elided "
+          f"{p.get('pinned_hit_bytes',0)/1e9:.2f} GB "
+          f"(verify requests served by pinned residents)")
+    mc = getattr(getattr(controller, "merge_engine", None),
+                 "merged_cache", None)
+    if mc is not None:
+        tot = max(1, mc.hit_n + mc.miss_n)
+        print(f"  merged_cache: hit {mc.hit_n} / miss {mc.miss_n} "
+              f"(adopt rate {mc.hit_n/tot:.2f}), merge_elided "
+              f"{mc.elided_bytes/1e9:.2f} GB, singleton resident/slot "
+              f"{mc.singleton_pinned_n}/{mc.singleton_slot_n} "
+              f"(pin-budget denied {mc.singleton_budget_denied_n}), "
+              f"legacy-fallback {mc.fallback_n}")
     kc = getattr(getattr(controller, "draft", None), "kept_changed", None)
     if kc:
         print(f"  kept_changed: {sum(kc)/len(kc):.2f} experts/cycle "
@@ -320,6 +335,12 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     moe = None
     cpu_source = None
     usable_vram_bytes: Optional[int] = None    # VRAM budget audit/guard limit
+    # C1 cache mode (merged_cache_plan.md) — resolved in the offload budget
+    # block; False on hf / legacy / device_memory_ratio escape-hatch runs.
+    cache_mode = False
+    k_prime = 0
+    expert_bytes_v = 0
+    singleton_pin_budget = None
     if cfg.backend == "offload":
         if not cfg.offload_path:
             raise ValueError(
@@ -333,29 +354,74 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
             model_vram = compute_model_vram_bytes(
                 cfg.model_id, cfg.dtype, cfg.trust_remote_code)
             usable_vram_bytes = int(cfg.vram_budget_ratio * model_vram)
-            # Reserve the fixed merged-expert residency out of the budget so the
-            # archer pool shrinks to leave room — total (archer pool + merged)
-            # stays within 0.2x, an honest scarce-VRAM sim (verify_merge_plan.md
-            # P1/P2). Only merge drafts on the offload-merge engine hold merged.
-            merged_bytes = 0
-            if cfg.merge_offload and \
-                    get_draft_class(cfg.draft_name).holds_merged_residency:
-                K = int(cfg.draft_args.get("K", 1))
-                merged_bytes = compute_merged_bytes(
-                    cfg.model_id, K, cfg.dtype, cfg.trust_remote_code)
-            pool_bytes = usable_vram_bytes - merged_bytes
-            if pool_bytes <= 0:
-                raise ValueError(
-                    f"budget too small: merged reserve "
-                    f"{merged_bytes / 1e9:.1f}GB ≥ usable "
-                    f"{usable_vram_bytes / 1e9:.1f}GB (lower K or raise b)")
-            device_memory_ratio = pool_bytes / gpu_total
-            print(f"\n  [budget] vram_budget_ratio={cfg.vram_budget_ratio} × "
-                  f"model_vram={model_vram / 1e9:.1f}GB = "
-                  f"usable {usable_vram_bytes / 1e9:.2f}GB; "
-                  f"reserve merged {merged_bytes / 1e9:.2f}GB → "
-                  f"archer pool {pool_bytes / 1e9:.2f}GB → "
-                  f"device_memory_ratio={device_memory_ratio:.4f}")
+            wants_merged = (cfg.merge_offload and
+                            get_draft_class(cfg.draft_name)
+                            .holds_merged_residency)
+            K = int(cfg.draft_args.get("K", 1))
+            uniform_eff = (cfg.cluster_within_weight == "uniform"
+                           or os.environ.get("AUG_CLUSTER_UNIFORM") is not None)
+            # Cache mode (merged_cache_plan.md §2.6/§3): merged slots live
+            # INSIDE the pool on the C0 ledger, so the pool gets the FULL
+            # budget (auto mode, single ledger). Member-set content keys need
+            # uniform coefficients; AUG_LEGACY_MERGE is the transition escape
+            # hatch (old per-cycle rebuild + fixed reserve).
+            cache_mode = (wants_merged and K > 1 and uniform_eff
+                          and os.environ.get("AUG_LEGACY_MERGE") is None)
+            if cache_mode:
+                n_layers, expert_bytes_v = compute_expert_geometry(
+                    cfg.model_id, cfg.dtype, cfg.trust_remote_code)
+                # verify floor (§3): keep c×(per-layer max verify working set,
+                # (T+1)×top-k distinct ≈ 48 experts) forever unpinnable.
+                floor_bytes = 2 * 48 * expert_bytes_v
+                k_prime = min(K, (usable_vram_bytes - floor_bytes)
+                              // (n_layers * expert_bytes_v))
+                if k_prime < 1:
+                    raise ValueError(
+                        f"budget too small for cache mode: floor "
+                        f"{floor_bytes / 1e9:.1f}GB leaves no slot room in "
+                        f"usable {usable_vram_bytes / 1e9:.1f}GB")
+                # Single BUDGET, two arenas (2026-07-10): slots are torch
+                # memory carved out of `usable` HERE; the archer pool gets the
+                # rest. Slot bytes must never touch the archer ledger — ghost
+                # debits there drained it and live-locked the fetch thread.
+                slot_carve = k_prime * n_layers * expert_bytes_v
+                pool_bytes = usable_vram_bytes - slot_carve
+                # Resident-singleton pins are ordinary archer residents; cap
+                # their total so the floor stays unpinnable (over-budget
+                # singletons fall back to identity slots).
+                singleton_pin_budget = pool_bytes - floor_bytes
+                device_memory_ratio = pool_bytes / gpu_total
+                print(f"\n  [budget] auto cache-mode: "
+                      f"vram_budget_ratio={cfg.vram_budget_ratio} × "
+                      f"model_vram={model_vram / 1e9:.1f}GB = usable "
+                      f"{usable_vram_bytes / 1e9:.2f}GB; slot carve "
+                      f"{slot_carve / 1e9:.2f}GB (S=K′={k_prime}"
+                      + (f", K={K} capped" if k_prime < K else "")
+                      + f") → archer pool {pool_bytes / 1e9:.2f}GB; "
+                      f"verify floor {floor_bytes / 1e9:.2f}GB; singleton "
+                      f"pin budget {singleton_pin_budget / 1e9:.2f}GB → "
+                      f"device_memory_ratio={device_memory_ratio:.4f}")
+            else:
+                # Legacy: merged tensors live in the torch allocator OUTSIDE
+                # the pool ledger, so the fixed reserve keeps pool+merged
+                # within the budget (honest scarce-VRAM sim).
+                merged_bytes = 0
+                if wants_merged:
+                    merged_bytes = compute_merged_bytes(
+                        cfg.model_id, K, cfg.dtype, cfg.trust_remote_code)
+                pool_bytes = usable_vram_bytes - merged_bytes
+                if pool_bytes <= 0:
+                    raise ValueError(
+                        f"budget too small: merged reserve "
+                        f"{merged_bytes / 1e9:.1f}GB ≥ usable "
+                        f"{usable_vram_bytes / 1e9:.1f}GB (lower K or raise b)")
+                device_memory_ratio = pool_bytes / gpu_total
+                print(f"\n  [budget] vram_budget_ratio={cfg.vram_budget_ratio} × "
+                      f"model_vram={model_vram / 1e9:.1f}GB = "
+                      f"usable {usable_vram_bytes / 1e9:.2f}GB; "
+                      f"reserve merged {merged_bytes / 1e9:.2f}GB → "
+                      f"archer pool {pool_bytes / 1e9:.2f}GB → "
+                      f"device_memory_ratio={device_memory_ratio:.4f}")
         else:
             device_memory_ratio = cfg.device_memory_ratio
             usable_vram_bytes = int(device_memory_ratio * gpu_total)
@@ -406,6 +472,11 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
         draft.cluster_method = get_cluster_method(cfg.cluster_name,
                                                   **cfg.cluster_args)
         draft.within_weight = cfg.cluster_within_weight
+        # Cache-mode adaptive K′ (merged_cache_plan.md §3): draft width is
+        # capped by the slot budget after the verify floor.
+        if cache_mode and 0 < k_prime < draft.K:
+            print(f"  [budget] adaptive K′: draft.K {draft.K} → {k_prime}")
+            draft.K = k_prime
     print(f"  Resolved   : draft={cfg.draft_name}{draft_args} "
           f"cluster={cfg.cluster_name} within_weight={cfg.cluster_within_weight}")
 
@@ -415,7 +486,11 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
                             merge_during_verify=cfg.merge_during_verify,
                             flush_on_draft_end=cfg.flush_on_draft_end,
                             merge_overlap=cfg.merge_overlap,
-                            prefill_warmup=cfg.prefill_warmup)
+                            prefill_warmup=cfg.prefill_warmup,
+                            cache_mode=cache_mode,
+                            slots_per_layer=k_prime,
+                            expert_bytes=expert_bytes_v,
+                            singleton_pin_budget=singleton_pin_budget)
 
     # One-time, model-derived precomputation (e.g. SpecMoE expert distances).
     draft.prepare(adapter, controller.blocks)
@@ -575,6 +650,13 @@ def _make_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list] = None) -> int:
+    # AUG_HANG_DEBUG=<sec>: dump every thread's Python stack to stderr every
+    # <sec> seconds — locates silent hangs (e.g. a pybind call that never
+    # returns shows up as the last Python frame). Diagnostic-only env.
+    if os.environ.get("AUG_HANG_DEBUG"):
+        import faulthandler
+        faulthandler.dump_traceback_later(
+            int(os.environ["AUG_HANG_DEBUG"]), repeat=True, exit=False)
     parser = _make_parser()
     args = parser.parse_args(argv)
 

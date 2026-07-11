@@ -112,9 +112,12 @@ class ExpertDispatcher : public base::noncopyable {
       const std::vector<double>& weights, int gpu_id);
 
   // ── merged-expert slots (merged_cache_plan.md C0) ─────────────────────────
-  // Persistent per-(layer, slot) GPU buffers for merged draft experts, on the
-  // SAME byte ledger as the expert cache (cache_sizes_). Reclaim = DISCARD
-  // (buffers freed; content reconstructible by re-merge — no host backing).
+  // Persistent per-(layer, slot) GPU buffers for merged draft experts. They
+  // are TORCH-allocator memory inside the slot budget the cli carves out of
+  // `usable` at load (pool = usable − S×L×expert) — they must NEVER touch the
+  // archer ledger (cache_sizes_): ghost debits there drained the ledger and
+  // live-locked the fetch thread (2026-07-10). Reclaim = DISCARD (buffers
+  // freed; content reconstructible by re-merge — no host backing).
   // Python owns ALL policy (which member set lives in which slot, retention,
   // pin choice); C++ only stores, merges-into, pins and discards. Concurrency
   // convention as the merge/read APIs above: Python calls dispatch-quiescent;
@@ -207,10 +210,6 @@ class ExpertDispatcher : public base::noncopyable {
   std::vector<torch::Tensor> MergeAccumulate(
       int layer_idx, const std::vector<int>& expert_ids,
       const std::vector<double>& weights, const torch::Device& device);
-  // Two-tier reclaim, stage 1: discard one unpinned merged slot (cheap — no
-  // D2H, reconstructible). Returns false when none exists (→ caller falls to
-  // the pin-aware LFU over originals).
-  bool TryDiscardUnpinnedSlot(int gpu_id);
 
  private:
   std::vector<std::unique_ptr<base::Thread>> threads_;
@@ -280,6 +279,10 @@ class ExpertDispatcher : public base::noncopyable {
     std::atomic<int64_t> draft_fetch_n{0}, draft_fetch_us{0},
         draft_fetch_bytes{0};
     std::atomic<int64_t> evict_n{0}, evict_us{0};
+    // singleton_verify_hit (merged_cache_plan.md §4.3): verify-phase requests
+    // served by a resident PINNED expert — the draft working-set pin elided a
+    // verify fetch (dual identity). Also counts specmoe's pinned kept-N hits.
+    std::atomic<int64_t> pinned_hit_n{0}, pinned_hit_bytes{0};
     std::atomic<int64_t> enqueue_wait_n{0}, enqueue_wait_us{0};
     std::atomic<int64_t> forward_n{0}, forward_us{0};
     std::atomic<int64_t> merge_n{0}, merge_us{0};

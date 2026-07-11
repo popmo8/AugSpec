@@ -291,6 +291,21 @@ def compute_model_vram_bytes(model_id: str, dtype: torch.dtype,
     return n_params * bytes_per
 
 
+def compute_expert_geometry(model_id: str, dtype: torch.dtype,
+                            trust_remote_code: bool = True) -> Tuple[int, int]:
+    """(num_hidden_layers, bytes of ONE expert) from config — no weights.
+    Cache-mode budget math (merged_cache_plan.md §3): verify floor and the
+    per-layer slot cap are derived from these two numbers."""
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(
+        model_id, trust_remote_code=trust_remote_code)
+    n_layers = cfg.num_hidden_layers
+    hidden = cfg.hidden_size
+    inter = getattr(cfg, "moe_intermediate_size", None) or cfg.intermediate_size
+    bytes_per = torch.finfo(dtype).bits // 8
+    return n_layers, 3 * inter * hidden * bytes_per
+
+
 def compute_merged_bytes(model_id: str, K: int, dtype: torch.dtype,
                          trust_remote_code: bool = True) -> int:
     """Fixed footprint of the cached merged draft experts = K clusters/layer ×

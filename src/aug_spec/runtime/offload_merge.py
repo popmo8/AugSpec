@@ -45,7 +45,9 @@ class OffloadMergeEngine:
     """
 
     def __init__(self, adapter, model: nn.Module, during_verify: bool = False,
-                 flush: bool = False, overlap: bool = False):
+                 flush: bool = False, overlap: bool = False,
+                 cache_mode: bool = False, slots_per_layer: int = 0,
+                 expert_bytes: int = 0, singleton_pin_budget=None):
         self.adapter = adapter
         self.model = model
         self.device = getattr(model, "device", None)
@@ -62,6 +64,15 @@ class OffloadMergeEngine:
         # the next layer's PCIe fetch (instead of a per-layer full device sync).
         # Ablation flag merge_overlap.
         self.overlap = overlap
+        # C1 (merged_cache_plan.md): the GPU merged-expert cache. Policy lives
+        # in MergedCacheIndex (Python); the C0 slot table is the mechanism.
+        # None outside cache mode → every hook below no-ops and the legacy
+        # per-cycle rebuild is used.
+        self.cache_mode = cache_mode
+        self._slots_per_layer = slots_per_layer
+        self._expert_bytes = expert_bytes
+        self._singleton_pin_budget = singleton_pin_budget
+        self.merged_cache = None
         self._merge_stream = None                 # lazily created side stream
         # Back-reference to the Controller (set by it after construction): gives
         # on_verify_layer access to the draft (per-layer merge logic) + draft_cache.
@@ -82,6 +93,23 @@ class OffloadMergeEngine:
         self.blocks = list(blocks)
         for _, block in self.blocks:
             block._merge_engine = self
+        # C1: size the C++ slot table + build the policy index. Behaviour is
+        # unchanged until the draft's refresh routes through merged_cache.
+        if self.cache_mode and self._slots_per_layer > 0:
+            disp = self._dispatcher()
+            if disp is not None and hasattr(disp, "init_merged_slots"):
+                num_layers = max(li for li, _ in self.blocks) + 1
+                disp.init_merged_slots(num_layers, self._slots_per_layer)
+                from aug_spec.runtime.merged_cache import MergedCacheIndex
+                self.merged_cache = MergedCacheIndex(
+                    self._slots_per_layer, self._expert_bytes,
+                    singleton_pin_budget=self._singleton_pin_budget)
+                print(f"  [merged_cache] enabled: layers={num_layers} "
+                      f"S={self._slots_per_layer} "
+                      f"expert_bytes={self._expert_bytes}")
+            else:
+                print("  [merged_cache] NOT enabled "
+                      f"(cache_mode={self.cache_mode}, disp={disp is not None})")
         # activation_similarity / hybrid: turn on the C++ engine's per-expert
         # output capture up front (must be on BEFORE any dispatch;
         # on_verify_layer runs post-dispatch). The dispatcher is shared across
@@ -202,6 +230,10 @@ class OffloadMergeEngine:
         if getattr(self._cluster_method(), "act_sim_prefill_only", False) \
                 and not self._capture_on:
             self._set_capture(True)
+        # C1: question boundary — drop the content index and every pin (no
+        # cross-question warm start yet; that is C2).
+        if self.merged_cache is not None:
+            self.merged_cache.reset(self.blocks, self._dispatcher())
 
     def on_draft_start(self) -> None:
         """Called at the verify→draft transition (in_draft_phase set True).

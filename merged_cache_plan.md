@@ -151,7 +151,12 @@
     順序正確;merged 驅逐 = discard,零成本)。C++ 驅逐後 Python 的
     content index 以 residency probe 對帳(probe miss = 已被淘汰)。
   - question 邊界 stats 清空 → LRU tiebreak。
-- **跨題 warm start**:reset() 不清 content index;uniform key 與題目無關。
+- ~~跨題 warm start~~ **不做(2026-07-10 定案)**:merged expert 必須反映
+  **本題** prefill 的 similarity map(拿別題 A map 分出的 pair 硬套語意
+  不乾淨);「省重 merge」的目標已由 prefill-time merge 達成(C-BOOT 空首輪
+  + P3:每層 dispatch 完就地用本層剛捕到的統計 merge,藏進 prefill 的
+  transfer 流,不存在「prefill 完再重 merge 一輪」)。reset() 照舊每題清
+  index/pins;cache 的 reuse 範圍 = 題內跨 cycle。
 
 ### 2.4 Draft forward
 - 每層 K 組 = merged slots + pinned singletons,全部 GPU resident →
@@ -202,8 +207,8 @@
     不再是 ~100% accept(fallback=target 本人)的已知語意變化,mnt=64 下
     佔比 ~1/6 被放大,mnt=512 稀釋至 <1pp(最終驗收量化)。
     per-cycle accepted-token 的 re-encode 維持 merged(歷史行為)。
-  - stale warm start(沿用上一題 partition)降級為 optional 加速器,
-    非正確性需求。
+  - stale warm start(沿用上一題 partition)**不做**(同跨題 warm start
+    的否決理由:draft 狀態一律出自本題 prefill 統計)。
   - 驗收:draft_fetch GB/題 → ~0;MAT 預期持平(首 token 由 target 生成,
     精確;僅失去單一 token 的投機加速)。
 
@@ -258,23 +263,29 @@ model:
     vram_budget_ratio: 0.2        # 總預算(不變,單一 pool 全額;無新欄位)
 ```
 
-- **單一本帳**:pool = `vram_budget_ratio × model_bytes`,所有進駐(原始
-  + merged)都記 `cache_sizes_`。
-- 硬限制只有 **verify floor**:draft 側 **pin** 總量 ≤ pool −
-  c×(單層最大 verify 工作集),c≈2(內部常數;單層工作集 ≈ 該層
-  distinct routed 上限 ≈ 48×9.44MB ≈ 0.45GB ⇒ floor 保留 ~1GB)。
-  依據:引擎是逐 expert fetch↔compute 串流,verify 需要的即時空間是
-  常數級,不是比例級(§0 決策演進 v4)。
-- 工作集(K×L ≈ 7.25GB @K=16)恆 pin;保護級 history pin 到 floor 為止;
-  一般 history unpin、自然佔滿剩餘空間,verify 壓力來了 on-demand
-  discard。**不存在固定分割,也就沒有「一邊擠一邊空」。**
-- 下限保護:`pool − K×L×expert < floor` 時 adaptive 縮 K′(budget 印表
-  明示),`K′ < 1` 才 error。
+**(2026-07-10 C1 實作修訂:「單一預算、兩個 arena」取代「單一本帳」。**
+原案讓 slot bytes 記在 archer 帳本(`cache_sizes_`),但 slot 實體是
+torch-allocator 記憶體——幽靈扣款抽乾帳本、fetch thread 活鎖(job 258694
+法醫傾印定案)。兩個 allocator 無法共用一本帳,劃帳如下:)
+
+- **載入時劃帳**:`slot carve = K′×L×expert`(torch 記憶體,draft slots);
+  `archer pool = usable − carve`(原始 expert)。總帳恆 = usable =
+  `vram_budget_ratio × model_bytes`,零新旋鈕。
+  (0.2× @K=16:usable 12.21 → carve 7.25 + pool 4.97GB。)
+- **verify floor**:singleton 的 archer pin 總量 ≤ pool − floor
+  (floor = 2×48×expert ≈ 0.91GB;超額的 singleton pin 被拒,只損失
+  verify-hit 紅利不損正確性——draft 一律由 slot 供貨,見 §4.1 修訂)。
+- **K′ adaptive**:`K′ = min(K, (usable − floor) / (L×expert))`,
+  budget 印表明示;`K′ < 1` 才 error。
+- **帳實守恆(C++ 兩則,2026-07-10)**:fetch 只在「真插入」時扣帳
+  (`insert(key).second`);`FindExpertEvict` 掃描時對殭屍條目(key 在帳、
+  node 不在 GPU——pin-blind 的 archer prefetcher 所致)當場收屍還帳。
+  歷史註記:`EvictLayer` 過去每層無條件 erase,意外扮演殭屍清道夫;
+  C-DEL 刪它之後這個**潛伏帳漏**才現形。
 - 公平性:兩法同 `vram_budget_ratio`;specmoe 的 kept-N pin 本來就在
   pool 內,對比自然公平。品質軸的 sweep 用 K(draft 寬度)。
-- 現行 `cli.py:328` 的固定 merged reserve(K×L 從 usable 扣掉、縮小
-  archer pool)在 C1 併入本語意後**移除**:pool 拿回全額,merged 佔用
-  改由同一本帳記錄。
+- TODO:vram_guard 的稽核上限尚未對齊新劃帳(audit-only,照舊會印
+  超額警告;C2 收尾時校正)。
 
 ## 4. 兩個論文機制的落點
 
@@ -293,8 +304,14 @@ model:
   probe,結果決定 hit(直接用 cache,不 fetch 不 merge)與 miss(才進下面
   的重排與 merge)——沒有 partition/probe 結果,pipeline 無事可排。
 - v1:probe(hit 跳過)+ **enqueue 重排**(下輪 partition 需要且 miss 的
-  成員排最前 fetch;input_queue FIFO、單 fetch thread,Python 排序即控制)
+  成員排最前 fetch;input_queue FIFO、單 fetch thread,Python 排序即控制;
+  C++ 只加一個可選優先序參數——純機制)+ **非 routed 的 wanted 成員附掛
+  prefetch**(miss group 成員這輪沒被 route 到時,附在該層 fetch 流尾端,
+  與 compute 重疊——否則 merge 點要同步補抓冷成員,這是 v1 最實在的收益)
   + 沿用 P4 side-stream(merge 藏進下一層 fetch)。
+  但書:merge 仍在 dispatch 後(P4 藏一層)時,「routed 內重排」本身收益
+  有限(dispatch 等全員到齊);動刀前先 profiling merge 點等待中冷成員
+  補抓的佔比。
 - v2(profiling 決定):層內 per-group 提前 merge(需 completion event);
   P4 已把 merge 藏一層,先量 `merge(P3)`/drain 佔比再說。
 - 與 `flush_on_draft_end`(P1)互斥:cache 模式下停用(config 衝突報 error)。
@@ -321,7 +338,7 @@ model:
 | C-BOOT | 空首輪 + `run.prefill_warmup` flag(預設 true;false = ablation 走舊 fallback)+ warmup 模式下 fallback 改 hard assert(§2.4;**不依賴 C0–C3,現有 P3 就能建 merged,獨立可先跑**) | q15 topm:draft_fetch GB/題 → ~0、MAT 持平、TTFT 下降;flag off 重現舊行為 |
 | C0 | C++ 機制:id 空間延伸 + `merge_experts_to_slot` + discard 驅逐分支 + `EvictLayer` pin-skip(**先不接 policy,行為不變**) | rebuild + unit tests + smoke ×2(數字不動) |
 | C1 | auto 模式(verify floor)+ Python content index + 工作集 pin(singleton 雙重身分生效)+ 移除舊固定 merged reserve | smoke + q15;singleton_verify_hit 上報 |
-| C2 | retention + history + 跨題 warm start | q15;merged_hit / elided GB |
+| C2 | **題內** retention + history(保護級 pair pin 到 floor、其餘 unpin/discard;不做跨題 warm start——2026-07-10 定案) | q15;merged_hit / elided GB(題內 adopt rate) |
 | C3 | pipelining v1(probe + enqueue 重排) | AUG_PROFILE;TPS |
 | **最終驗收** | 整個 plan 完成後,以**論文方法設定的 q15 三重複(`q15_hybrid_a{λ}_r1–r3`,qpc=15/mnt=512/T=5/vram 0.2/uniform)**為對照重跑同 config | (1) **AccR/MAT 落在 run-to-run noise 內**(差 <3pp 多跑取平均)——理論上 plan 不動 draft 權重,AccR 掉 = 有 bug,這是「沒有錯」的判準;(2) TPS ≥ 舊值;(3) draft_fetch/題 → ~0、assert 零觸發。跨方法基準 = `q15_specmoe_ep2`(4.105/0.486 與復跑 4.197/0.515 當 noise band) |
 
@@ -362,8 +379,8 @@ model:
 | C-DEL EvictLayer 全刪(§2.5) | ✅ 2026-07-10:code 全刪、cdel_tm_off liveness 過(4.95GB pool 沖 1.1TB ≈ 12 萬次 demand-evict 零異常、AccR 0.51 健康);**效能 A/B(TPS/verify_fetch vs 歷史)併入最終驗收** |
 | C-BOOT 空首輪 + `run.prefill_warmup` + assert + KV-copy(§2.4) | ✅ 2026-07-10:含兩顆 bug 修復(assistant mask 失同步 → crash;draft 重 encode prompt → AccR 崩,KV-copy 解);診斷 258444 過(offload 0.455 / 對齊率 0.665 / TPS +11%);mnt=512 規模的 MAT 持平驗證併入最終驗收 |
 | C0 C++ slot 機制(行為不變) | ✅ 2026-07-10:MergedSlot 表 + 5 API + 兩段式回收 hook;binding 檢查 + 六項功能 probe(258137)全過;smoke 行為不變 |
-| C1 auto 模式 + content index + 工作集 pin | ⬜ |
-| C2 retention + history + warm start | ⬜ |
+| C1 auto 模式 + content index + 工作集 pin | ✅ 2026-07-10(job 258696):**AccR 0.7036 / TPS 4.489(+15.6% vs freq/legacy 3.884)**、adopt rate 0.52、merge_elided 10.1TB、singleton_verify_hit 3525/cyc(elided 1TB)、pin-denied 0.8%、fallback 0。途中修四 bug:assistant mask 失同步、pin-too-late TOCTOU、pin-blind prefetcher 翻參照(→ singleton 一律 slot 供貨,pin 降級為 verify-hit best-effort)、帳本幽靈扣款+殭屍(→ 劃帳模型 + 帳實守恆,§3 修訂) |
+| C2 題內 retention + history(跨題 warm start 不做) | ⬜ |
 | C3 pipelining v1 | ⬜ |
 | 最終驗收(q15_hybrid 三重複對照:AccR noise 內持平、TPS ↑、draft_fetch→~0) | ⬜ |
 | 論文補 adopt-first 一句(hierarchy 段 "likely to reproduce" 之後;現行敘述是「先 greedy 後 probe、retention 靠自然重現」,與 §2.3 兩段式實作方向相反,C1 落地後必補) | ⬜ |
