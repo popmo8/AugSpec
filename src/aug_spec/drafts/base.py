@@ -384,7 +384,8 @@ class ScoreBasedAvgDraft(DraftStrategy):
             self._refresh_layer(adapter, layer_to_block[li], li, score_vec,
                                 draft_cache)
 
-    def _refresh_layer(self, adapter, block, li, score_vec, draft_cache):
+    def _refresh_layer(self, adapter, block, li, score_vec, draft_cache,
+                       routed=None):
         """Build (or rebuild) the merged draft for one layer from its captured
         count vector. Shared by `refresh` (after-verify, all layers) and the
         offload-merge engine's `on_verify_layer` (during-verify, one layer)."""
@@ -407,7 +408,7 @@ class ScoreBasedAvgDraft(DraftStrategy):
             mc = getattr(engine, "merged_cache", None) if engine else None
             if mc is not None:
                 draft_cache[li] = mc.build_layer(li, block, weights, self,
-                                                 adapter)
+                                                 routed=routed)
             else:
                 draft_cache[li] = self._cluster_and_build(adapter, block,
                                                           weights, li)

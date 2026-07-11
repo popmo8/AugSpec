@@ -155,6 +155,13 @@ class Qwen3MoeAdapter(MoEAdapter):
             dtype=hs_flat.dtype, device=hs_flat.device)
         weights_mask.scatter_add_(1, topk_idx, topk_w)
 
+        # C3 pipeline:dispatch 前規劃本層 merge(score 已 capture)——
+        # MergeJob 與下面這次 dispatch 的 fetch/forward 同層重疊。
+        engine = getattr(block, "_merge_engine", None)
+        if engine is not None:
+            engine.on_verify_layer_plan(
+                block.layer_id, block,
+                torch.nonzero(router_mask.any(dim=0)).flatten().tolist())
         block.expert_executor.dispatch_local(
             block.layer_id, hs_flat, router_mask, weights_mask)
         out = block.expert_executor.wait_dispatch_local()

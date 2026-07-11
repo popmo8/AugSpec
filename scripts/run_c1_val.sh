@@ -60,6 +60,6 @@ for tag, d in (("c1_smoke (uniform, cache mode)", "c1_smoke"),
           f"cycles={ov['total_cycles']} MAT={ov['mean_accept_tokens']} "
           f"AccR={ov['acceptance_rate']} TPS={ov['tokens_per_second']}"))
 print("  驗收:AccR 與 uniform 參考(q15_freqslice r1-r3 ≈ 0.44-0.47)同量級;"
-      "singleton_verify_hit>0;merged_cache adopt rate 上報;fallback≈0")
+      "singleton_verify_hit>0;singleton hit>0(C2.1 probe);無 RuntimeError(fallback 已刪)")
 PYEOF
 echo "[c1_val] done"

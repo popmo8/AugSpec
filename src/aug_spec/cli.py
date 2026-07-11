@@ -99,8 +99,9 @@ class RunConfig:
                                          # verify (P3) vs after-verify refresh
     flush_on_draft_end: bool             # offload-merge: phase-exclusive flush
                                          # (archer@draft-start, merged@draft-end, P1)
-    merge_overlap: bool                  # offload-merge: merge on side stream,
-                                         # overlap with next-layer fetch (P4)
+    merge_overlap: bool                  # offload-merge: C3 merge-job
+                                         # pipeline(同層 fetch∥forward∥
+                                         # merge);false = P2 同步 ablation
     merged_backend: Optional[str]        # offload: merged-expert draft kernel
                                          # (was AUG_MERGED_BACKEND; None=default)
     early_pin: Optional[int]             # SpecMoE early-pin stage (was
@@ -210,7 +211,8 @@ class RunConfig:
             flush_on_draft_end=bool(
                 offload_cfg.get("flush_on_draft_end", False)),
             merge_overlap=bool(
-                offload_cfg.get("merge_overlap", False)),
+                offload_cfg.get("merge_overlap", True)),   # D3: cache mode
+                                                           # pipeline 預設開
             merged_backend=(str(offload_cfg["merged_backend"]).lower()
                             if offload_cfg.get("merged_backend") else None),
             early_pin=(int(draft_cfg["early_pin"])
@@ -269,7 +271,14 @@ def _dump_profile(controller) -> None:
     row("evict", "evict_n", "evict_us")
     row("enqueue_wait", "enqueue_wait_n", "enqueue_wait_us")     # race-fix hits
     row("expert_forward", "forward_n", "forward_us")
-    row("merge(P3)", "merge_n", "merge_us")
+    row("merge(P3)", "merge_n", "merge_us")   # pipeline 下為 merge 線程時間
+    if p.get("mg_jobs_n", 0):
+        print(f"  mg-pipeline: jobs {p['mg_jobs_n']} "
+              f"(gated {p.get('mg_gated_n', 0)}), gate-wait "
+              f"{p.get('mg_gate_wait_us', 0)/1e6:.2f} s, cold "
+              f"{p.get('mg_cold_bytes', 0)/1e9:.2f} GB; drain "
+              f"{p.get('drain_n', 0)}x wait "
+              f"{p.get('drain_wait_us', 0)/1e6:.3f} s (KPI≈0)")
     row("draft_dispatch", "dispatch_n", "dispatch_us")
     gb = (p.get("verify_fetch_bytes", 0) + p.get("draft_fetch_bytes", 0)) / 1e9
     print(f"  fetched {gb:.2f} GB total "
@@ -286,10 +295,12 @@ def _dump_profile(controller) -> None:
         tot = max(1, mc.hit_n + mc.miss_n)
         print(f"  merged_cache: hit {mc.hit_n} / miss {mc.miss_n} "
               f"(adopt rate {mc.hit_n/tot:.2f}), merge_elided "
-              f"{mc.elided_bytes/1e9:.2f} GB, singleton resident/slot "
-              f"{mc.singleton_pinned_n}/{mc.singleton_slot_n} "
+              f"{mc.elided_bytes/1e9:.2f} GB, singleton resident/slot/hit "
+              f"{mc.singleton_pinned_n}/{mc.singleton_slot_n}/"
+              f"{mc.singleton_hit_n} "
               f"(pin-budget denied {mc.singleton_budget_denied_n}), "
-              f"legacy-fallback {mc.fallback_n}")
+              f"steals {mc.steal_n} (protected {mc.steal_protected_n}), "
+              f"sgl-feas-denied {mc.sgl_feas_denied_n}")
     kc = getattr(getattr(controller, "draft", None), "kept_changed", None)
     if kc:
         print(f"  kept_changed: {sum(kc)/len(kc):.2f} experts/cycle "

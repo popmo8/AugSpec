@@ -4,6 +4,9 @@
 // EfficientMoE Team
 
 #include "expert_dispatcher.h"
+#include <c10/cuda/CUDAGuard.h>
+#include <chrono>
+#include <unordered_set>
 #include "aio/archer_tensor_index.h"
 #include "common/pytorch.h"
 #include "common/time.h"
@@ -187,6 +190,10 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
     // exec_args.hidden_states = std::move(input);
     exec_args.expert_node = expert_node;
     expert_node->SetTensorsFromBlob(expert_node->node->device);
+    // C3 pipeline: a routed member can be resident WITHOUT ever passing
+    // GPUFetchFunc (e.g. the prefetcher landed it after SubmitMergeJobs read
+    // it as missing) — fire the gate here too so no job waits forever.
+    NotifyExpertArrived(args.layer_idx, args.expert_idx);
     exec_args.out_gpu_id = original_device.index();
     exec_args.out_dtype = c10::typeMetaToScalarType(hidden_states_.dtype());
     exec_args.hit = true;
@@ -329,14 +336,15 @@ std::vector<torch::Tensor> ExpertDispatcher::MergeExpertsLocal(
   return out;
 }
 
-// ── merged-expert slots (merged_cache_plan.md C0) ───────────────────────────
-// Persistent per-(layer, slot) GPU buffers for merged draft experts. Same byte
-// ledger as the expert cache (cache_sizes_); reclaim = DISCARD (buffers freed,
-// content reconstructible by re-merge — no host backing, no D2H). Concurrency
-// follows the existing convention: Python calls these dispatch-quiescent
-// (between layers / phases); the fetch thread only touches slots via
-// TryDiscardUnpinnedSlot while a dispatch is in flight, so the two never
-// overlap. Zero slots until InitMergedSlots — existing runs are unaffected.
+// ── merged-expert slots (merged_cache_plan.md C0; D0 pre-allocation) ────────
+// Persistent per-(layer, slot) GPU buffers for merged draft experts, living in
+// TORCH-allocator memory inside the slot carve the cli budgets at load (they
+// never touch the archer ledger). D0 (c3_pipeline_plan.md): ALL buffers are
+// allocated up front at InitMergedSlots so a slot handle is valid before its
+// content is written — the plan-ahead emit (D2) hands slot tensors to the
+// draft while their merge job is still in flight. Content is overwritten in
+// place by merges; there is no discard path (buffers live for the process).
+// Zero slots until InitMergedSlots — non-cache-mode runs are unaffected.
 
 void ExpertDispatcher::InitMergedSlots(int num_layers, int slots_per_layer) {
   if (!merged_slots_.empty()) {
@@ -344,9 +352,43 @@ void ExpertDispatcher::InitMergedSlots(int num_layers, int slots_per_layer) {
     return;
   }
   if (num_layers <= 0 || slots_per_layer <= 0) return;
+  // Template = the first registered expert's tensors: every expert shares one
+  // layout (cache-mode invariant), so shapes/dtypes come from any of them.
+  std::vector<torch::Tensor> tmpl;
+  for (auto& per_layer : experts_) {
+    for (auto& en : per_layer) {
+      if (en == nullptr || en->node == nullptr) continue;
+      for (auto tid : en->node->tensor_ids) {
+        auto it = kTensorIndex->find(tid);
+        if (it == kTensorIndex->end() || !it->second.tensor.defined()) {
+          tmpl.clear();
+          break;
+        }
+        tmpl.push_back(it->second.tensor);
+      }
+      if (!tmpl.empty()) break;
+    }
+    if (!tmpl.empty()) break;
+  }
+  TORCH_CHECK(!tmpl.empty(),
+              "InitMergedSlots: no registered expert to size slots from — "
+              "call after expert registration");
+  auto device = torch::Device(torch::kCUDA, 0);
   merged_slots_.resize(num_layers);
   for (auto& layer : merged_slots_) {
     layer.resize(slots_per_layer);
+    for (auto& slot : layer) {
+      int64_t bytes = 0;
+      slot.tensors.reserve(tmpl.size());
+      for (auto& t : tmpl) {
+        auto buf = torch::zeros(
+            t.sizes(),
+            torch::TensorOptions().dtype(t.scalar_type()).device(device));
+        bytes += buf.numel() * buf.element_size();
+        slot.tensors.push_back(std::move(buf));
+      }
+      slot.byte_size = bytes;
+    }
   }
 }
 
@@ -369,24 +411,14 @@ bool ExpertDispatcher::MergeExpertsToSlot(int layer_idx, int slot_idx,
                                 torch::Device(torch::kCUDA, gpu_id));
   if (merged.empty()) return false;
 
-  // Slots are TORCH-allocator memory inside the slot budget the cli carved
-  // out of `usable` at load (pool = usable − S×L×expert). They never touch
-  // the archer ledger (cache_sizes_): the 2026-07-10 hang was exactly this —
-  // ghost debits drained the ledger, the fetch thread evicted every unpinned
-  // original and then live-locked waiting for room that physically existed.
-  if (slot.cached) {
-    // Rebuild in place: shapes are invariant (every expert has the same
-    // layout), so copy into the stable buffers — no allocator churn.
-    if (slot.tensors.size() != merged.size()) return false;
-    for (size_t i = 0; i < merged.size(); ++i) {
-      slot.tensors[i].copy_(merged[i]);
-    }
-  } else {
-    int64_t need = 0;
-    for (auto& t : merged) need += t.numel() * t.element_size();
-    slot.tensors = std::move(merged);
-    slot.byte_size = need;
-    slot.cached = true;
+  // D0: buffers are pre-allocated and stable — always the copy_ path (no
+  // allocator churn, and handles handed out earlier stay valid). Slot memory
+  // never touches the archer ledger (cache_sizes_): the 2026-07-10 hang was
+  // exactly that — ghost debits drained the ledger and live-locked the fetch
+  // thread.
+  if (slot.tensors.size() != merged.size()) return false;
+  for (size_t i = 0; i < merged.size(); ++i) {
+    slot.tensors[i].copy_(merged[i]);
   }
   if (profile_enabled_) {
     prof_.merge_us += _prof_now_us() - _mg_t0;
@@ -408,9 +440,9 @@ std::vector<torch::Tensor> ExpertDispatcher::GetMergedSlot(int layer_idx,
       slot_idx >= static_cast<int>(merged_slots_[layer_idx].size())) {
     return out;
   }
-  auto& slot = merged_slots_[layer_idx][slot_idx];
-  if (!slot.cached) return out;             // probe miss
-  return slot.tensors;                      // refs valid while pinned
+  // D0: pre-allocated — an initialised table always returns valid handles
+  // (content may still be in flight; the draft reads only after drain).
+  return merged_slots_[layer_idx][slot_idx].tensors;
 }
 
 void ExpertDispatcher::SetMergedSlotPinned(int layer_idx,
@@ -430,23 +462,215 @@ void ExpertDispatcher::SetMergedSlotPinned(int layer_idx,
   }
 }
 
-void ExpertDispatcher::DiscardMergedSlot(int layer_idx, int slot_idx,
-                                         int gpu_id) {
+// ── C3 merge-job pipeline (c3_pipeline_plan.md D1) ───────────────────────────
+// Plan-ahead merges: Python submits this layer's miss groups BEFORE dispatch;
+// each job fires the moment its last routed member lands on GPU, so merge
+// overlaps the SAME layer's remaining fetch + forward. Input liveness: the
+// snapshot locks each member's node->mutex — the universal relocation guard
+// (FindExpertEvict, the prefetcher and exec all take it before SetDevice) —
+// clones to torch-owned staging on the merge stream, and only unlocks after
+// the reads completed. After that, evict/relocation of the original is
+// harmless. The draft reads slot content only after WaitMergesDone.
+
+bool ExpertDispatcher::SubmitMergeJobs(
+    int layer_idx, const std::vector<int>& slots,
+    const std::vector<std::vector<int>>& members,
+    const std::vector<std::vector<double>>& weights,
+    const std::vector<int>& routed) {
   if (layer_idx < 0 ||
       layer_idx >= static_cast<int>(merged_slots_.size())) {
-    return;
+    return false;
   }
-  if (slot_idx < 0 ||
-      slot_idx >= static_cast<int>(merged_slots_[layer_idx].size())) {
-    return;
+  if (slots.size() != members.size() || slots.size() != weights.size()) {
+    return false;
   }
-  std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
-  auto& slot = merged_slots_[layer_idx][slot_idx];
-  if (!slot.cached) return;
-  slot.tensors.clear();   // frees torch memory (slot budget, not the ledger)
-  slot.byte_size = 0;
-  slot.cached = false;
+  for (int sl : slots) {
+    if (sl < 0 || sl >= static_cast<int>(merged_slots_[layer_idx].size())) {
+      return false;
+    }
+  }
+  if (!merge_thread_started_.exchange(true)) {
+    // Create the merge stream HERE (submit thread, before the merge thread
+    // exists) — a lazy init inside the merge thread would race the
+    // std::optional read in WaitMergesDone.
+    merge_stream_ = c10::cuda::getStreamFromPool(false, 0);
+    merge_thread_ = std::thread(&ExpertDispatcher::MergeThreadFunc, this);
+  }
+  std::unordered_set<int> routed_set(routed.begin(), routed.end());
+  std::vector<std::shared_ptr<MergeJob>> ready;
+  {
+    std::lock_guard<std::mutex> lk(merge_mu_);
+    for (size_t i = 0; i < slots.size(); ++i) {
+      auto job = std::make_shared<MergeJob>();
+      job->layer = layer_idx;
+      job->slot = slots[i];
+      job->experts = members[i];
+      job->weights = weights[i];
+      job->submit_us = _prof_now_us();
+      merge_pending_.fetch_add(1);
+      for (int e : job->experts) {
+        if (e < 0 || e >= static_cast<int>(experts_.size())) continue;
+        auto en = experts_[e][layer_idx];
+        bool resident = en != nullptr && en->node != nullptr &&
+                        en->node->device.is_cuda();
+        // Gate only on members this verify pass will bring in; anything else
+        // is read from its host copy at exec time (mg_cold_bytes).
+        if (!resident && routed_set.count(e)) {
+          job->missing += 1;
+          merge_watch_[(static_cast<uint64_t>(layer_idx) << 32) + e]
+              .push_back(job);
+        }
+      }
+      if (job->missing == 0) {
+        ready.push_back(job);
+      } else if (profile_enabled_) {
+        prof_.mg_gated_n += 1;
+      }
+      if (profile_enabled_) prof_.mg_jobs_n += 1;
+    }
+  }
+  for (auto& j : ready) merge_ready_.Push(j);
+  return true;
 }
+
+void ExpertDispatcher::NotifyExpertArrived(int64_t layer_idx,
+                                           int64_t expert_idx) {
+  if (!merge_thread_started_.load()) return;   // non-cache mode fast path
+  std::vector<std::shared_ptr<MergeJob>> ready;
+  {
+    std::lock_guard<std::mutex> lk(merge_mu_);
+    auto it = merge_watch_.find(
+        (static_cast<uint64_t>(layer_idx) << 32) + expert_idx);
+    if (it == merge_watch_.end()) return;
+    for (auto& job : it->second) {
+      if (--job->missing == 0) ready.push_back(job);
+    }
+    merge_watch_.erase(it);
+  }
+  for (auto& j : ready) merge_ready_.Push(j);
+}
+
+void ExpertDispatcher::MergeThreadFunc() {
+  while (true) {
+    std::shared_ptr<MergeJob> job;
+    merge_ready_.Pop(job);
+    if (job == nullptr || main_thread_stop_flag_.load()) break;
+    ExecMergeJob(job);
+    {
+      std::lock_guard<std::mutex> lk(merge_mu_);
+      merge_pending_.fetch_sub(1);
+    }
+    merge_cv_.notify_all();
+  }
+}
+
+void ExpertDispatcher::ExecMergeJob(const std::shared_ptr<MergeJob>& job) {
+  int64_t t0 = _prof_now_us();
+  if (profile_enabled_) prof_.mg_gate_wait_us += t0 - job->submit_us;
+  auto device = torch::Device(torch::kCUDA, 0);
+  c10::cuda::CUDAStreamGuard guard(*merge_stream_);
+
+  // 1. Snapshot every member into torch-owned staging under its node mutex;
+  //    unlock only after the reads completed (stream sync) — relocation of
+  //    the original after that is harmless.
+  std::vector<std::vector<torch::Tensor>> staged;
+  std::vector<Node*> locked;
+  staged.reserve(job->experts.size());
+  for (int e : job->experts) {
+    std::vector<torch::Tensor> snap;   // stays empty for invalid members —
+                                       // keeps staged[i] aligned with weights[i]
+    if (e >= 0 && e < static_cast<int>(experts_.size())) {
+      auto en = experts_[e][job->layer];
+      if (en != nullptr && en->node != nullptr) {
+        Node* node = en->node.get();
+        node->mutex.lock();
+        locked.push_back(node);
+        for (auto tid : node->tensor_ids) {
+          auto it = kTensorIndex->find(tid);
+          if (it == kTensorIndex->end() || !it->second.tensor.defined()) {
+            continue;
+          }
+          torch::Tensor t = it->second.tensor;
+          if (t.device().is_cuda()) {
+            snap.push_back(t.clone());
+          } else {
+            snap.push_back(t.to(device));
+            if (profile_enabled_) {
+              prof_.mg_cold_bytes += t.numel() * t.element_size();
+            }
+          }
+        }
+      }
+    }
+    staged.push_back(std::move(snap));
+  }
+  merge_stream_->synchronize();
+  for (auto* n : locked) n->mutex.unlock();
+
+  // 2. fp32 accumulate from staging (same op order as MergeAccumulate →
+  //    bit-exact vs merge_experts_local) + copy into the slot buffers.
+  std::vector<torch::Tensor> acc;
+  c10::ScalarType out_dtype = torch::kBFloat16;
+  bool sized = false;
+  for (size_t gi = 0; gi < staged.size(); ++gi) {
+    double w = (gi < job->weights.size()) ? job->weights[gi] : 0.0;
+    if (w == 0.0 || staged[gi].empty()) continue;
+    if (!sized) {
+      acc.resize(staged[gi].size());
+      sized = true;
+    }
+    for (size_t i = 0; i < staged[gi].size() && i < acc.size(); ++i) {
+      if (!acc[i].defined()) {
+        acc[i] = torch::zeros(
+            staged[gi][i].sizes(),
+            torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        out_dtype = staged[gi][i].scalar_type();
+      }
+      acc[i].add_(staged[gi][i].to(torch::kFloat32), w);
+    }
+  }
+  auto& slot = merged_slots_[job->layer][job->slot];
+  for (size_t i = 0; i < acc.size() && i < slot.tensors.size(); ++i) {
+    if (acc[i].defined()) slot.tensors[i].copy_(acc[i].to(out_dtype));
+  }
+  if (profile_enabled_) {
+    prof_.merge_n += 1;
+    prof_.merge_us += _prof_now_us() - t0;
+  }
+}
+
+void ExpertDispatcher::WaitMergesDone(double timeout_s) {
+  int64_t t0 = _prof_now_us();
+  {
+    std::unique_lock<std::mutex> lk(merge_mu_);
+    bool ok = merge_cv_.wait_for(
+        lk, std::chrono::duration<double>(timeout_s),
+        [&] { return merge_pending_.load() == 0; });
+    if (!ok) {
+      // Forensic dump, then fatal — no degraded mode (starvation-guard style).
+      for (auto& kv : merge_watch_) {
+        int64_t l = static_cast<int64_t>(kv.first >> 32);
+        int64_t e = static_cast<int64_t>(kv.first & 0xffffffff);
+        auto en = (e < static_cast<int64_t>(experts_.size()) &&
+                   l < static_cast<int64_t>(experts_[e].size()))
+                      ? experts_[e][l] : nullptr;
+        DLOG_WARN("WaitMergesDone: still waiting on (layer ", l, ", expert ",
+                  e, ") device ",
+                  (en && en->node) ? en->node->device.str() : "?",
+                  " gating ", kv.second.size(), " job(s)");
+      }
+      DLOG_FATAL("WaitMergesDone: ", merge_pending_.load(),
+                 " merge job(s) not done after ", timeout_s,
+                 " s — a routed member never arrived? Aborting run.");
+    }
+  }
+  if (merge_stream_.has_value()) merge_stream_->synchronize();
+  if (profile_enabled_) {
+    prof_.drain_n += 1;
+    prof_.drain_wait_us += _prof_now_us() - t0;
+  }
+}
+
 
 torch::Tensor ExpertDispatcher::DispatchMergedLocal(
     torch::Tensor hidden_states, torch::Tensor weight,
@@ -557,6 +781,9 @@ void ExpertDispatcher::ResetProfile() {
   prof_.forward_n = 0; prof_.forward_us = 0;
   prof_.merge_n = 0; prof_.merge_us = 0;
   prof_.dispatch_n = 0; prof_.dispatch_us = 0;
+  prof_.mg_jobs_n = 0; prof_.mg_gated_n = 0; prof_.mg_gate_wait_us = 0;
+  prof_.mg_cold_bytes = 0;
+  prof_.drain_n = 0; prof_.drain_wait_us = 0;
 }
 
 std::map<std::string, int64_t> ExpertDispatcher::DumpProfile() {
@@ -579,6 +806,12 @@ std::map<std::string, int64_t> ExpertDispatcher::DumpProfile() {
       {"merge_us", prof_.merge_us.load()},
       {"dispatch_n", prof_.dispatch_n.load()},
       {"dispatch_us", prof_.dispatch_us.load()},
+      {"mg_jobs_n", prof_.mg_jobs_n.load()},
+      {"mg_gated_n", prof_.mg_gated_n.load()},
+      {"mg_gate_wait_us", prof_.mg_gate_wait_us.load()},
+      {"mg_cold_bytes", prof_.mg_cold_bytes.load()},
+      {"drain_n", prof_.drain_n.load()},
+      {"drain_wait_us", prof_.drain_wait_us.load()},
   };
 }
 
@@ -916,6 +1149,9 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
     }
     expert_node->node->incache_visit_count += 1;
     expert_node->SetTensorsFromBlob(device);
+    // C3 pipeline: fire merge jobs gated on this expert (no-op unless the
+    // merge thread is live; SetDevice already synchronised the H2D).
+    NotifyExpertArrived(layer_idx, expert_idx);
     // module_->SetTensorsFromIds(expert_node->node->tensor_ids);
 
     // std::cerr << "ExpertDispatcher::GPUFetchFunc: move to device gpu_id "

@@ -13,7 +13,21 @@ Active only in "cache mode": offload + merge engine + `within_weight: uniform`
 rebuild (`ScoreBasedAvgDraft._cluster_and_build`).
 
 C1 scope: within-question reuse only — `reset()` clears the index at每題
-boundary (cross-question warm start is C2).
+boundary(跨題 warm start 已於 2026-07-10 定案不做)。
+C2 (2026-07-10): retention-aware slot stealing — the ONLY reclaimer of slots
+under the carve model is `_alloc_slot`, so the paper's retention rule lives
+there: never steal this build's entries; steal unprotected (members no longer
+all-active) before protected; singletons (cheap identity rebuild) before
+pairs; low co-occur pairs first; LRU as the tiebreak.
+C2.1 (2026-07-11): PAIR-adopt-first — stage 1 adopts multi-member groups
+only. Adopting a cached singleton spends 1 of the K group quota while
+covering 1 expert, which breaks the M<=2K "2 coverage per group" accounting
+and is what forced >K groups (slot overflow). Singletons are now decided by
+greedy and served afterwards by a content probe (same zero-cost hit, no
+quota distortion) — group count is structurally <=K whenever |active|<=2K.
+The probe path also runs the archer-pin step, so a re-used singleton's
+original keeps its verify-hit pin (the old stage-1 singleton adopt skipped
+it → retained experts were re-fetched every verify).
 """
 
 from __future__ import annotations
@@ -47,8 +61,15 @@ class MergedCacheIndex:
         self.groups_n = 0               # total groups partitioned
         self.singleton_pinned_n = 0     # singletons pinned for verify hits
         self.singleton_slot_n = 0       # singletons that needed an identity slot
+        self.singleton_hit_n = 0        # singletons re-served from a cached slot
         self.singleton_budget_denied_n = 0   # pin budget full → identity slot
-        self.fallback_n = 0             # legacy CPU/GPU merges (slot API failed)
+        self.sgl_feas_denied_n = 0      # singleton adopt denied: quota
+                                        # infeasible (B variant guard)
+        self.steal_n = 0                # slot steals (history evictions)
+        self.steal_protected_n = 0      # had to steal a protected entry
+        # per-layer build counter — entries stamped with it; this build's
+        # entries are never steal victims.
+        self._build_no: Dict[int, int] = defaultdict(int)
 
     # ── question boundary ────────────────────────────────────────────────
     def reset(self, blocks, dispatcher) -> None:
@@ -57,6 +78,7 @@ class MergedCacheIndex:
         self.index.clear()
         self.pinned_bytes = 0
         self._layer_pin_bytes.clear()
+        self._build_no.clear()
         if dispatcher is None:
             return
         for li, _ in blocks:
@@ -64,27 +86,90 @@ class MergedCacheIndex:
         if hasattr(dispatcher, "clear_pinned"):
             dispatcher.clear_pinned(0)
 
-    # ── slot allocation ──────────────────────────────────────────────────
-    def _alloc_slot(self, li: int) -> int:
-        used = set(self.index[li].values())
+    # ── slot allocation(C2:retention-aware steal)─────────────────────
+    def _alloc_slot(self, li: int, active_set=frozenset(),
+                    cooccur=None, cur_stamp: int = -1) -> int:
+        used = {v[0] for v in self.index[li].values()}
         for s in range(self.S):
             if s not in used:
                 return s
-        # Every slot is owned by an index entry → steal the oldest (its
-        # content is overwritten by the coming merge; entry dropped).
-        oldest_key = next(iter(self.index[li]))
-        return self.index[li].pop(oldest_key)
+        # Every slot is owned by an index entry → steal by the retention rule
+        # (this is the ONLY slot reclaimer under the carve model): never this
+        # build's entries; unprotected before protected (members all-active =
+        # likely re-adopted next cycle); singletons before pairs (identity
+        # rebuild is a µs copy, a pair costs a re-merge); low co-occur pairs
+        # first; LRU (oldest first, stable min) as the tiebreak.
+        def badness(item):
+            members, (_slot, stamp) = item
+            co = 0.0
+            if len(members) > 1 and cooccur is not None:
+                a, b = sorted(members)[:2]
+                co = float(cooccur[a][b])
+            return (stamp == cur_stamp,            # this build → last resort
+                    members <= active_set,         # protected → late
+                    len(members) > 1,              # pairs → later than singles
+                    co)                            # cold pairs first
+        # O(1) common case: entries iterate oldest-first, so the first old
+        # unprotected singleton is provably optimal — break instead of a full
+        # O(S) min() scan (C1's steal was next(iter()); 778k steals/run make
+        # the scan a wall-clock line item, job 258941).
+        best = best_item = None
+        for item in self.index[li].items():
+            b = badness(item)
+            if best is None or b < best:
+                best, best_item = b, item
+                if b == (False, False, False, 0.0):
+                    break
+        victim, (slot, stamp) = best_item
+        if stamp == cur_stamp:
+            # Every slot is owned by THIS build ⇒ the partition produced more
+            # than S=K' groups. With pair-adopt-first (C2.1) that is provably
+            # impossible while |active| <= 2K, so reaching here means an
+            # unsupported configuration (a draft without a top-M <= 2K cutoff
+            # in cache mode). Stealing would overwrite content already emitted
+            # this cycle — silently wrong draft weights — so fail fast instead
+            # (2026-07-11: fallback path removed on request; no degraded mode).
+            raise RuntimeError(
+                f"merged_cache: slot demand exceeded S={self.S} at layer {li} "
+                f"— partition produced >K groups, |active|>2K? Use a draft "
+                f"with top-M <= 2K (e.g. topm_count) in cache mode.")
+        self.steal_n += 1
+        if victim <= active_set:
+            self.steal_protected_n += 1
+        del self.index[li][victim]
+        return slot
 
     # ── the per-layer build (replaces _cluster_and_build in cache mode) ──
     def build_layer(self, li: int, block, weights: List[float],
-                    draft, adapter) -> Dict[str, Any]:
+                    draft, routed=None) -> Dict[str, Any]:
+        """routed=None → P2(同步 merge,dispatch 後呼叫)。
+        routed=list  → C3 pipeline(dispatch 前呼叫):miss 組收集成 MergeJob
+        一次 submit,成員到齊即在 C++ merge 線程執行;emit 的 slot handle 因
+        D0 預配而在內容寫入前即有效,draft 在 WaitMergesDone 之後才讀。"""
         disp = block.expert_executor.expert_dispatcher
+        pipeline = routed is not None
+        job_slots: List[int] = []
+        job_members: List[List[int]] = []
+        job_weights: List[List[float]] = []
+
+        def _write_slot(slot, ids, uw):
+            if pipeline:
+                job_slots.append(slot)
+                job_members.append(list(ids))
+                job_weights.append(list(uw))
+                return True
+            return disp.merge_experts_to_slot(li, slot, list(ids),
+                                              list(uw), 0)
         active = [i for i, w in enumerate(weights) if w > 0.0]
         active_set = set(active)
         K = draft.K
         # Singleton-pin ledger: this layer's previous contribution is being
         # replaced by this build.
         pinned_other = self.pinned_bytes - self._layer_pin_bytes.get(li, 0)
+        # C2: stamp this build — its entries are never steal victims.
+        self._build_no[li] += 1
+        cur = self._build_no[li]
+        li_cooccur = draft.cooccur.get(li)
 
         experts: List[Dict[str, Any]] = []
         masses: List[float] = []
@@ -125,8 +210,23 @@ class MergedCacheIndex:
             return {"gate_proj": tensors[0], "up_proj": tensors[1],
                     "down_proj": tensors[2]}
 
+        def _pin_singleton(i):
+            pin_ok = (self.singleton_pin_budget is None
+                      or pinned_other
+                      + (len(singleton_ids) + 1) * self.expert_bytes
+                      <= self.singleton_pin_budget)
+            if pin_ok:
+                self.singleton_pinned_n += 1
+                singleton_ids.append(i)
+                _pin_now()
+            else:
+                self.singleton_budget_denied_n += 1
+
         # ── stage 1: adopt(§2.3 cache-first)— cached groups whose members
-        # all remain active are taken as-is: 0 fetch, 0 merge.
+        # all remain active are taken as-is: 0 fetch, 0 merge. Pairs adopt
+        # unconditionally(每組覆蓋 2,不動額度 slack);singletons adopt only
+        # while quota-feasible(B variant guard below)——denied 者仍可能被
+        # greedy 判回 singleton 而走 probe(pass 1)。
         used: set = set()
         adopted_groups: List[frozenset] = []
         for members in list(reversed(self.index[li])):   # most recent first
@@ -134,17 +234,30 @@ class MergedCacheIndex:
                 break
             if not members.issubset(active_set) or (members & used):
                 continue
-            slot = self.index[li][members]
+            if len(members) == 1:
+                # B variant (2026-07-11, jobs 259050/259089): singleton 續留
+                # 特權——adopt 讓熱門 expert 以精確權重續任 singleton,不被
+                # greedy 配對稀釋(兩次 C2.1 純語意跑 AccR 都落在 0.627,低於
+                # C1/C2 的 0.70 帶)。特權排在額度記帳之後:adopt 後剩餘的
+                # active 必須仍塞得進剩餘額度(每 pair 覆蓋 2),否則跳過、
+                # 交給 greedy——組數因此永遠 ≤ K,溢位維持構造性不可能。
+                r_after = len(active_set) - len(used) - 1
+                if r_after > 2 * (K - len(adopted_groups) - 1):
+                    self.sgl_feas_denied_n += 1
+                    continue
+            slot, _ = self.index[li][members]
+            # D0:slot buffer 開機預配且無 discard 路徑 → handle 恆有效。
             tensors = disp.get_merged_slot(li, slot, 0)
-            if len(tensors) != 3:              # discarded under fetch pressure
-                del self.index[li][members]
-                continue
+            self.index[li][members] = (slot, cur)   # refresh stamp
             self.index[li].move_to_end(members)
             used |= members
             adopted_groups.append(members)
             slot_ids.append(slot)
             _pin_now()
             self.hit_n += 1
+            if len(members) == 1:
+                self.singleton_hit_n += 1
+                _pin_singleton(next(iter(members)))   # fetch-once verify pin
             self.elided_bytes += len(members) * self.expert_bytes
             _emit(members, _dict3(tensors),
                   sum(weights[m] for m in members), src="adopt")
@@ -163,60 +276,85 @@ class MergedCacheIndex:
                     pair_sim=draft._pair_sim_table(li))
                 groups = draft.cluster_method.assign(ctx, k_rem)
 
-        for g in groups:
-            mass = sum(weights[m] for m in g)
-            if len(g) == 1:
-                # Singleton: the DRAFT is always served from an identity slot
-                # (our own torch buffers) — holding refs to the resident
-                # original is unsafe: archer\'s prefetcher relocates nodes
-                # regardless of pinned_ and SetDevice(host) flips held refs to
-                # CPU in place (jobs 258555/258658). The original is STILL
-                # pinned (budget permitting), purely for the dual-identity
-                # verify hit — losing that pin costs a re-fetch, never
-                # correctness.
-                i = g[0]
-                pin_ok = (self.singleton_pin_budget is None
-                          or pinned_other
-                          + (len(singleton_ids) + 1) * self.expert_bytes
-                          <= self.singleton_pin_budget)
-                if pin_ok:
-                    self.singleton_pinned_n += 1
-                    singleton_ids.append(i)
-                    _pin_now()
-                else:
-                    self.singleton_budget_denied_n += 1
-                key = frozenset(g)
-                slot = self._alloc_slot(li)
-                if disp.merge_experts_to_slot(li, slot, [i], [1.0], 0):
-                    tensors = disp.get_merged_slot(li, slot, 0)
-                    self.index[li][key] = slot
-                    slot_ids.append(slot)
-                    _pin_now()
-                    self.singleton_slot_n += 1
-                    self.miss_n += 1
-                    _emit(g, _dict3(tensors), mass, src="singleton-slot")
-                else:
-                    self.fallback_n += 1
-                    _emit(g, self._legacy_one(draft, adapter, block,
-                                              weights, g), mass,
-                          src="legacy-fallback-single")
+        # Singleton note: the DRAFT is always served from an identity slot
+        # (our own torch buffers) — holding refs to the resident original is
+        # unsafe: archer's prefetcher relocates nodes regardless of pinned_
+        # and SetDevice(host) flips held refs to CPU in place (jobs
+        # 258555/258658). The original is STILL pinned (budget permitting),
+        # purely for the dual-identity verify hit — losing that pin costs a
+        # re-fetch, never correctness.
+        #
+        # Processing ORDER (C2.1 fix, job 259050): singleton probes run
+        # BEFORE pair allocs. Pair allocs steal slots and singletons are the
+        # preferred steal victims, so probing at the end of the loop let the
+        # same build steal entries that were about to be probe hits (adopt
+        # 0.51→0.38, protected steals 0.1%→19%). Probing first refreshes
+        # their stamps (this-build ⇒ unstealable). Emit order is free — the
+        # final list is re-sorted by mass.
+        single_miss: List[List[int]] = []
+        for g in groups:                      # pass 1: singleton probes
+            if len(g) != 1:
                 continue
+            _pin_singleton(g[0])
+            key = frozenset(g)
+            cached = self.index[li].get(key)
+            if cached is not None:
+                tensors = disp.get_merged_slot(li, cached[0], 0)
+                self.index[li][key] = (cached[0], cur)
+                self.index[li].move_to_end(key)
+                slot_ids.append(cached[0])
+                _pin_now()
+                self.hit_n += 1
+                self.singleton_hit_n += 1
+                self.elided_bytes += self.expert_bytes
+                _emit(g, _dict3(tensors),
+                      sum(weights[m] for m in g), src="singleton-adopt")
+                continue
+            single_miss.append(g)
+
+        for g in groups:                      # pass 2: pair merges (steal ok)
+            if len(g) == 1:
+                continue
+            mass = sum(weights[m] for m in g)
             # Pair / group: uniform coefficients (cache-mode precondition) →
             # the merged content is determined by the member set alone.
             key = frozenset(g)
-            slot = self._alloc_slot(li)
+            slot = self._alloc_slot(li, active_set, li_cooccur, cur)
             uw = [1.0 / len(g)] * len(g)
-            if disp.merge_experts_to_slot(li, slot, list(g), uw, 0):
-                tensors = disp.get_merged_slot(li, slot, 0)
-                self.index[li][key] = slot
-                slot_ids.append(slot)
-                _pin_now()
-                self.miss_n += 1
-                _emit(g, _dict3(tensors), mass, src="pair-slot")
-            else:
-                self.fallback_n += 1
-                _emit(g, self._legacy_one(draft, adapter, block, weights, g),
-                      mass, src="legacy-fallback-pair")
+            if not _write_slot(slot, list(g), uw):
+                raise RuntimeError(
+                    f"merged_cache: merge into slot {slot} failed — layer "
+                    f"{li} group {sorted(g)}")
+            tensors = disp.get_merged_slot(li, slot, 0)
+            self.index[li][key] = (slot, cur)
+            slot_ids.append(slot)
+            _pin_now()
+            self.miss_n += 1
+            _emit(g, _dict3(tensors), mass, src="pair-slot")
+
+        for g in single_miss:                 # pass 3: identity copies
+            i = g[0]
+            key = frozenset(g)
+            slot = self._alloc_slot(li, active_set, li_cooccur, cur)
+            if not disp.merge_experts_to_slot(li, slot, [i], [1.0], 0):
+                raise RuntimeError(
+                    f"merged_cache: identity merge into slot {slot} failed "
+                    f"— layer {li} expert {i}")
+            tensors = disp.get_merged_slot(li, slot, 0)
+            self.index[li][key] = (slot, cur)
+            slot_ids.append(slot)
+            _pin_now()
+            self.singleton_slot_n += 1
+            self.miss_n += 1
+            _emit(g, _dict3(tensors),
+                  sum(weights[m] for m in g), src="singleton-slot")
+
+        if pipeline and job_slots:
+            if not disp.submit_merge_jobs(li, job_slots, job_members,
+                                          job_weights, list(routed)):
+                raise RuntimeError(
+                    f"merged_cache: submit_merge_jobs failed — layer {li} "
+                    f"slots {job_slots}")
 
         self.groups_n += len(experts)
 
@@ -234,13 +372,3 @@ class MergedCacheIndex:
             "weights": [masses[k] / total for k in order],
             "indices": [indices[k] for k in order],
         }
-
-    @staticmethod
-    def _legacy_one(draft, adapter, block, weights, group):
-        """Slot API failed (e.g. no evictable room) — fall back to the legacy
-        per-cycle merge for THIS group only (uniform within-group weights,
-        matching the cache-mode coefficients)."""
-        cw = [0.0] * len(weights)
-        for i in group:
-            cw[i] = 1.0 / len(group)
-        return draft._build_one(adapter, block, cw)

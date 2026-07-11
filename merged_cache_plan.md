@@ -300,21 +300,16 @@ torch-allocator 記憶體——幽靈扣款抽乾帳本、fetch thread 活鎖(jo
   cache 停用 + 印提示。
 
 ### 4.2 Fetch-Overlapped Merge Pipelining(C3)
-- **pipeline 完全下游於 partition(§2.3)**:該層 capture → adopt+greedy →
-  probe,結果決定 hit(直接用 cache,不 fetch 不 merge)與 miss(才進下面
-  的重排與 merge)——沒有 partition/probe 結果,pipeline 無事可排。
-- v1:probe(hit 跳過)+ **enqueue 重排**(下輪 partition 需要且 miss 的
-  成員排最前 fetch;input_queue FIFO、單 fetch thread,Python 排序即控制;
-  C++ 只加一個可選優先序參數——純機制)+ **非 routed 的 wanted 成員附掛
-  prefetch**(miss group 成員這輪沒被 route 到時,附在該層 fetch 流尾端,
-  與 compute 重疊——否則 merge 點要同步補抓冷成員,這是 v1 最實在的收益)
-  + 沿用 P4 side-stream(merge 藏進下一層 fetch)。
-  但書:merge 仍在 dispatch 後(P4 藏一層)時,「routed 內重排」本身收益
-  有限(dispatch 等全員到齊);動刀前先 profiling merge 點等待中冷成員
-  補抓的佔比。
-- v2(profiling 決定):層內 per-group 提前 merge(需 completion event);
-  P4 已把 merge 藏一層,先量 `merge(P3)`/drain 佔比再說。
-- 與 `flush_on_draft_end`(P1)互斥:cache 模式下停用(config 衝突報 error)。
+**本節已由 `c3_pipeline_plan.md` 取代(2026-07-11)**。原 C3-0(P4 側流預設
+化)/ v1(fetch 隊重排)/ v2(per-group 提前 merge)的分階段路線作廢:舊 P4
+為 post-dispatch 一次性 merge 設計,且有 merge 輸入存活性 race(kernel 延後
+執行時,demand evict 與 pin-blind prefetcher 可搬走 from_blob 成員記憶體 →
+靜默錯權重)。新計劃直接到位:**plan 前移到 dispatch 之前 + C++ MergeJob
+pipeline(成員到齊即 merge,snapshot-under-mutex 斷 race)**,同一層內
+fetch ∥ forward ∥ merge。分步 D0-D3 與驗收見新文件。
+- 仍然成立的結論:pipeline 完全下游於 partition(§2.3);compute 側不需要
+  排程(resident 直進 exec queue);與 `flush_on_draft_end`(P1)互斥——
+  cache 模式下停用(config 衝突報 error)。
 
 ### 4.3 Telemetry(C1 起)
 - AUG_PROFILE 新 rows:`merged_hit / merged_miss / merge_elided_GB /
@@ -338,8 +333,9 @@ torch-allocator 記憶體——幽靈扣款抽乾帳本、fetch thread 活鎖(jo
 | C-BOOT | 空首輪 + `run.prefill_warmup` flag(預設 true;false = ablation 走舊 fallback)+ warmup 模式下 fallback 改 hard assert(§2.4;**不依賴 C0–C3,現有 P3 就能建 merged,獨立可先跑**) | q15 topm:draft_fetch GB/題 → ~0、MAT 持平、TTFT 下降;flag off 重現舊行為 |
 | C0 | C++ 機制:id 空間延伸 + `merge_experts_to_slot` + discard 驅逐分支 + `EvictLayer` pin-skip(**先不接 policy,行為不變**) | rebuild + unit tests + smoke ×2(數字不動) |
 | C1 | auto 模式(verify floor)+ Python content index + 工作集 pin(singleton 雙重身分生效)+ 移除舊固定 merged reserve | smoke + q15;singleton_verify_hit 上報 |
-| C2 | **題內** retention + history(保護級 pair pin 到 floor、其餘 unpin/discard;不做跨題 warm start——2026-07-10 定案) | q15;merged_hit / elided GB(題內 adopt rate) |
-| C3 | pipelining v1(probe + enqueue 重排) | AUG_PROFILE;TPS |
+| C2 | **題內 retention = 偷 slot 犧牲者排序**(劃帳模型下 slot 唯一回收點是 `_alloc_slot`,論文 retention 落在這:本 build 不偷 → 非保護先偷 → singleton 先於 pair(identity 重建便宜)→ 冷 co-occur pair 先 → LRU 裁決;S 維持 K′、零 C++) | adopt rate vs C1 的 0.52;steals(protected) telemetry;AccR 不動 |
+| C2.1 | **pair-adopt-first + fallback 移除**(2026-07-11 定案):stage-1 只 adopt 多成員組——adopt singleton 花 1 組額度只覆蓋 1 expert,破壞 M≤2K 的「每組覆蓋 2」記帳,正是 >K 組溢位的根因;singleton 改由 greedy 決定後做 content probe(同樣零成本 hit)。附帶修復 fetch-once 漏洞:舊 stage-1 singleton adopt 不走 archer-pin 步驟 → 留用 expert 每輪被 verify 重 fetch;probe 路徑補上 pin。|active| ≤ 2K 時組數構造性 ≤ K → guard 的 fallback(`_legacy_one`)整個刪除,溢位/merge 失敗一律 fail-fast(RuntimeError) | q5 重跑:singleton hit>0、verify fetch GB ↓、singleton_verify_hit ↑;無 RuntimeError |
+| C3 | **重寫為同層 pipeline(見 `c3_pipeline_plan.md`,取代 C3-0/v1/v2)**:plan 前移 + C++ MergeJob(到齊即 merge、snapshot 斷 race)、slot 開機預配、WaitMergesDone drain;分步 D0-D3 | drain_wait≈0;merge 離開關鍵路徑;q5 → q15 三重複 |
 | **最終驗收** | 整個 plan 完成後,以**論文方法設定的 q15 三重複(`q15_hybrid_a{λ}_r1–r3`,qpc=15/mnt=512/T=5/vram 0.2/uniform)**為對照重跑同 config | (1) **AccR/MAT 落在 run-to-run noise 內**(差 <3pp 多跑取平均)——理論上 plan 不動 draft 權重,AccR 掉 = 有 bug,這是「沒有錯」的判準;(2) TPS ≥ 舊值;(3) draft_fetch/題 → ~0、assert 零觸發。跨方法基準 = `q15_specmoe_ep2`(4.105/0.486 與復跑 4.197/0.515 當 noise band) |
 
 - 驗證固定套路:`tests/unit` → `smoke_noov_*` → q15(qpc=5、mnt=512、
@@ -379,8 +375,9 @@ torch-allocator 記憶體——幽靈扣款抽乾帳本、fetch thread 活鎖(jo
 | C-DEL EvictLayer 全刪(§2.5) | ✅ 2026-07-10:code 全刪、cdel_tm_off liveness 過(4.95GB pool 沖 1.1TB ≈ 12 萬次 demand-evict 零異常、AccR 0.51 健康);**效能 A/B(TPS/verify_fetch vs 歷史)併入最終驗收** |
 | C-BOOT 空首輪 + `run.prefill_warmup` + assert + KV-copy(§2.4) | ✅ 2026-07-10:含兩顆 bug 修復(assistant mask 失同步 → crash;draft 重 encode prompt → AccR 崩,KV-copy 解);診斷 258444 過(offload 0.455 / 對齊率 0.665 / TPS +11%);mnt=512 規模的 MAT 持平驗證併入最終驗收 |
 | C0 C++ slot 機制(行為不變) | ✅ 2026-07-10:MergedSlot 表 + 5 API + 兩段式回收 hook;binding 檢查 + 六項功能 probe(258137)全過;smoke 行為不變 |
-| C1 auto 模式 + content index + 工作集 pin | ✅ 2026-07-10(job 258696):**AccR 0.7036 / TPS 4.489(+15.6% vs freq/legacy 3.884)**、adopt rate 0.52、merge_elided 10.1TB、singleton_verify_hit 3525/cyc(elided 1TB)、pin-denied 0.8%、fallback 0。途中修四 bug:assistant mask 失同步、pin-too-late TOCTOU、pin-blind prefetcher 翻參照(→ singleton 一律 slot 供貨,pin 降級為 verify-hit best-effort)、帳本幽靈扣款+殭屍(→ 劃帳模型 + 帳實守恆,§3 修訂) |
-| C2 題內 retention + history(跨題 warm start 不做) | ⬜ |
-| C3 pipelining v1 | ⬜ |
+| C1 auto 模式 + content index + 工作集 pin | ✅ 2026-07-10(job 258696):**AccR 0.7036 / TPS 4.489(+15.6% vs freq/legacy 3.884)——⚠️ 單跑數字;後續同 config 重跑得 AccR 0.63-0.71 / TPS 3.93-4.49(見 C2 行),幅度結論以 q15 三重複為準**、adopt rate 0.52、merge_elided 10.1TB、singleton_verify_hit 3525/cyc(elided 1TB)、pin-denied 0.8%、fallback 0。途中修四 bug:assistant mask 失同步、pin-too-late TOCTOU、pin-blind prefetcher 翻參照(→ singleton 一律 slot 供貨,pin 降級為 verify-hit best-effort)、帳本幽靈扣款+殭屍(→ 劃帳模型 + 帳實守恆,§3 修訂) |
+| C2 題內 retention(偷 slot 犧牲者排序 + 溢位 guard) | ✅ 2026-07-11(jobs 258941/258998):機制驗證通過——steal telemetry 上線(protected 僅 ~0.1%)、溢位 guard 生效(exhausted 269 / 11.1 萬 builds ≈ **0.24%**,全數由 fallback 正確接手)、early-exit 使 steal 回 O(1)。**但績效結論懸置**:同 config 同 seed 三跑 AccR = 0.7036 / 0.7140 / 0.6292、TPS = 4.489 / 4.320 / 3.934——cache-mode 單跑變異數遠大於 C2 的預期效果量,pp 級比較必須用重複實驗(→ 最終驗收 q15 三重複一併裁決)。另:「平均 16.13 組/build ⇒ 溢位普遍」為分母偽影(prefill builds 灌入分子),實際溢位率即 0.24% |
+| C2.1 pair-adopt-first + fallback 移除 | 🔄 2026-07-11:首驗(259050)證實 **fetch-once 修復生效**——singleton_verify_hit elided 1.07TB→**3.97TB(3.7×)**、pin 事件 2.6×;但暴露實作順序 bug:pair alloc 先於 singleton probe,同 build 把即將命中的 singleton 條目偷走(singleton 是首選犧牲品)→ adopt 0.51→0.38、protected steals 0.1%→19%、identity 重拷 2×。已修:三段式處理(probe 先佔 stamp → pair alloc → singleton miss),29 unit tests 含順序不變量測試;q5 重驗(259089)後判定:順序修復正確但非主因——adopt 0.38 / protected steal 19% 是**純 partition-first 語意的結構性代價**(greedy 自由把快取 singleton 配對稀釋);且兩次 C2.1 跑 AccR 緊貼 0.6245/0.6274,低於 C1/C2 的 0.70 帶 → 疑似真品質回歸。**2026-07-11 定案改走 B variant**:stage-1 恢復 singleton adopt(續留特權,保熱門 expert 精確權重),但加額度可行性 guard(adopt 後剩餘 active 仍須塞得進剩餘額度,r′ ≤ 2·(K−a′)),特權永不推組數超 K,溢位維持構造性不可能;`sgl_feas_denied` 計數上報(推算平均 slack ≈ 8/build,拒絕應為偶發)。30 unit tests。**✅ 2026-07-11 完成(259167)**:機制全數如設計——adopt 0.45、singleton 續任 +31%、identity 重拷 −39%、protected steal 19%→6.8%、feas-denied 0.53/build(偶發)、verify-hit elided 3.9TB、verify fetch 六跑最低;無 RuntimeError。**幅度註記**:六跑 AccR 0.62-0.71 且 258941/258998 同節點、partition 統計相同仍差 8.5pp → q5 的 AccR 解析度 ±4-5pp,partition 微差非主驅動;AccR/TPS 幅度交 q15 三重複裁決 |
+| C3 同層 pipeline(c3_pipeline_plan.md) | ✅ 2026-07-11(job 259252):**drain wait 0.009s/1997 次 ≈ 0(KPI)**,merge 完全離開關鍵路徑;98% job 走到齊即發;verify fetch 16.9TB 歷次最低;AccR 0.6657 同量級、無 fatal。幅度交 q15 三重複 |
 | 最終驗收(q15_hybrid 三重複對照:AccR noise 內持平、TPS ↑、draft_fetch→~0) | ⬜ |
-| 論文補 adopt-first 一句(hierarchy 段 "likely to reproduce" 之後;現行敘述是「先 greedy 後 probe、retention 靠自然重現」,與 §2.3 兩段式實作方向相反,C1 落地後必補) | ⬜ |
+| 論文補 adopt-first 一句(hierarchy 段 "likely to reproduce" 之後)。C2.1 後準確版本:**pair**-adopt-first + singleton 由 greedy 決定後 probe——singleton 部分與論文現行「先 greedy 後 probe」敘述一致,只需補 pair 的 cache-first 一句 | ⬜ |

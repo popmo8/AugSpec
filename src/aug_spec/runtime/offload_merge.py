@@ -73,7 +73,6 @@ class OffloadMergeEngine:
         self._expert_bytes = expert_bytes
         self._singleton_pin_budget = singleton_pin_budget
         self.merged_cache = None
-        self._merge_stream = None                 # lazily created side stream
         # Back-reference to the Controller (set by it after construction): gives
         # on_verify_layer access to the draft (per-layer merge logic) + draft_cache.
         self.controller = None
@@ -106,10 +105,15 @@ class OffloadMergeEngine:
                     singleton_pin_budget=self._singleton_pin_budget)
                 print(f"  [merged_cache] enabled: layers={num_layers} "
                       f"S={self._slots_per_layer} "
-                      f"expert_bytes={self._expert_bytes}")
+                      f"expert_bytes={self._expert_bytes} "
+                      f"pipeline={'on' if self.overlap else 'off (P2 ablation)'}")
             else:
                 print("  [merged_cache] NOT enabled "
                       f"(cache_mode={self.cache_mode}, disp={disp is not None})")
+                if self.overlap:
+                    print("  [merge_overlap] ignored outside cache mode "
+                          "(the old P4 side-stream path was removed, "
+                          "c3_pipeline_plan.md §2.6) — using P2.")
         # activation_similarity / hybrid: turn on the C++ engine's per-expert
         # output capture up front (must be on BEFORE any dispatch;
         # on_verify_layer runs post-dispatch). The dispatcher is shared across
@@ -149,6 +153,26 @@ class OffloadMergeEngine:
         return self.adapter.build_weighted_avg(block, weights)
 
     # ── lifecycle hooks (stubs — grow with each optimisation) ───────────
+    def on_verify_layer_plan(self, layer_idx: int, block, routed) -> None:
+        """C3 pipeline(c3_pipeline_plan.md):adapter 在 dispatch_local
+        **之前**呼叫——score 在同一 forward 稍早已 capture,所以分群可以現在
+        規劃,miss 組以 C++ MergeJob 提交;每個 job 在最後一個 routed 成員落地
+        的瞬間執行,與同層剩餘的 fetch + forward 重疊。`routed` = 本次 verify
+        會取用的 expert(非 routed 的缺席成員不設門,exec 時 H2D 直讀)。
+        needs_activation_sim 的方法在此使用「截至上一 forward」的 pair_sim
+        (晚一格,hybrid decode 為 capture-free 不受影響)。非 cache-mode
+        pipeline 時 no-op。"""
+        if (not self.during_verify or not self.overlap
+                or self.merged_cache is None or self.controller is None
+                or self.controller.in_draft_phase):
+            return
+        draft = self.controller.draft
+        score = getattr(draft, "target_score", {}).get(layer_idx)
+        if score is None or not hasattr(draft, "_refresh_layer"):
+            return
+        draft._refresh_layer(self.adapter, block, layer_idx, score,
+                             self.controller.draft_cache, routed=routed)
+
     def on_verify_layer(self, layer_idx: int, block: nn.Module) -> None:
         """Called from the offload verify routing once layer `layer_idx`'s
         experts are GPU-resident (post-dispatch, pre-evict).
@@ -174,38 +198,22 @@ class OffloadMergeEngine:
             if d is not None and hasattr(d, "get_captured_expert_outputs"):
                 draft.accumulate_activation_sim(
                     layer_idx, d, self.adapter.num_experts(block))
+        if self.overlap and self.merged_cache is not None:
+            # C3 pipeline:本層的 merge 已在 dispatch 前規劃並交給 C++ merge
+            # 線程(on_verify_layer_plan),post-dispatch 無事可做(上面的
+            # act-sim 累加照常餵下一輪)。
+            return
         score = getattr(draft, "target_score", {}).get(layer_idx)
         if score is None or not hasattr(draft, "_refresh_layer"):
             return
-        disp = self._dispatcher()
-        import torch
-
-        def _merge():
-            draft._refresh_layer(self.adapter, block, layer_idx, score,
-                                 self.controller.draft_cache)
-
-        if not self.overlap or disp is None:
-            # P2 (synchronous): merge on the default stream. C-DEL
-            # (merged_cache_plan.md §2.5): NO per-layer eviction any more —
-            # verify residents stay in the pool and are reclaimed on demand by
-            # the pin-aware LFU (FindExpertEvict); the old rationale (avoid the
-            # overload evict-after-use race) died with the overload path. The
-            # synchronize stays for now so this change is eviction-only
-            # (attribution); C1 removes it with the cache mode.
-            _merge()
-            if disp is not None:
-                torch.cuda.synchronize()
-            return
-
-        # P4: run the merge on a side stream so it overlaps the next layer's PCIe
-        # fetch (default stream). The merge result in draft_cache is read only
-        # in the next draft phase, after on_draft_start syncs the side stream.
-        # (The old deferred per-layer evict went with C-DEL — eviction is
-        # demand-driven now.)
-        if self._merge_stream is None:
-            self._merge_stream = torch.cuda.Stream()
-        with torch.cuda.stream(self._merge_stream):
-            _merge()
+        # P2(同步;也是 merge_overlap:false 的 ablation 路徑):merge 在
+        # default stream 上。C-DEL:無 per-layer eviction;D3 一併移除了先前
+        # 保留的 per-layer torch.cuda.synchronize(eviction 是 demand-driven,
+        # draft 只在相位邊界後讀)。舊 P4 側流已刪(c3_pipeline_plan.md §2.6:
+        # 輸入存活性 race)——legacy + overlap 由 attach 印 deprecation 後走
+        # 這裡。
+        draft._refresh_layer(self.adapter, block, layer_idx, score,
+                             self.controller.draft_cache)
 
     def _dispatcher(self):
         """The archer ExpertDispatcher (shared across blocks), or None."""
@@ -215,11 +223,14 @@ class OffloadMergeEngine:
         return getattr(ex, "expert_dispatcher", None) if ex is not None else None
 
     def _drain_pending(self) -> None:
-        """P4: sync the side merge stream at the verify→draft boundary so the
-        draft reads valid merged tensors off the default stream. No-op unless
-        overlap ran. (The old deferred per-layer evict went with C-DEL.)"""
-        if self._merge_stream is not None:
-            self._merge_stream.synchronize()
+        """C3:等所有已提交 MergeJob 執行完且 kernel 落定(C++
+        WaitMergesDone;60s 未完成 → forensic dump + fatal,無降級)。唯一
+        drain 點:verify→draft 邊界與題界。P2 / legacy(從未提交 job)為
+        no-op。"""
+        if self.overlap and self.merged_cache is not None:
+            d = self._dispatcher()
+            if d is not None and hasattr(d, "wait_merges_done"):
+                d.wait_merges_done(60.0)
 
     def on_question_start(self) -> None:
         """Called from Controller.reset() at each question start. Re-arms the
@@ -230,9 +241,10 @@ class OffloadMergeEngine:
         if getattr(self._cluster_method(), "act_sim_prefill_only", False) \
                 and not self._capture_on:
             self._set_capture(True)
-        # C1: question boundary — drop the content index and every pin (no
-        # cross-question warm start yet; that is C2).
+        # 題界:先 drain(不留孤兒 MergeJob)再清 index/pin(跨題 warm
+        # start 已定案不做)。
         if self.merged_cache is not None:
+            self._drain_pending()
             self.merged_cache.reset(self.blocks, self._dispatcher())
 
     def on_draft_start(self) -> None:

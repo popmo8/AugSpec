@@ -6,8 +6,12 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <list>
+#include <optional>
 #include <functional>
 #include <map>
 #include <memory>
@@ -54,6 +58,11 @@ class ExpertDispatcher : public base::noncopyable {
                             int expert_type, int num_threads = 1);
   ~ExpertDispatcher() {
     main_thread_stop_flag_.store(true);
+    if (merge_thread_started_.load()) {
+      std::shared_ptr<MergeJob> sentinel;   // Push 只收 lvalue
+      merge_ready_.Push(sentinel);          // nullptr → MergeThreadFunc exits
+      if (merge_thread_.joinable()) merge_thread_.join();
+    }
     for (auto& thread : threads_) {
       thread->join();
     }
@@ -131,8 +140,23 @@ class ExpertDispatcher : public base::noncopyable {
   std::vector<torch::Tensor> GetMergedSlot(int layer_idx, int slot_idx,
                                            int gpu_id);   // empty = probe miss
   void SetMergedSlotPinned(int layer_idx, const std::vector<int>& slot_ids,
-                           int gpu_id);   // replaces the layer's slot pins
-  void DiscardMergedSlot(int layer_idx, int slot_idx, int gpu_id);
+                           int gpu_id);
+
+  // ── C3 merge-job pipeline (c3_pipeline_plan.md D1) ────────────────────
+  // Submit this layer's miss-group merges BEFORE dispatch. Parallel arrays:
+  // one job per index. `routed` = experts this verify pass will fetch/compute;
+  // a non-resident member NOT in `routed` never arrives → the job does not
+  // gate on it (read H2D from the host copy at exec instead). Jobs whose
+  // routed members are all resident go straight to the merge thread; the rest
+  // fire when their last routed member lands (NotifyExpertArrived).
+  bool SubmitMergeJobs(int layer_idx, const std::vector<int>& slots,
+                       const std::vector<std::vector<int>>& members,
+                       const std::vector<std::vector<double>>& weights,
+                       const std::vector<int>& routed);
+  // Block until every submitted job has run AND its kernels completed.
+  // timeout → forensic dump + fatal (no degraded mode). The only drain point:
+  // draft start / question boundary.
+  void WaitMergesDone(double timeout_s);   // replaces the layer's slot pins
 
   // aug_spec: run K merged dense draft experts through the SAME MoEMLP::forward
   // kernel the archer dispatch uses, so the merged-expert draft and the SpecMoE
@@ -256,9 +280,12 @@ class ExpertDispatcher : public base::noncopyable {
   // Merged-expert slot table [layer][slot] (merged_cache_plan.md C0). Sized by
   // InitMergedSlots; empty by default. See the public API block for semantics.
   struct MergedSlot {
-    std::vector<torch::Tensor> tensors;   // persistent GPU buffers
+    // Persistent GPU buffers, pre-allocated at InitMergedSlots (D0,
+    // c3_pipeline_plan.md): handles are valid BEFORE content is written —
+    // required by the plan-ahead emit (D2). Content is overwritten in place
+    // by merges; there is no discard path.
+    std::vector<torch::Tensor> tensors;
     int64_t byte_size = 0;
-    bool cached = false;   // currently holds pool bytes
     bool pinned = false;   // draft working set / protected history (no evict)
   };
   std::vector<std::vector<MergedSlot>> merged_slots_;
@@ -268,6 +295,29 @@ class ExpertDispatcher : public base::noncopyable {
   std::vector<std::atomic<int64_t>> exec_active_;
 
   int cache_capacity_ = 0;
+
+  // ── C3 merge-job pipeline state (guarded by merge_mu_) ────────────────
+  struct MergeJob {
+    int layer = 0;
+    int slot = 0;
+    std::vector<int> experts;
+    std::vector<double> weights;
+    int missing = 0;          // routed members not yet resident
+    int64_t submit_us = 0;
+  };
+  std::mutex merge_mu_;
+  std::condition_variable merge_cv_;
+  std::unordered_map<uint64_t, std::vector<std::shared_ptr<MergeJob>>>
+      merge_watch_;           // (layer,expert) → jobs gated on its arrival
+  ThreadSafeQueue<std::shared_ptr<MergeJob>> merge_ready_;
+  std::atomic<int64_t> merge_pending_{0};
+  std::atomic<bool> merge_thread_started_{false};
+  std::thread merge_thread_;
+  std::optional<c10::cuda::CUDAStream> merge_stream_;
+  void MergeThreadFunc();
+  void ExecMergeJob(const std::shared_ptr<MergeJob>& job);
+  // Fetch-thread hook: fires gated jobs whose last routed member landed.
+  void NotifyExpertArrived(int64_t layer_idx, int64_t expert_idx);
 
   std::vector<MoEMLP*> modules_;
 
@@ -287,6 +337,12 @@ class ExpertDispatcher : public base::noncopyable {
     std::atomic<int64_t> forward_n{0}, forward_us{0};
     std::atomic<int64_t> merge_n{0}, merge_us{0};
     std::atomic<int64_t> dispatch_n{0}, dispatch_us{0};
+    // C3 pipeline (c3_pipeline_plan.md §4.3): job counts, arrival-gate wait,
+    // cold member H2D bytes read inside jobs, and the drain wait at draft
+    // start — drain_wait≈0 is the C3 KPI (merge fully hidden by verify).
+    std::atomic<int64_t> mg_jobs_n{0}, mg_gated_n{0}, mg_gate_wait_us{0};
+    std::atomic<int64_t> mg_cold_bytes{0};
+    std::atomic<int64_t> drain_n{0}, drain_wait_us{0};
   };
   ProfileCounters prof_;
   std::atomic<int> profile_phase_{0};   // 0 = verify, 1 = draft
