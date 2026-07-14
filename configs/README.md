@@ -23,7 +23,7 @@ model:
     # merged_backend: engine_bmm        # engine_bmm (default) | dispatch | bmm  (A4)
 
 draft:
-  name: uniform | count | pruned_count | topm_count | prefill_count | prefill_topm_count | softmax | random_mask | specmoe   # REQUIRED
+  name: uniform | count | pruned_count | topm_count | prefill_count | prefill_topm_count | softmax | random_mask | random_merge | specmoe | none   # REQUIRED
   args:
     # strategy-specific — see "Draft strategies" below
   # early_pin: 0                        # default: 0  — SpecMoE early-pin stage 0|1|2 (A4)
@@ -235,19 +235,85 @@ require all experts in GPU at build time (any expert with non-zero
 softmax mass gets pulled in) — fine on full-GPU backend, see
 [../PROGRESS.md](../PROGRESS.md) for the offloading caveat.
 
-#### `random_mask` — single random expert per layer per cycle (baseline)
+#### `random_mask` — `num_keep` random experts per layer, fixed for the run
 
 ```yaml
 draft:
   name: random_mask
   args:
-    seed: 42               # REQUIRED — different seeds yield different sweeps
-    num_experts: 8         # optional — auto-defaults to adapter.num_experts(first block)
+    seed: 42               # REQUIRED — masks are reproducible per seed
+    num_keep: 16           # experts kept per layer (default 1)
+    num_experts: 128       # optional — auto-defaults to adapter.num_experts(first block)
+    per_cycle: false       # true = legacy: redraw the mask every cycle
 ```
 
-Picks one uniformly random expert per layer at the start of each
-cycle. Sweep `seed` across 42 / 123 / 456 etc. for a stable
-randomness baseline.
+The Table-1 "Random (prune)" baseline: the kept set is drawn ONCE per run
+(seeded) and stays fixed for every question and cycle — the "random"
+policy of the {random, static, dynamic} axis (only SpecMoE and the
+count-merge drafts are dynamic). `per_cycle: true` restores the
+historical single-expert-per-cycle behaviour.
+
+#### `random_merge` — K random-group merged experts, fixed for the run
+
+```yaml
+draft:
+  name: random_merge
+  args:
+    K: 16                  # merged experts per layer
+    draft_top_k: 8         # clusters activated per token (default: native top-k)
+    seed: 0
+```
+
+The Table-1 "Random (merge)" baseline: ALL n experts are partitioned into
+K random balanced groups once per run (seeded), each group merged with
+uniform weights (1/|group|), frozen for the whole run. Routing uses the
+same gate-remap path as the dynamic merge drafts. The `cluster` section
+is ignored — the partition is the draft's own.
+
+#### `static_mask` — offline-searched kept-set mask (Enumerate/NAEE baseline)
+
+```yaml
+draft:
+  name: static_mask
+  args:
+    spec_path: output/naee/Qwen3-30B-A3B-Base_r16.json   # REQUIRED
+```
+
+The Table-1 "Enumerate" baseline (prune–static): loads the kept-set spec
+searched offline by `scripts/search_naee.py` (min reconstruction loss over
+calibration tokens; exact enumeration when C(n, r) is small, seeded
+sampling otherwise — the Qwen3 row is "sampled") and freezes each layer's
+boolean mask for the whole run. Same masked-forward mechanics as
+`random_mask`.
+
+#### `static_merge` — offline-clustered merged experts (HC-SMoE baseline)
+
+```yaml
+draft:
+  name: static_merge
+  args:
+    spec_path: output/hc_smoe/Qwen3-30B-A3B-Base_K16.json   # REQUIRED
+    draft_top_k: 8         # clusters activated per token (default: native top-k)
+```
+
+The Table-1 "HC-SMoE" baseline (merge–static): loads the grouping spec
+built offline by `scripts/build_hc_smoe.py` (average-linkage clustering on
+calibration expert outputs from `scripts/collect_calibration.py`), merges
+each group frequency-weighted ONCE, and stays frozen for the whole run.
+The `cluster` section is ignored — the partition lives in the spec file.
+
+#### `none` — non-speculative baseline (e.g. MoE-Caching)
+
+```yaml
+draft:
+  name: none
+```
+
+No draft, no controller, no forward swaps: plain target-only `generate`.
+MAT/AccR come out zero; TPS is the meaningful output. With
+`backend: offload` the archer pool gets the full VRAM budget (no merged
+reserve) — this is the MoE-Caching row of Table 2 (the engine's LFU
+expert cache under the same total budget).
 
 ## `cluster`
 
@@ -291,6 +357,9 @@ accumulated in the engine's `on_verify_layer` hook).
 | `prefill_warmup` | bool | `true` | **C-BOOT** (merged_cache_plan.md §2.4): the first candidate round of every question returns zero candidates, so the target does a pure prefill that captures routing stats and builds the draft state *before* the first real draft — the first-cycle standard-routing fallback (and its ~47GB/question draft fetch) never triggers, and reaching it raises. `false` = paper ablation (legacy draft-first + first-cycle fallback). Applies to every method (loop-level). Distinct from `warmup` above. |
 | `emit_tokens_csv` | bool | `false` | Per-cycle per-position dump. Useful for offline analysis; ~100 MB / full run. |
 | `spec_bench_cache` | str | `<cwd>/data/spec_bench` | Override where `question.jsonl` is downloaded / loaded. |
+| `skip_categories` | list | `[]` | Drop whole categories before sampling; `mt_bench` expands to its 8 sub-categories. |
+| `mt_bench_pooled` | bool | `false` | Sample mt_bench's 8 sub-categories as ONE pool: the whole mt_bench subtask contributes `questions_per_cat` questions total (default: qpc PER sub-category, up to 8×qpc). Aggregation unchanged. |
+| `humaneval` | bool | `false` | Append HumanEval (164 problems, `questions_per_cat` sampled) as its own `humaneval` category — the paper tables' Coding column. Prompted as raw completion (no chat template). Category name is deliberately NOT `coding` (that is an mt_bench sub-category). Cached at `<spec_bench_cache>/../humaneval/`. |
 | `reasoning_effort` | str | (none) | **GPT-OSS only** — injected into the chat template by `GptOssAdapter.post_load`. |
 
 ## `output`

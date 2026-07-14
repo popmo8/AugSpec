@@ -1,0 +1,21 @@
+# A3/A4 smoke (baseline_tables_plan.md): draft:none non-speculative baseline
+# (= MoE-Caching path) on offload + humaneval category. Full vram budget goes
+# to the archer pool (no draft, no merged reserve, no cpu_source).
+# qpc=1, mnt=64 — correctness only; MAT/AccR are zero by construction.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+
+draft:
+  name: none
+
+run:
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+
+output: {label: smoke_a_none, dir: output/smoke_a_none}

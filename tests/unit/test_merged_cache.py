@@ -331,3 +331,19 @@ def test_c3_pipeline_content_matches_sync():
     for e1, e2 in zip(o1["experts"], o2["experts"]):
         for k in e1:
             assert torch.equal(e1[k], e2[k])
+
+
+def test_no_data_fallback_compressed_to_quota():
+    """hybrid 兩表皆空 → greedy_pair 回全 singleton(>K 組);cache mode 必須
+    壓回額度(低權重先配對、高權重保純),不觸發 slot fail-fast。"""
+    from aug_spec.clustering import get_cluster_method
+    disp = FakeDisp()
+    draft = FakeDraft(K=2)
+    draft.cluster_method = get_cluster_method("hybrid")   # 表空 → 全 singleton
+    draft.K = 3
+    mc = MergedCacheIndex(slots_per_layer=3, expert_bytes=100)
+    w = _weights(8, {0: 5, 1: 4, 2: 3, 3: 2, 4: 1})       # 5 actives, K=3
+    out = mc.build_layer(0, _block(disp), w, draft)
+    assert len(out["experts"]) == 3                        # 壓回 K
+    assert [0] in out["indices"]                           # 最高權重保純
+    assert sorted(x for g in out["indices"] for x in g) == [0, 1, 2, 3, 4]

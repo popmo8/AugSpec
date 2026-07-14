@@ -1,0 +1,20 @@
+# C2 smoke (baseline_tables_plan.md): static_merge (HC-SMoE) on hf with the
+# real K=16 spec + humaneval. qpc=1, mnt=64 — correctness only.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: static_merge
+  args:
+    spec_path: output/hc_smoe/Qwen3-30B-A3B-Base_K16.json
+    draft_top_k: 8
+
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+
+output: {label: smoke_c_hcsmoe, dir: output/smoke_c_hcsmoe}

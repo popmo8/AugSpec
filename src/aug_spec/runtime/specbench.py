@@ -23,12 +23,14 @@ from __future__ import annotations
 import copy
 import csv
 import functools
+import gzip
 import json
+import os
 import random
 import time
 import urllib.request
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -50,10 +52,19 @@ SPEC_BENCH_MT_BENCH_CATS = frozenset({
     "coding", "extraction", "stem", "humanities",
 })
 
-# Subtask order from Spec-Bench's evaluation/speed.py::get_single_speedup.
+# HumanEval (the paper tables' Coding column). Category name is
+# "humaneval", NOT "coding" — "coding" is an mt_bench sub-category and
+# reusing it would cross-contaminate both aggregations.
+HUMANEVAL_URL = (
+    "https://raw.githubusercontent.com/openai/human-eval/master/"
+    "data/HumanEval.jsonl.gz"
+)
+
+# Subtask order from Spec-Bench's evaluation/speed.py::get_single_speedup,
+# plus our humaneval extension (run.humaneval).
 SPEC_BENCH_SUBTASKS: Tuple[str, ...] = (
     "mt_bench", "translation", "summarization",
-    "qa", "math_reasoning", "rag", "overall",
+    "qa", "math_reasoning", "rag", "humaneval", "overall",
 )
 
 
@@ -74,6 +85,29 @@ def _load_spec_bench_questions(cache_dir: Path) -> List[Dict[str, Any]]:
             line = line.strip()
             if line:
                 questions.append(json.loads(line))
+    return questions
+
+
+def _load_humaneval_questions(cache_dir: Path) -> List[Dict[str, Any]]:
+    """Download (once) HumanEval and adapt it to the question schema
+    (`question_id` / `category` / `turns`). 164 problems; the shared
+    per-category sampler then draws `questions_per_cat` of them."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / "HumanEval.jsonl.gz"
+    if not cache_file.exists():
+        print(f"  Downloading HumanEval → {cache_file}")
+        urllib.request.urlretrieve(HUMANEVAL_URL, cache_file)
+    questions: List[Dict[str, Any]] = []
+    with gzip.open(cache_file, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rec = json.loads(line)
+                questions.append({
+                    "question_id": rec["task_id"],
+                    "category": "humaneval",
+                    "turns": [rec["prompt"]],
+                })
     return questions
 
 
@@ -112,6 +146,42 @@ def _category_matches(q_cat: str, subtask: str) -> bool:
     if subtask == "mt_bench":
         return q_cat in SPEC_BENCH_MT_BENCH_CATS
     return q_cat == subtask
+
+
+def _sample_questions(all_q: List[Dict[str, Any]], questions_per_cat: int,
+                      seed: int, skip_categories: Optional[List[str]],
+                      mt_bench_pooled: bool) -> Tuple[List[Dict[str, Any]],
+                                                      set]:
+    """Per-category sampling (seeded shuffle, first `questions_per_cat`).
+
+    `mt_bench_pooled` treats mt_bench's 8 sub-categories as ONE pool, so
+    the whole mt_bench subtask contributes `questions_per_cat` questions
+    (default False = legacy: qpc PER sub-category, i.e. up to 8×qpc).
+    Question dicts keep their original sub-category, so aggregation is
+    unchanged either way."""
+    skip: set = set()
+    for c in (skip_categories or []):
+        if c == "mt_bench":
+            skip |= set(SPEC_BENCH_MT_BENCH_CATS)
+        else:
+            skip.add(c)
+    by_cat: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for q in all_q:
+        if q["category"] in skip:
+            continue
+        by_cat[q["category"]].append(q)
+    if mt_bench_pooled:
+        pool = [q for c in sorted(SPEC_BENCH_MT_BENCH_CATS)
+                for q in by_cat.pop(c, [])]
+        if pool:
+            by_cat["mt_bench"] = pool
+    rng = random.Random(seed)
+    questions: List[Dict[str, Any]] = []
+    for cat in sorted(by_cat):
+        pool = list(by_cat[cat])
+        rng.shuffle(pool)
+        questions.extend(pool[:questions_per_cat])
+    return questions, skip
 
 
 # =============================================================================
@@ -485,20 +555,32 @@ def run_specbench(
     vram_limit_bytes: Optional[int] = None,
     vram_guard: bool = False,
     skip_categories: Optional[List[str]] = None,
+    include_humaneval: bool = False,
+    mt_bench_pooled: bool = False,
 ) -> SpecBenchResult:
     """Run SpecBench eval with a fixed-T speculative schedule.
 
     See module docstring for the full pipeline. Returns a `SpecBenchResult`
     with `per_question`, `per_subtask`, and `overall` aggregates.
 
+    `draft_model=None` runs the non-speculative baseline (e.g. MoE-Caching):
+    plain target-only `generate`, no assist patch; MAT/AccR come out zero
+    and TPS is the meaningful output.
+
+    `include_humaneval` (run.humaneval) appends HumanEval as its own
+    "humaneval" category (the tables' Coding column), sampled with the same
+    `questions_per_cat` and prompted as raw completion (no chat template).
+
     `before_generate(input_ids)` (optional) runs immediately before every
     `target_model.generate(...)` call (warmup + each question). The offload
     backend wires `moe._configure_hook` here — moe_infinity needs fresh
     expert-tracer sequence entries per generation. No-op (None) on hf.
     """
-    target_model.generation_config.num_assistant_tokens = num_speculative
-    target_model.generation_config.num_assistant_tokens_schedule = "constant"
-    draft_model.generation_config.assistant_confidence_threshold = 0
+    spec = draft_model is not None
+    if spec:
+        target_model.generation_config.num_assistant_tokens = num_speculative
+        target_model.generation_config.num_assistant_tokens_schedule = "constant"
+        draft_model.generation_config.assistant_confidence_threshold = 0
 
     # VRAM budget audit + guard (verify_merge_plan.md §0.1). Driver-level total
     # GPU memory (includes archer's cudaMalloc pool, which torch peak misses) is
@@ -529,35 +611,24 @@ def run_specbench(
     cache_dir = (spec_bench_cache if spec_bench_cache is not None
                  else Path.cwd() / "data" / "spec_bench")
     all_q = _load_spec_bench_questions(cache_dir)
-    # run.skip_categories: drop whole categories (or the "mt_bench" alias, which
-    # expands to its 8 sub-categories) before sampling — e.g. to run without
-    # mt_bench's 40 questions.
-    skip: set = set()
-    for c in (skip_categories or []):
-        if c == "mt_bench":
-            skip |= set(SPEC_BENCH_MT_BENCH_CATS)
-        else:
-            skip.add(c)
-    by_cat: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for q in all_q:
-        if q["category"] in skip:
-            continue
-        by_cat[q["category"]].append(q)
-    rng = random.Random(seed)
-    questions: List[Dict[str, Any]] = []
-    for cat in sorted(by_cat):
-        pool = list(by_cat[cat])
-        rng.shuffle(pool)
-        questions.extend(pool[:questions_per_cat])
+    if include_humaneval:
+        all_q = all_q + _load_humaneval_questions(cache_dir.parent / "humaneval")
+    questions, skip = _sample_questions(
+        all_q, questions_per_cat, seed, skip_categories, mt_bench_pooled)
     if skip:
         print(f"  Skipped cats  : {sorted(skip)}")
+    if mt_bench_pooled:
+        n_mt = sum(1 for q in questions
+                   if q["category"] in SPEC_BENCH_MT_BENCH_CATS)
+        print(f"  mt_bench      : pooled sampling — {n_mt} questions total")
 
     print("=" * 70)
     title = f"  SpecBench [{label}]" if label else "  SpecBench"
     print(title)
     print(f"  T (fixed)     : {num_speculative}")
     print(f"  Q/cat         : {questions_per_cat}")
-    print(f"  Total Q       : {len(questions)} ({len(by_cat)} categories)")
+    n_cats = len({q["category"] for q in questions})
+    print(f"  Total Q       : {len(questions)} ({n_cats} categories)")
     if output_dir is not None:
         print(f"  Output        : {output_dir}")
     print("=" * 70)
@@ -597,16 +668,17 @@ def run_specbench(
             # C-BOOT: the compile-warmup generate must run under the same
             # assist patch as the questions — with prefill_warmup the draft
             # would otherwise run first with an empty draft cache and trip the
-            # adapters' fail-fast assert.
-            with _locked_assist_patch(
+            # adapters' fail-fast assert. Non-speculative runs skip the patch.
+            warm_patch = (_locked_assist_patch(
                 num_speculative, lm_topk, lambda cs: None,
                 prefill_warmup=prefill_warmup,
                 on_prefill_warmup=on_prefill_warmup,
                 target_model=target_model,
-            ):
+            ) if spec else nullcontext())
+            with warm_patch:
                 target_model.generate(
                     **warm_in, max_new_tokens=8, do_sample=False,
-                    assistant_model=draft_model,
+                    **({"assistant_model": draft_model} if spec else {}),
                 )
         print("    warmup done")
 
@@ -622,7 +694,12 @@ def run_specbench(
                 on_question_start(q)
 
             user_msg = q["turns"][0]
-            prompt = _format_chat_prompt(tokenizer, [], user_msg)
+            if category == "humaneval":
+                # Raw completion — HumanEval prompts are code prefixes; a
+                # chat template would break the continuation task.
+                prompt = user_msg
+            else:
+                prompt = _format_chat_prompt(tokenizer, [], user_msg)
             inputs = tokenizer(prompt, return_tensors="pt").to(
                 get_model_device(target_model))
             input_len = int(inputs["input_ids"].shape[1])
@@ -651,23 +728,36 @@ def run_specbench(
                     torch.cuda.synchronize()
                 if before_generate is not None:
                     before_generate(inputs["input_ids"])
-                with _locked_assist_patch(
+                gen_patch = (_locked_assist_patch(
                     num_speculative, lm_topk, _on_verify,
                     prefill_warmup=prefill_warmup,
                     on_prefill_warmup=on_prefill_warmup,
                     target_model=target_model,
-                ):
+                ) if spec else nullcontext())
+                with gen_patch:
                     out = target_model.generate(
                         **inputs,
                         max_new_tokens=max_new_tokens,
                         do_sample=False,
-                        assistant_model=draft_model,
+                        **({"assistant_model": draft_model} if spec else {}),
                     )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 wall = time.perf_counter() - t0
+                # Per-question sample so the peak audit also covers
+                # non-speculative runs (draft:none has no verify cycles —
+                # the per-cycle sample above never fires there).
+                _vram_sample("question_end")
 
                 new_tokens = int(out.shape[1] - input_len)
+                # AUG_DUMP_COMMITTED=1: diagnostic — the exact generated token
+                # stream per question → <output_dir>/committed.jsonl, for the
+                # V1 batch-loop equivalence check. No-op when unset.
+                if os.environ.get("AUG_DUMP_COMMITTED") and output_dir:
+                    with open(output_dir / "committed.jsonl", "a") as _f:
+                        _f.write(json.dumps(
+                            {"qid": qid,
+                             "committed": out[0, input_len:].tolist()}) + "\n")
                 accept_lens = [1 + nm for _, nm in cycle_stats]
                 n_prop = sum(n for n, _ in cycle_stats)
                 n_acc = sum(nm for _, nm in cycle_stats)

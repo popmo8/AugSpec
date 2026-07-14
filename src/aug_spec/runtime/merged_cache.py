@@ -275,6 +275,24 @@ class MergedCacheIndex:
                     cooccur=draft.cooccur.get(li),
                     pair_sim=draft._pair_sim_table(li))
                 groups = draft.cluster_method.assign(ctx, k_rem)
+                if len(groups) > k_rem:
+                    # No-data fallback(hybrid/cooccur 的表在題首尚未累積時
+                    # greedy_pair 回全 singleton)會超出剩餘額度——legacy
+                    # 模式無所謂,cache mode 的組數受 slot 上限硬約束
+                    # (f15 259303/259305:S=16 fail-fast)。壓回額度:
+                    # 低權重 singleton 兩兩合併、高權重保持純 singleton
+                    # (與 freq_slice 的鄰接配對精神一致)。只影響表格
+                    # 空白的最初幾個 build。
+                    singles = sorted((g for g in groups if len(g) == 1),
+                                     key=lambda g: weights[g[0]])
+                    multis = [g for g in groups if len(g) > 1]
+                    need = len(groups) - k_rem
+                    while need > 0 and len(singles) >= 2:
+                        a = singles.pop(0)
+                        b = singles.pop(0)
+                        multis.append(a + b)
+                        need -= 1
+                    groups = multis + singles
 
         # Singleton note: the DRAFT is always served from an identity slot
         # (our own torch buffers) — holding refs to the resident original is

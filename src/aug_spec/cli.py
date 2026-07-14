@@ -13,7 +13,9 @@ Example YAML:
       # adapter: mixtral                # optional; auto-detected if omitted
 
     draft:
-      name: count                       # uniform | count | pruned_count | softmax | random_mask
+      name: count   # uniform | count | pruned_count | topm_count | prefill* |
+                    # softmax | random_mask | random_merge | specmoe |
+                    # none (non-speculative baseline, e.g. MoE-Caching)
       args:
         count_top_k: 2                  # optional for count-based drafts
         record_history: true
@@ -37,6 +39,7 @@ Outputs go to `output.dir`:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import os
@@ -135,6 +138,20 @@ class RunConfig:
     emit_tokens_csv: bool
     spec_bench_cache: Optional[Path]
     skip_categories: List[str]           # run.skip_categories (e.g. ["mt_bench"])
+    humaneval: bool                      # run.humaneval: append HumanEval as
+                                         # its own "humaneval" category (the
+                                         # paper tables' Coding column)
+    mt_bench_pooled: bool                # run.mt_bench_pooled: sample the 8
+                                         # mt_bench sub-categories as ONE pool
+                                         # (qpc questions total, not per subcat)
+    batch_loop: bool                     # run.batch_loop (batch_spec_plan.md):
+                                         # use the custom batched spec loop
+                                         # instead of HF assisted decoding.
+                                         # false = legacy path, untouched.
+    batch_size: int                      # run.batch_size (batch_loop only)
+    debug_invariants: bool               # run.debug_invariants: assert the
+                                         # ragged-batch invariants each cycle
+                                         # (V3 validation; batch_loop only)
 
     # output
     output_dir: Path
@@ -232,6 +249,11 @@ class RunConfig:
             emit_tokens_csv=bool(run_cfg.get("emit_tokens_csv", False)),
             spec_bench_cache=spec_cache_path,
             skip_categories=[str(c) for c in (run_cfg.get("skip_categories") or [])],
+            humaneval=bool(run_cfg.get("humaneval", False)),
+            mt_bench_pooled=bool(run_cfg.get("mt_bench_pooled", False)),
+            batch_loop=bool(run_cfg.get("batch_loop", False)),
+            batch_size=int(run_cfg.get("batch_size", 1)),
+            debug_invariants=bool(run_cfg.get("debug_invariants", False)),
             output_dir=output_dir,
             label=str(out_cfg.get("label", path.stem)),
         )
@@ -334,6 +356,10 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print(f"  Output     : {cfg.output_dir}")
     print("=" * 70)
 
+    # draft.name "none" → non-speculative baseline (e.g. MoE-Caching): no
+    # draft, no controller, no forward swaps — plain target-only generate.
+    spec_mode = cfg.draft_name.lower() != "none"
+
     # Apply YAML overrides for the offload knobs that used to be import-time
     # env reads (A4). Must run before any forward; env vars still override.
     apply_offload_settings(merged_backend=cfg.merged_backend,
@@ -365,7 +391,7 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
             model_vram = compute_model_vram_bytes(
                 cfg.model_id, cfg.dtype, cfg.trust_remote_code)
             usable_vram_bytes = int(cfg.vram_budget_ratio * model_vram)
-            wants_merged = (cfg.merge_offload and
+            wants_merged = (spec_mode and cfg.merge_offload and
                             get_draft_class(cfg.draft_name)
                             .holds_merged_residency)
             K = int(cfg.draft_args.get("K", 1))
@@ -440,12 +466,13 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
               f"(device_memory_ratio={device_memory_ratio:.4f}) ...")
         # cpu_source = host-resident weights for draft-side merging (M7).
         # Merge runs on CPU and ships one expert to GPU (offload-safe for any
-        # merge draft); masked drafts (random_mask) never touch it.
+        # merge draft); masked drafts (random_mask) never touch it. Skipped
+        # entirely for draft:none — no draft means nothing ever reads it.
         model, tokenizer, moe, cpu_source = load_offload(
             cfg.model_id, cfg.offload_path,
             device_memory_ratio=device_memory_ratio,
             dtype=cfg.dtype, trust_remote_code=cfg.trust_remote_code,
-            load_cpu_source=True,
+            load_cpu_source=spec_mode,
         )
     else:
         print(f"\nLoading {cfg.model_id} (single copy; target == draft) ...")
@@ -457,88 +484,131 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
         )
     model.eval()
 
-    if cfg.adapter_name is not None:
-        adapter = get_adapter(cfg.adapter_name)
+    draft = None
+    controller = None
+    on_cycle_extra = None
+    draft_args = dict(cfg.draft_args)
+    if spec_mode:
+        if cfg.adapter_name is not None:
+            adapter = get_adapter(cfg.adapter_name)
+        else:
+            adapter = adapter_for_config(model.config)
+        adapter.post_load(model, tokenizer, _NamespaceFromDict(cfg.raw))
+        print(f"  Adapter    : {adapter.name}")
     else:
-        adapter = adapter_for_config(model.config)
-    adapter.post_load(model, tokenizer, _NamespaceFromDict(cfg.raw))
-    print(f"  Adapter    : {adapter.name}")
+        adapter = None
+        print("  Adapter    : (none — non-speculative baseline run)")
     print(f"  VRAM       : {get_peak_vram_gb():.2f} GB")
 
-    # ── resolve draft args (auto-fill from adapter per the draft's flags) ─
-    draft_args = dict(cfg.draft_args)
-    draft_cls = get_draft_class(cfg.draft_name)
-    if draft_cls.needs_count_top_k and "count_top_k" not in draft_args:
-        draft_args["count_top_k"] = adapter.default_count_top_k(model)
-    if draft_cls.needs_num_experts and "num_experts" not in draft_args:
-        # Pick num_experts from the first MoE block in the model.
-        first_block = next(iter(adapter.iter_moe(model)))[1]
-        draft_args["num_experts"] = adapter.num_experts(first_block)
+    if spec_mode:
+        # ── resolve draft args (auto-fill from adapter per the draft's flags) ─
+        draft_cls = get_draft_class(cfg.draft_name)
+        if draft_cls.needs_count_top_k and "count_top_k" not in draft_args:
+            draft_args["count_top_k"] = adapter.default_count_top_k(model)
+        if draft_cls.needs_num_experts and "num_experts" not in draft_args:
+            # Pick num_experts from the first MoE block in the model.
+            first_block = next(iter(adapter.iter_moe(model)))[1]
+            draft_args["num_experts"] = adapter.num_experts(first_block)
 
-    draft = get_draft(cfg.draft_name, **draft_args)
-    # Inject the clustering / within-cluster weighting (A3/A4) for the
-    # averaged-draft family; other drafts don't cluster. Set before
-    # draft.prepare() so the cluster method's prepare hook runs.
-    if isinstance(draft, ScoreBasedAvgDraft):
-        draft.cluster_method = get_cluster_method(cfg.cluster_name,
-                                                  **cfg.cluster_args)
-        draft.within_weight = cfg.cluster_within_weight
-        # Cache-mode adaptive K′ (merged_cache_plan.md §3): draft width is
-        # capped by the slot budget after the verify floor.
-        if cache_mode and 0 < k_prime < draft.K:
-            print(f"  [budget] adaptive K′: draft.K {draft.K} → {k_prime}")
-            draft.K = k_prime
-    print(f"  Resolved   : draft={cfg.draft_name}{draft_args} "
-          f"cluster={cfg.cluster_name} within_weight={cfg.cluster_within_weight}")
+        draft = get_draft(cfg.draft_name, **draft_args)
+        # Inject the clustering / within-cluster weighting (A3/A4) for the
+        # averaged-draft family; other drafts don't cluster. Set before
+        # draft.prepare() so the cluster method's prepare hook runs.
+        if isinstance(draft, ScoreBasedAvgDraft):
+            draft.cluster_method = get_cluster_method(cfg.cluster_name,
+                                                      **cfg.cluster_args)
+            draft.within_weight = cfg.cluster_within_weight
+            # Cache-mode adaptive K′ (merged_cache_plan.md §3): draft width is
+            # capped by the slot budget after the verify floor.
+            if cache_mode and 0 < k_prime < draft.K:
+                print(f"  [budget] adaptive K′: draft.K {draft.K} → {k_prime}")
+                draft.K = k_prime
+        print(f"  Resolved   : draft={cfg.draft_name}{draft_args} "
+              f"cluster={cfg.cluster_name} "
+              f"within_weight={cfg.cluster_within_weight}")
 
-    # ── run ───────────────────────────────────────────────────────────
-    controller = Controller(model, adapter, draft, cpu_source=cpu_source,
-                            merge_offload=cfg.merge_offload,
-                            merge_during_verify=cfg.merge_during_verify,
-                            flush_on_draft_end=cfg.flush_on_draft_end,
-                            merge_overlap=cfg.merge_overlap,
-                            prefill_warmup=cfg.prefill_warmup,
-                            cache_mode=cache_mode,
-                            slots_per_layer=k_prime,
-                            expert_bytes=expert_bytes_v,
-                            singleton_pin_budget=singleton_pin_budget)
+        # ── run ───────────────────────────────────────────────────────
+        controller = Controller(model, adapter, draft, cpu_source=cpu_source,
+                                merge_offload=cfg.merge_offload,
+                                merge_during_verify=cfg.merge_during_verify,
+                                flush_on_draft_end=cfg.flush_on_draft_end,
+                                merge_overlap=cfg.merge_overlap,
+                                prefill_warmup=cfg.prefill_warmup,
+                                cache_mode=cache_mode,
+                                slots_per_layer=k_prime,
+                                expert_bytes=expert_bytes_v,
+                                singleton_pin_budget=singleton_pin_budget)
 
-    # One-time, model-derived precomputation (e.g. SpecMoE expert distances).
-    draft.prepare(adapter, controller.blocks)
+        # One-time, model-derived precomputation (e.g. SpecMoE distances).
+        draft.prepare(adapter, controller.blocks)
 
-    on_cycle_extra = None
-    if isinstance(draft, ScoreBasedAvgDraft):
-        on_cycle_extra = draft.make_on_cycle_tagger()  # None if record_history=False
+        if isinstance(draft, ScoreBasedAvgDraft):
+            on_cycle_extra = draft.make_on_cycle_tagger()  # None unless history
 
     t0 = time.perf_counter()
-    controller.install()
+    if controller is not None:
+        controller.install()
     try:
-        callbacks = specbench_callbacks(controller, on_cycle_extra=on_cycle_extra)
+        callbacks = ({} if controller is None else
+                     specbench_callbacks(controller,
+                                         on_cycle_extra=on_cycle_extra))
         if moe is not None:
             callbacks["before_generate"] = moe._configure_hook
-        with shared_model_phase_patch(controller):
-            result = run_specbench(
-                target_model=model,
-                draft_model=model,                # SAME object — shared weights
-                tokenizer=tokenizer,
+        if cfg.batch_loop:
+            # batch_spec_plan.md: custom batched loop — no HF assisted
+            # decoding, no monkey-patching; phase flips + engine hooks are
+            # driven inside the loop itself.
+            from aug_spec.runtime.batch_spec import run_specbench_batched
+            result = run_specbench_batched(
+                model, tokenizer,
+                controller if spec_mode else None,
                 num_speculative=cfg.T,
+                batch_size=cfg.batch_size,
                 questions_per_cat=cfg.questions_per_cat,
                 max_new_tokens=cfg.max_new_tokens,
                 output_dir=cfg.output_dir,
                 label=cfg.label,
                 seed=cfg.seed,
                 spec_bench_cache=cfg.spec_bench_cache,
-                emit_tokens_csv=cfg.emit_tokens_csv,
-                warmup=cfg.warmup,
-                prefill_warmup=cfg.prefill_warmup,
-                on_prefill_warmup=controller.update_masks,
-                vram_limit_bytes=usable_vram_bytes,
-                vram_guard=cfg.vram_guard,
                 skip_categories=cfg.skip_categories,
-                **callbacks,
+                include_humaneval=cfg.humaneval,
+                mt_bench_pooled=cfg.mt_bench_pooled,
+                debug_invariants=cfg.debug_invariants,
+                before_generate=(moe._configure_hook if moe is not None
+                                 else None),
             )
+        else:
+            phase_ctx = (shared_model_phase_patch(controller)
+                         if controller is not None
+                         else contextlib.nullcontext())
+            with phase_ctx:
+                result = run_specbench(
+                    target_model=model,
+                    # SAME object — shared weights; None = non-spec run.
+                    draft_model=model if spec_mode else None,
+                    tokenizer=tokenizer,
+                    num_speculative=cfg.T,
+                    questions_per_cat=cfg.questions_per_cat,
+                    max_new_tokens=cfg.max_new_tokens,
+                    output_dir=cfg.output_dir,
+                    label=cfg.label,
+                    seed=cfg.seed,
+                    spec_bench_cache=cfg.spec_bench_cache,
+                    emit_tokens_csv=cfg.emit_tokens_csv,
+                    warmup=cfg.warmup,
+                    prefill_warmup=cfg.prefill_warmup if spec_mode else False,
+                    on_prefill_warmup=(controller.update_masks
+                                       if controller is not None else None),
+                    vram_limit_bytes=usable_vram_bytes,
+                    vram_guard=cfg.vram_guard,
+                    skip_categories=cfg.skip_categories,
+                    include_humaneval=cfg.humaneval,
+                    mt_bench_pooled=cfg.mt_bench_pooled,
+                    **callbacks,
+                )
     finally:
-        controller.uninstall()
+        if controller is not None:
+            controller.uninstall()
     wall = time.perf_counter() - t0
 
     # ── write summary.json ────────────────────────────────────────────
@@ -547,14 +617,16 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
         "config": cfg.raw,
         "label": cfg.label,
         "model_id": cfg.model_id,
-        "adapter": adapter.name,
+        "adapter": adapter.name if adapter is not None else None,
         "draft": {"name": cfg.draft_name, "args": draft_args},
         "T": cfg.T,
         "questions_per_cat": cfg.questions_per_cat,
         "max_new_tokens": cfg.max_new_tokens,
-        "num_moe_layers": controller.num_moe_layers,
+        "num_moe_layers": (controller.num_moe_layers
+                           if controller is not None else None),
         "wall_time_s": wall,
-        "n_cycles_total": controller.update_count,
+        "n_cycles_total": (controller.update_count
+                           if controller is not None else 0),
         "peak_vram_gb": get_peak_vram_gb(),
         "vram_budget_ratio": cfg.vram_budget_ratio,
         "usable_vram_gb": (usable_vram_bytes / 1e9
@@ -612,7 +684,8 @@ def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     print(f"  MAT      : {ov.get('mean_accept_tokens', 0):.3f}")
     print(f"  AccRate  : {ov.get('acceptance_rate', 0):.4f}")
     print(f"  TPS      : {ov.get('tokens_per_second', 0):.2f}")
-    print(f"  Wall     : {wall:.2f} s, refresh cycles: {controller.update_count}")
+    print(f"  Wall     : {wall:.2f} s, refresh cycles: "
+          f"{controller.update_count if controller is not None else 0}")
     print(f"\n  Results saved → {summary_path}")
 
     _dump_profile(controller)
