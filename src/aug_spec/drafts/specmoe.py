@@ -378,3 +378,49 @@ def topk_substitute_forward(controller, layer_idx: int, block: nn.Module):
         return final.reshape(batch_size, sequence_length, hidden_dim), router_logits
 
     return fwd
+
+
+def gptoss_substitute_forward(controller, layer_idx: int, block: nn.Module):
+    """SpecMoE forward for the gpt-oss fused layout (`mlp.router` +
+    batched `mlp.experts`), hf backend only — the offload engine does not
+    support this family, so there are no dispatch / bmm / early-pin branches
+    (gptoss_acceptance_plan.md Step 2).
+
+    Routing follows the gpt-oss semantic (softmax AFTER topk, opposite order
+    to qwen3): winners are the top-`route_top_k` logits, their weights the
+    softmax over exactly those logits. Draft phase remaps each winner through
+    the substitute table; weights stay with the natural winner's rank and
+    colliding remapped winners accumulate via scatter_add_. That sum is what
+    the GPU inference path of `GptOssExperts.forward` consumes (it reads only
+    the dense routing_weights and ignores router_indices); the CPU/training
+    loop would double-count colliding winners, but every acceptance run
+    executes the GPU path.
+    """
+
+    def fwd(mlp, hidden_states):
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        router = mlp.router
+        router_logits = F.linear(flat, router.weight, router.bias)
+
+        k = controller.draft.route_top_k
+        top_val, selected = torch.topk(router_logits, k, dim=-1)   # [T, k]
+        top_val = F.softmax(top_val, dim=1, dtype=top_val.dtype)
+
+        if controller.in_draft_phase:
+            sub_table = controller.draft_cache.get(layer_idx)
+            if sub_table is not None:
+                selected = sub_table.to(selected.device)[selected]  # remap
+        else:
+            controller.draft.capture(
+                layer_idx, F.softmax(router_logits, dim=1, dtype=torch.float))
+
+        router_scores = torch.zeros_like(router_logits).scatter_add_(
+            1, selected, top_val)
+        routed_out = mlp.experts(
+            hidden_states,
+            router_indices=selected,
+            routing_weights=router_scores,
+        )
+        return routed_out, router_scores
+
+    return fwd

@@ -1,0 +1,23 @@
+# q16b4 全量重跑 (2026-07-22): 271786 wedge 後其增量 CSV 被 272478(誤用同 dir)覆寫,
+# 無法接力 → 全量重跑至獨立 dir。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    serial_dispatch: true
+draft:
+  name: moe_ondemand
+run:
+  questions_per_cat: 16
+  max_new_tokens: 512
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 4
+  batch_by_category: true
+output:
+  label: ondemand_ser_q16b4_r2
+  dir: output/ondemand_ser_q16b4_r2

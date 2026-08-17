@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .base import ClusterContext, ClusterMethod, greedy_pair
+from .base import ClusterContext, ClusterMethod, greedy_group
 
 
 def weight_sim_table(flats: List[torch.Tensor], metric: str) -> torch.Tensor:
@@ -57,4 +57,4 @@ class WeightSimCluster(ClusterMethod):
             torch.save(self.tables, self.cache)
 
     def assign(self, ctx: ClusterContext, K: int) -> List[List[int]]:
-        return greedy_pair(self.tables.get(ctx.layer_idx), list(ctx.active), K)
+        return greedy_group(self.tables.get(ctx.layer_idx), list(ctx.active), K, ctx.group_cap)

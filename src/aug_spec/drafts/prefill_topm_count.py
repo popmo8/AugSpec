@@ -20,7 +20,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from .prefill_count import PrefillCountDraft
-from .topm_count import keep_top_m
+from .topm_count import keep_top_m, note_topm_stats
 
 
 class PrefillTopMCountDraft(PrefillCountDraft):
@@ -33,7 +33,11 @@ class PrefillTopMCountDraft(PrefillCountDraft):
         if M is not None and M < 1:
             raise ValueError(f"M must be >= 1, got {M!r}")
         self.M = M
+        self.topm_stats = {"n": None, "m": None, "calls": 0,
+                           "sum_active": 0, "sum_dropped": 0,
+                           "filled_calls": 0}
 
     def _postprocess_weights(self, weights: List[float]) -> List[float]:
         m = self.M if self.M is not None else self.count_top_k
+        note_topm_stats(self.topm_stats, weights, m)
         return keep_top_m(weights, m)

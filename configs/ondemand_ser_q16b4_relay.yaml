@@ -1,0 +1,28 @@
+# 接力 (2026-07-22): ondemand_ser_q16b4 wedge 後只補 math/rag/humaneval;
+# mt/trans/summ/qa 沿用原 run 增量 CSV (math 原 run 只有部分,本 run 重跑完整)。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    serial_dispatch: true
+draft:
+  name: moe_ondemand
+run:
+  questions_per_cat: 16
+  max_new_tokens: 512
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 4
+  batch_by_category: true
+  skip_categories:
+  - mt_bench
+  - translation
+  - summarization
+  - qa
+output:
+  label: ondemand_ser_q16b4_relay
+  dir: output/ondemand_ser_q16b4_relay

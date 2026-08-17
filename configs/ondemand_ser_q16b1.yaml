@@ -1,0 +1,23 @@
+# batch_scale 小 B 端點 (2026-07-22): B=1, qpc=16, mnt=512, T=5 協議。
+# base=ondemand_ser_q64b64.yaml
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    serial_dispatch: true
+draft:
+  name: moe_ondemand
+run:
+  questions_per_cat: 16
+  max_new_tokens: 512
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 1
+  batch_by_category: true
+output:
+  label: ondemand_ser_q16b1
+  dir: output/ondemand_ser_q16b1

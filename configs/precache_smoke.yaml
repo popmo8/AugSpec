@@ -1,0 +1,17 @@
+# moe_precache smoke — B=1, tiny (prefill-count pin path, legacy/specbench).
+# Verifies: budget prints pin count, gate hooks count prefill, auto-pin fires
+# at first decode, per-question reset. Not a benchmark — correctness only.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+draft:
+  name: moe_precache
+  args:
+    pin_fraction: 0.10
+run:
+  questions_per_cat: 1
+  max_new_tokens: 32
+output: {label: precache_smoke, dir: output/precache_smoke}

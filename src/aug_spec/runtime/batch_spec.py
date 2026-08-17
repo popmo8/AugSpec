@@ -30,7 +30,6 @@ batched greedy, one token per step) — the MoE-Caching baseline.
 
 from __future__ import annotations
 
-import copy
 import os
 import time
 from dataclasses import dataclass, field
@@ -44,13 +43,17 @@ from transformers import DynamicCache
 # Cache utilities
 # =========================================================================
 
-def stack_caches(caches: List[DynamicCache]) -> Tuple[DynamicCache,
-                                                      torch.Tensor]:
+def stack_caches(caches: List[DynamicCache], consume: bool = False,
+                 ) -> Tuple[DynamicCache, torch.Tensor]:
     """Merge per-sequence (batch-1) caches into one batched cache.
 
     Content is LEFT-aligned (pad at the tail, zeros); returns the batched
     cache plus the validity mask [B, P_max]. Later appends always go to the
     physical tail, so the pad becomes an interior hole handled by the mask.
+
+    `consume=True` releases each source layer as it is stacked (2026-07-22
+    B=256 OOM fix: sources + the stacked build otherwise coexist in full).
+    The sources are unusable afterwards — only for callers that discard them.
     """
     n_layers = len(caches[0].layers)
     lens = [c.get_seq_length() for c in caches]
@@ -66,7 +69,12 @@ def stack_caches(caches: List[DynamicCache]) -> Tuple[DynamicCache,
                 v = torch.cat([v, pad.clone()], dim=2)
             ks.append(k)
             vs.append(v)
+            if consume:
+                c.layers[li].keys = None
+                c.layers[li].values = None
         legacy.append((torch.cat(ks, dim=0), torch.cat(vs, dim=0)))
+        ks.clear()
+        vs.clear()
     mask = torch.zeros(len(caches), P, dtype=torch.long,
                        device=legacy[0][0].device)
     for i, L in enumerate(lens):
@@ -190,7 +198,8 @@ def spec_decode_batch(model, controller, state: BatchState, *, T: int,
         # localises a hang to a cycle index (a batch prints nothing else
         # until it completes — job 260924 stalled invisibly without this).
         n_cycles += 1
-        if n_cycles % 25 == 0:
+        if n_cycles % 5 == 0:   # was 25 — serial/large-B cycles run minutes
+                                 # each; 5 keeps the watchdog fed (batch_scale_plan §4)
             done = sum(len(state.records[i].committed)
                        for i in state.seq_idx)
             print(f"    [cycle {n_cycles}] B={B} committed≈{done}",
@@ -346,23 +355,36 @@ def run_specbench_batched(
     mt_bench_pooled: bool = False,
     before_generate=None,
     debug_invariants: bool = False,
+    precache=None,                     # moe_precache: PrecacheManager or None
+    batch_by_category: bool = True,    # affinity batching: one subtask per batch
+    batch_fill_repeat: bool = False,   # fill a short subtask group to batch_size
+                                       # by cycling its questions (B>80 support)
+    prompt_token_cap: int = 0,         # >0: truncate every prompt to its FIRST
+                                       # N tokens (input-length sweeps; 0 = off)
 ):
     """Batched analogue of `run_specbench` (same question protocol, same
     greedy target-exact semantics). Returns a `SpecBenchResult`.
 
     Metric caveats (batch_spec_plan.md §4.3): per-question TPS =
     seq_tokens / batch_wall (co-scheduled); the honest headline number is
-    `overall.tokens_per_second` = Σtokens / Σbatch_walls. Per-subtask TPS
-    is NOT defined for B > 1 and is reported as 0.0.
+    `overall.tokens_per_second` = Σtokens / Σbatch_walls. Per-subtask TPS is
+    NOT defined for mixed batches at B > 1 (reported 0.0) — but with
+    `batch_by_category` every batch is one subtask, so each batch wall
+    attributes cleanly and per-subtask TPS = Σtok(subtask)/Σwalls(subtask).
+    Note the effective batch is then capped by the subtask's question count
+    (e.g. qpc=15 → B=64 runs 15-wide batches).
     """
     from pathlib import Path
 
     from .loader import get_model_device
     from .specbench import (
         QuestionResult, SpecBenchResult, _aggregate_subtask,
-        _format_chat_prompt, _load_humaneval_questions,
+        _category_matches, _format_chat_prompt, _load_humaneval_questions,
         _load_spec_bench_questions, _print_final_table, _sample_questions,
-        SPEC_BENCH_SUBTASKS)
+        SPEC_BENCH_MT_BENCH_CATS, SPEC_BENCH_SUBTASKS)
+
+    def _subtask_of(cat: str) -> str:
+        return "mt_bench" if cat in SPEC_BENCH_MT_BENCH_CATS else cat
 
     spec = controller is not None
     T = num_speculative if spec else 0
@@ -417,15 +439,50 @@ def run_specbench_batched(
     # the pooled-draft-over-diverse-sequences effect (not a batching bug),
     # and affinity batching can recover it. One batch per question here.
     _replicate = os.environ.get("AUG_BATCH_REPLICATE") is not None
-    _iter = ([[q] * batch_size for q in questions] if _replicate
-             else [questions[b0:b0 + batch_size]
-                   for b0 in range(0, len(questions), batch_size)])
+    if _replicate:
+        _iter = [[q] * batch_size for q in questions]
+    elif batch_by_category:
+        # Affinity batching: group by SUBTASK (mt_bench sub-categories pool
+        # into one group, matching the summary-table aggregation) and batch
+        # within each group only — no cross-category batch ever. Last batch
+        # of each group is ragged; effective batch ≤ group size.
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for q in questions:
+            groups.setdefault(_subtask_of(q["category"]), []).append(q)
+        order = [s for s in SPEC_BENCH_SUBTASKS if s in groups]
+        order += [s for s in groups if s not in order]      # safety net
+        if batch_fill_repeat:
+            # batch_scale_plan §3: cycle-extend any short group to exactly
+            # batch_size (one full B-wide batch per subtask; replicas are
+            # ordinary sequences — throughput-oriented semantics).
+            for s_ in order:
+                g = groups[s_]
+                if len(g) < batch_size:
+                    reps = -(-batch_size // len(g))          # ceil
+                    groups[s_] = (g * reps)[:batch_size]
+        _iter = [groups[s][i:i + batch_size] for s in order
+                 for i in range(0, len(groups[s]), batch_size)]
+        max_g = max(len(g) for g in groups.values())
+        if batch_size > max_g:
+            print(f"  [batch_loop] batch_by_category: batch_size "
+                  f"{batch_size} > largest subtask group ({max_g}) — "
+                  f"effective batch capped at the group size", flush=True)
+    else:
+        _iter = [questions[b0:b0 + batch_size]
+                 for b0 in range(0, len(questions), batch_size)]
+
+    # Pure-batch wall attribution (batch_by_category / replicate): every batch
+    # is a single subtask, so its wall belongs to that subtask → per-subtask
+    # TPS becomes well-defined at B > 1.
+    subtask_walls: Dict[str, float] = {}
+    _done_q = 0
 
     for _bi, batch_q in enumerate(_iter):
-        b0 = _bi * batch_size
         t0 = time.perf_counter()
         if spec:
             controller.reset()          # per-batch reset (B=1 ≡ legacy)
+        if precache is not None:
+            precache.reset()            # drop prev batch's pins, re-open counting
 
         records, tgt_caches, ttfts, plens = [], [], [], []
         for q in batch_q:
@@ -434,7 +491,12 @@ def run_specbench_batched(
                       else _format_chat_prompt(tokenizer, [], user_msg))
             ids = tokenizer(prompt, return_tensors="pt"
                             ).input_ids.to(device)
+            if prompt_token_cap > 0:
+                ids = ids[:, :prompt_token_cap]
             cache, ttft = _prefill_one(target_model, ids, before_generate)
+            if len(records) % 16 == 15:      # watchdog heartbeat during the
+                print(f"    [prefill {len(records) + 1}/{len(batch_q)}]",
+                      flush=True)            # long silent prefill loop
             rec = SeqRecord(qid=str(q["question_id"]),
                             category=q["category"],
                             prompt_len=ids.shape[1], committed=[ttft])
@@ -443,14 +505,32 @@ def run_specbench_batched(
             ttfts.append(ttft)
             plens.append(ids.shape[1])
 
+        if precache is not None:
+            # pooled prefill counts over all B sequences → pin top-k% and stop
+            # counting before decode (gate hooks no-op thereafter).
+            precache.pin()
+
         if spec:
             controller.update_masks()   # C-BOOT: build draft state from
                                         # the pooled prefill captures
-            ast_caches = [copy.deepcopy(c) for c in tgt_caches]  # KV-copy
-            ast_cache, ast_mask = stack_caches(ast_caches)
+        # Memory-lean assembly (2026-07-22, jobs 271515/516 OOM'd a 139GB H200
+        # at B=256): the old order — deepcopy all B per-seq caches for the
+        # assistant, stack BOTH sets — holds ~4x the batched KV transiently
+        # (per-seq tgt + per-seq ast copies + both stacked builds). Stack the
+        # target ONCE, free the per-seq caches immediately, then CLONE the
+        # stacked cache for the assistant (identical values = same KV-copy
+        # semantics, one copy instead of B deepcopies + a second stack).
+        tgt_cache, tgt_mask = stack_caches(tgt_caches, consume=True)
+        tgt_caches.clear()                        # free per-seq KV asap
+        if spec:
+            # from_legacy_cache -> update -> torch.cat COPIES (verified in
+            # transformers cache_utils.update), so no explicit clone needed —
+            # ast gets independent tensors with identical prompt KV.
+            ast_cache = DynamicCache.from_legacy_cache(tuple(
+                (lyr.keys, lyr.values) for lyr in tgt_cache.layers))
+            ast_mask = tgt_mask.clone()
         else:
             ast_cache, ast_mask = None, None
-        tgt_cache, tgt_mask = stack_caches(tgt_caches)
 
         state = BatchState(
             seq_idx=list(range(len(records))), records=records,
@@ -471,6 +551,9 @@ def run_specbench_batched(
             torch.cuda.synchronize()
         wall = time.perf_counter() - t0
         batch_walls.append(wall)
+        _batch_st = _subtask_of(batch_q[0]["category"])   # pure under
+        subtask_walls[_batch_st] = (                       # affinity/replicate
+            subtask_walls.get(_batch_st, 0.0) + wall)
 
         if os.environ.get("AUG_DUMP_COMMITTED"):
             import json as _json
@@ -493,21 +576,41 @@ def run_specbench_batched(
             per_question.append(qr)
             _write_qres(qr)
         per_q_f.flush()                         # survive kill/timeout
-        done = (_bi + 1) if _replicate else b0 + len(batch_q)
-        total = len(questions) if _replicate else len(questions)
-        print(f"  [batch {_bi + 1}] {done}/{total} q, "
-              f"wall={wall:.1f}s, "
+        _done_q += 1 if _replicate else len(batch_q)
+        print(f"  [batch {_bi + 1}] {_done_q}/{len(questions)} q "
+              f"({_batch_st}), wall={wall:.1f}s, "
               f"tok={sum(len(r.committed) for r in records)}", flush=True)
+        # Release this batch's KV BEFORE the next batch's prefill/stacking
+        # (2026-07-22, jobs 271597/271778 OOM at batch 3 of B=256): both the
+        # BatchState fields AND the loop-local aliases (tgt_cache/ast_cache/
+        # masks — rebound only mid-way through the NEXT batch's stacking)
+        # otherwise keep the previous batch's full tgt+ast KV alive during the
+        # next batch's prefill + stacking. Low-acceptance runs are hit hardest
+        # (dirty holes inflate the physical KV ~2x).
+        state.tgt_cache = None
+        state.ast_cache = None
+        state = None
+        tgt_cache = ast_cache = tgt_mask = ast_mask = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     per_q_f.close()
 
     # ── aggregation: pooled acc metrics; TPS from batch walls only ──
+    # Pure batches (batch_by_category / replicate): per-subtask TPS =
+    # Σtok(subtask) / Σwalls(subtask's batches). Mixed batches: undefined → 0.
+    pure_batches = batch_by_category or _replicate
     per_subtask: Dict[str, Dict[str, Any]] = {}
     for subtask in SPEC_BENCH_SUBTASKS:
         m = _aggregate_subtask(per_question, subtask)
         if m is not None:
             if batch_size > 1 and subtask != "overall":
-                m["tokens_per_second"] = 0.0   # undefined under co-scheduling
+                if pure_batches and subtask_walls.get(subtask, 0.0) > 0:
+                    st_tok = sum(qr.num_new_tokens for qr in per_question
+                                 if _category_matches(qr.category, subtask))
+                    m["tokens_per_second"] = st_tok / subtask_walls[subtask]
+                else:
+                    m["tokens_per_second"] = 0.0   # mixed: undefined
             per_subtask[subtask] = m
     total_tokens = sum(qr.num_new_tokens for qr in per_question)
     if "overall" in per_subtask:

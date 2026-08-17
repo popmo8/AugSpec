@@ -122,9 +122,13 @@ class Controller:
             block.forward = (
                 lambda hidden_states, *a, _fn=fn, _block=block, **kw:
                 _fn(_block, hidden_states))
+        # Draft-specific hooks beyond the MoE-block swap (e.g. speed's
+        # decoder-layer skip). No-op for most drafts.
+        self.draft.post_install(self)
         self._installed = True
 
     def uninstall(self) -> None:
+        self.draft.post_uninstall(self)
         for _, block in self.blocks:
             if hasattr(block, "_aug_spec_orig_forward"):
                 block.forward = block._aug_spec_orig_forward

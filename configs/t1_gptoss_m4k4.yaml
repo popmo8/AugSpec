@@ -1,0 +1,13 @@
+# GPT-OSS M=4,K=4(count top-4 恆等拷貝、不合併;singleton 群 → cluster 方法
+# 無作用,用 freq_slice+uniform 與診斷 smoke 一致)。與 Ours(M8K4)/SpecMoE(N4)
+# 同預算(4 顆駐留)。smoke 參考:AccR 0.3082(g0_gptoss_m4k4_smoke, job 265169)。
+# 協議 = t1:T=5, qpc=15, mnt=512, humaneval, mt_bench_pooled。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: topm_count
+  args: {M: 4, K: 4, draft_top_k: 4, record_history: false}
+cluster:
+  name: freq_slice
+  within_weight: uniform
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, humaneval: true, mt_bench_pooled: true}
+output: {label: t1_gptoss_m4k4, dir: output/t1_gptoss_m4k4}

@@ -8,6 +8,9 @@ for the whole run. Routing goes through the shared gate-remap path
 the dynamic merge drafts use — only the (offline) partition, the frequency
 weights, and the freeze differ.
 
+Also the base class of the MC-SMoE baseline (`drafts/mc_smoe.py`), which
+only overrides `_merge_group` (permutation alignment before averaging).
+
 Spec schema (json):
     {"model_id": ..., "K": 16, "count_top_k": 8,
      "layers": {"<layer_idx>": {"groups": [[expert ids]...],
@@ -70,7 +73,7 @@ class StaticMergeDraft(DraftStrategy):
             experts = []
             masses = []
             total_freq = sum(freq)
-            for group in groups:
+            for gi, group in enumerate(groups):
                 gf = sum(freq[i] for i in group)
                 weights = [0.0] * n
                 if gf > 0:
@@ -80,7 +83,9 @@ class StaticMergeDraft(DraftStrategy):
                 else:
                     for i in group:
                         weights[i] = 1.0 / len(group)
-                experts.append(linear_merge(adapter, block, group, weights))
+                experts.append(
+                    self._merge_group(adapter, block, entry, gi, group,
+                                      weights))
                 # Cluster mass = calibration frequency share; only used for
                 # the descending order the multi-cache contract expects
                 # (routing is per-token gate remap). Size share when the
@@ -94,6 +99,14 @@ class StaticMergeDraft(DraftStrategy):
                 "weights": [masses[j] for j in order],
                 "indices": [groups[j] for j in order],
             }
+
+    def _merge_group(self, adapter, block, entry, gi, group, weights):
+        """Merge one group into a dense expert dict. `weights` is the
+        full-length per-expert weight vector (frequency-normalised within
+        the group); `entry` is the layer's raw spec dict and `gi` the
+        group's index in it. Hook for subclasses — `mc_smoe` overrides
+        this to permutation-align members before averaging."""
+        return linear_merge(adapter, block, group, weights)
 
     def prepopulate(self, adapter, blocks, draft_cache):
         draft_cache.clear()

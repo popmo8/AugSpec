@@ -1,0 +1,8 @@
+# Table 1 — GPT-OSS Random (prune) row (hf acceptance; gptoss_acceptance_plan.md).
+# num_keep=4 = native top-k(32 experts 比照 Qwen3 128→16 的比例語義由 K2 定案)。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: random_mask
+  args: {seed: 0, num_keep: 4}
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, humaneval: true, mt_bench_pooled: true}
+output: {label: t1_gptoss_randmask, dir: output/t1_gptoss_randmask}

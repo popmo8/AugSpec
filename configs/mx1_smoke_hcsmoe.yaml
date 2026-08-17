@@ -1,0 +1,21 @@
+# hf-backend smoke for the mx1 (Mixtral Table-1) run — qpc=1, mnt=64.
+# Merge/HC-SMoE: K=1 degenerate single cluster (freq-weighted merge of all 8;
+# baseline_tables_plan.md WS-C "8->1 degenerates, run as-is").
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: static_merge
+  args:
+    spec_path: output/hc_smoe/Mixtral-8x7B-v0.1_K1.json
+    draft_top_k: 1
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: mx1_smoke_hcsmoe
+  dir: output/mx1_smoke_hcsmoe

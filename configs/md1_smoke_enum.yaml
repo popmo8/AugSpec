@@ -1,0 +1,21 @@
+# hf-backend smoke for the md1 (DeepSeek Table-1) run - qpc=1, mnt=64.
+# Prune/Enumerate: NAEE kept-set, SAMPLED 1e5 subsets (C(64,8)~4.4e9,
+# exact enumeration infeasible - same protocol as the Qwen3 row; mark
+# "sampled" in the table notes). Spec from scripts/run_md1_artifacts.sh.
+model:
+  id: deepseek-ai/deepseek-moe-16b-base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: static_mask
+  args:
+    spec_path: output/naee/deepseek-moe-16b-base_r8.json
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: md1_smoke_enum
+  dir: output/md1_smoke_enum

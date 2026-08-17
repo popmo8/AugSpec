@@ -1,0 +1,16 @@
+# AUG_PROFILE diagnostic: B=1, mnt=128 (enough decode to expose fetch cost).
+# Run twice — default headroom (no cache) vs AUG_PRECACHE_HEADROOM_EXPERTS=256
+# (re-creates the cache) — and compare verify_fetch_bytes / pinned-hit rate.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+draft:
+  name: moe_precache
+  args: {pin_fraction: 0.10}
+run:
+  questions_per_cat: 1
+  max_new_tokens: 128
+output: {label: precache_profile, dir: output/precache_profile}

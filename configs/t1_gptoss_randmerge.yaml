@@ -1,0 +1,8 @@
+# Table 1 — GPT-OSS Random (merge) row (hf acceptance; gptoss_acceptance_plan.md)。
+# 全 32 顆隨機均分 4 群、uniform 合併、全 run 凍結。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: random_merge
+  args: {K: 4, draft_top_k: 4, seed: 0}
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, humaneval: true, mt_bench_pooled: true}
+output: {label: t1_gptoss_randmerge, dir: output/t1_gptoss_randmerge}

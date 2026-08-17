@@ -123,16 +123,17 @@ class MergedCacheIndex:
         victim, (slot, stamp) = best_item
         if stamp == cur_stamp:
             # Every slot is owned by THIS build ⇒ the partition produced more
-            # than S=K' groups. With pair-adopt-first (C2.1) that is provably
-            # impossible while |active| <= 2K, so reaching here means an
-            # unsupported configuration (a draft without a top-M <= 2K cutoff
-            # in cache mode). Stealing would overwrite content already emitted
+            # than S=K' groups. With adopt-first accounting that is provably
+            # impossible while |active| <= cap*K (cap = ceil(M/K), classic
+            # pairing cap=2), so reaching here means an unsupported
+            # configuration (a draft without a top-M <= cap*K cutoff in cache
+            # mode). Stealing would overwrite content already emitted
             # this cycle — silently wrong draft weights — so fail fast instead
             # (2026-07-11: fallback path removed on request; no degraded mode).
             raise RuntimeError(
                 f"merged_cache: slot demand exceeded S={self.S} at layer {li} "
-                f"— partition produced >K groups, |active|>2K? Use a draft "
-                f"with top-M <= 2K (e.g. topm_count) in cache mode.")
+                f"— partition produced >K groups, |active|>cap*K? Use a "
+                f"draft with top-M <= cap*K (e.g. topm_count) in cache mode.")
         self.steal_n += 1
         if victim <= active_set:
             self.steal_protected_n += 1
@@ -147,6 +148,7 @@ class MergedCacheIndex:
         一次 submit,成員到齊即在 C++ merge 線程執行;emit 的 slot handle 因
         D0 預配而在內容寫入前即有效,draft 在 WaitMergesDone 之後才讀。"""
         disp = block.expert_executor.expert_dispatcher
+        cap = getattr(draft, "group_cap", 2)   # ceil(M/K); 2 = classic pairing
         pipeline = routed is not None
         job_slots: List[int] = []
         job_members: List[List[int]] = []
@@ -239,10 +241,10 @@ class MergedCacheIndex:
                 # 特權——adopt 讓熱門 expert 以精確權重續任 singleton,不被
                 # greedy 配對稀釋(兩次 C2.1 純語意跑 AccR 都落在 0.627,低於
                 # C1/C2 的 0.70 帶)。特權排在額度記帳之後:adopt 後剩餘的
-                # active 必須仍塞得進剩餘額度(每 pair 覆蓋 2),否則跳過、
+                # active 必須仍塞得進剩餘額度(每組覆蓋 cap=ceil(M/K)),否則跳過、
                 # 交給 greedy——組數因此永遠 ≤ K,溢位維持構造性不可能。
                 r_after = len(active_set) - len(used) - 1
-                if r_after > 2 * (K - len(adopted_groups) - 1):
+                if r_after > cap * (K - len(adopted_groups) - 1):
                     self.sgl_feas_denied_n += 1
                     continue
             slot, _ = self.index[li][members]
@@ -273,7 +275,8 @@ class MergedCacheIndex:
                 ctx = ClusterContext(
                     active=remaining, weights=weights, layer_idx=li,
                     cooccur=draft.cooccur.get(li),
-                    pair_sim=draft._pair_sim_table(li))
+                    pair_sim=draft._pair_sim_table(li),
+                    group_cap=cap)
                 groups = draft.cluster_method.assign(ctx, k_rem)
                 if len(groups) > k_rem:
                     # No-data fallback(hybrid/cooccur 的表在題首尚未累積時
@@ -288,10 +291,14 @@ class MergedCacheIndex:
                     multis = [g for g in groups if len(g) > 1]
                     need = len(groups) - k_rem
                     while need > 0 and len(singles) >= 2:
-                        a = singles.pop(0)
-                        b = singles.pop(0)
-                        multis.append(a + b)
-                        need -= 1
+                        # 低權重 singleton 打包,一包最多 cap 顆(cap=2 時
+                        # 位元級同舊行為 = 兩兩配對);每包減少組數 take-1。
+                        take = min(cap, need + 1, len(singles))
+                        pack: List[int] = []
+                        for _ in range(take):
+                            pack += singles.pop(0)
+                        multis.append(pack)
+                        need -= take - 1
                     groups = multis + singles
 
         # Singleton note: the DRAFT is always served from an identity slot

@@ -1,0 +1,17 @@
+# Table 1 — GPT-OSS Ours row (hf acceptance; gptoss_acceptance_plan.md K1)。
+# cluster = hybrid a75(與 Qwen3 Ours 同方法定義);act-sim 走 hf prefill 捕捉
+# (Step 0.5),log 需出現 [act_sim] INFO 才算非退化。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: topm_count
+  args: {M: 8, K: 4, draft_top_k: 4, record_history: false}
+cluster:
+  name: hybrid
+  alpha: 0.75
+  metric: l2
+  norm: rank
+  cooccur_norm: raw
+  cooccur_scope: decode
+  within_weight: uniform
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, humaneval: true, mt_bench_pooled: true}
+output: {label: t1_gptoss_ours, dir: output/t1_gptoss_ours}

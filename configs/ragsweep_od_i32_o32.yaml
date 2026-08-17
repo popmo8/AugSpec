@@ -1,0 +1,30 @@
+# RAG@B=16 input/output sweep (2026-07-25): in=32 out=32, base=ondemand_ser_q16b16.yaml
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    serial_dispatch: true
+draft:
+  name: moe_ondemand
+run:
+  questions_per_cat: 16
+  max_new_tokens: 32
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 16
+  batch_by_category: true
+  skip_categories:
+  - mt_bench
+  - translation
+  - summarization
+  - qa
+  - math_reasoning
+  - humaneval
+  prompt_token_cap: 32
+output:
+  label: ragsweep_od_i32_o32
+  dir: output/ragsweep_od_i32_o32

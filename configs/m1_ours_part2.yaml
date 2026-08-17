@@ -1,0 +1,44 @@
+# m1_ours 補跑 part2 (2026-07-18): job 265701 wedge 在 370/560,前四個 subtask
+# (humaneval/math/mt_bench/qa 各80題) 已由 per-question CSV 增量保存
+# (output/m1_ours_partial_265701.csv);本 config 只跑剩餘三個 subtask
+# (translation/summarization/rag 各80)。合併規則:前四 subtask 用 partial CSV
+# cycles-加權池化,後三用本 run 的 overall_summary;Overall=mean7(同 Table1 慣例)。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+    merge_overlap: true
+draft:
+  name: topm_count
+  args:
+    M: 32
+    K: 16
+    draft_top_k: 8
+    record_history: false
+cluster:
+  name: hybrid
+  alpha: 0.75
+  metric: l2
+  norm: rank
+  cooccur_norm: raw
+  cooccur_scope: decode
+  within_weight: uniform
+run:
+  T: 3
+  questions_per_cat: all
+  max_new_tokens: 512
+  prefill_warmup: true
+  humaneval: false
+  mt_bench_pooled: true
+  skip_categories:
+  - mt_bench
+  - qa
+  - math_reasoning
+output:
+  label: m1_ours_part2
+  dir: output/m1_ours_part2

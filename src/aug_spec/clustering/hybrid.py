@@ -33,7 +33,7 @@ from typing import List, Optional
 
 import torch
 
-from .base import ClusterContext, ClusterMethod, greedy_pair
+from .base import ClusterContext, ClusterMethod, greedy_group
 
 _NO_DATA = -1.0
 
@@ -95,7 +95,7 @@ class HybridRelationCluster(ClusterMethod):
         self.cooccur_scope = cooccur_scope
 
     def assign(self, ctx: ClusterContext, K: int) -> List[List[int]]:
-        return greedy_pair(self._blend(ctx), list(ctx.active), K)
+        return greedy_group(self._blend(ctx), list(ctx.active), K, ctx.group_cap)
 
     # ── relation-map assembly ────────────────────────────────────────────
     def _blend(self, ctx: ClusterContext) -> Optional[torch.Tensor]:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gc
 import inspect
+import math
 import types
 from typing import Any, Optional, Tuple
 
@@ -322,6 +323,77 @@ def compute_merged_bytes(model_id: str, K: int, dtype: torch.dtype,
     bytes_per = torch.finfo(dtype).bits // 8
     expert_bytes = 3 * inter * hidden * bytes_per   # gate_proj + up_proj + down_proj
     return int(K) * n_layers * expert_bytes
+
+
+def compute_precache_pool_bytes(
+        model_id: str, pin_fraction: float, batch_size: int,
+        dtype: torch.dtype, trust_remote_code: bool = True,
+        pipeline_slack_topk: int = 2,
+        headroom_experts_override: Optional[int] = None
+        ) -> Tuple[int, int, int, int]:
+    """Archer pool budget for the ``moe_precache`` / ``moe_ondemand`` baselines
+    (config-only, no weights). The pool holds ONLY:
+
+      * the pinned set — top ``pin_fraction`` experts per MoE layer, kept
+        resident for the whole question (``pin_fraction=0`` → NO pins, i.e. the
+        ``moe_ondemand`` zero-cache lower bound), and
+      * a minimal streaming buffer — one dispatch's working set
+        (``min(E, batch*top_k)``) plus ``pipeline_slack_topk*top_k`` slack.
+
+    The archer engine STREAMS experts through the pool (Enqueue: resident →
+    exec, else fetch; a full pool evicts the least-visited non-pinned expert to
+    make room — expert_dispatcher.cpp Enqueue/FindExpertEvict). So a forward
+    never needs all routed experts resident at once, only the in-flight
+    pipeline. Sizing the headroom to one dispatch's working set (not a
+    persistent cache) means every non-pinned expert is fetched on demand and
+    evicted as the forward advances — nothing beyond the pins is cached across
+    layers or decode steps. This is the whole point of the baseline: a LARGER
+    headroom (e.g. a full E×safety) would act as an LRU cache and defeat it.
+
+    Returns ``(pool_bytes, n_pin_per_layer, num_experts, expert_bytes)``."""
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(
+        model_id, trust_remote_code=trust_remote_code)
+    n_layers = cfg.num_hidden_layers
+    hidden = cfg.hidden_size
+    inter = getattr(cfg, "moe_intermediate_size", None) or cfg.intermediate_size
+    n_experts = (getattr(cfg, "num_experts", None)
+                 or getattr(cfg, "num_local_experts", None)
+                 or getattr(cfg, "n_routed_experts", None))
+    if n_experts is None:
+        raise ValueError(
+            f"could not read expert count from {model_id!r} config "
+            "(tried num_experts / num_local_experts / n_routed_experts)")
+    top_k = int(getattr(cfg, "num_experts_per_tok", None)
+                or getattr(cfg, "moe_topk", None) or 8)
+    bytes_per = torch.finfo(dtype).bits // 8
+    expert_bytes = 3 * inter * hidden * bytes_per   # gate + up + down
+    # pin_fraction == 0 → moe_ondemand (no pins); else at least one pin.
+    n_pin = 0 if pin_fraction <= 0 else max(1, math.ceil(pin_fraction * n_experts))
+    pinned_bytes = n_layers * n_pin * expert_bytes
+    # Streaming buffer sizing. Two constraints:
+    #   (a) decode: hold one decode dispatch's working set (min(E, batch*top_k)).
+    #   (b) prefill FLOOR: a prefill layer can route the WHOLE prompt across up
+    #       to every expert, so ONE dispatch commits up to E experts in-flight at
+    #       once. The archer fetch thread evict-starves (expert_dispatcher.cpp
+    #       :1055 "evict starvation") if the pool can't hold a full dispatch —
+    #       so the TOTAL pool (pins + headroom) must be >= E + slack. Pins count
+    #       toward this floor (that is why moe_precache's 624 pins let its
+    #       headroom stay tiny, while moe_ondemand with 0 pins needs headroom
+    #       itself to cover the floor).
+    # This floor (~E) is still far below one decode STEP's fetch count
+    # (n_layers * working >= 48*8 = 384 at B=1), so nothing survives across
+    # steps: no cache, only a transient in-flight buffer.
+    slack = pipeline_slack_topk * top_k
+    working = min(n_experts, max(1, batch_size) * top_k)
+    pinned_total = n_layers * n_pin
+    prefill_floor = n_experts + slack          # pool must hold one full dispatch
+    headroom_experts = max(working + slack, prefill_floor - pinned_total)
+    if headroom_experts_override is not None:
+        headroom_experts = headroom_experts_override
+    headroom_bytes = headroom_experts * expert_bytes
+    pool_bytes = pinned_bytes + headroom_bytes
+    return pool_bytes, n_pin, int(n_experts), expert_bytes
 
 
 def get_gpu_used_bytes(device: int = 0) -> int:

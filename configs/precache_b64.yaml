@@ -1,0 +1,21 @@
+# moe_precache — B=64, same protocol as mc_b64 (qpc15/mnt512/humaneval/pooled)
+# for a like-for-like comparison against MoE-Caching at batch. Pins prefill-hot
+# 10% experts/layer; every other expert is on-demand fetched with NO cache.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+draft:
+  name: moe_precache
+  args:
+    pin_fraction: 0.10
+run:
+  questions_per_cat: 15
+  max_new_tokens: 512
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 64
+output: {label: precache_b64, dir: output/precache_b64}

@@ -1,0 +1,20 @@
+# hf-backend smoke for the mx1 (Mixtral Table-1) run — qpc=1, mnt=64.
+# Prune/Random: keep 1 of 8 experts per layer, drawn once per run (seed 0).
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: random_mask
+  args:
+    seed: 0
+    num_keep: 1
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: mx1_smoke_randmask
+  dir: output/mx1_smoke_randmask

@@ -1,0 +1,21 @@
+# hf-backend smoke for the md1 (DeepSeek Table-1) run - qpc=1, mnt=64.
+# Merge/MC-SMoE: router-logits grouping (avg K=8 adaptive, global budget
+# 27x8 dominants) + permutation-aligned freq-weighted merge.
+model:
+  id: deepseek-ai/deepseek-moe-16b-base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: mc_smoe
+  args:
+    spec_path: output/mc_smoe/deepseek-moe-16b-base_K8.json
+    draft_top_k: 6
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: md1_smoke_mcsmoe
+  dir: output/md1_smoke_mcsmoe

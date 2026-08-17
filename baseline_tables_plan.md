@@ -11,7 +11,7 @@
 | policy | 意義 | 對應列 |
 |---|---|---|
 | **random** | prune/merge 集合**隨機決定、整個 run 固定**（seed 記進 provenance） | Random ×2 |
-| **static** | 集合由 calibration 離線決定、整個 run 固定 | Enumerate（NAEE）、HC-SMoE |
+| **static** | 集合由 calibration 離線決定、整個 run 固定 | Enumerate（NAEE）、HC-SMoE、MC-SMoE |
 | **dynamic** | 集合每個 verify cycle 依 target routing 統計更新——**只有這兩個是動態** | SpecMoE、Ours |
 
 ## 1. 範圍（已定案，不重議）
@@ -102,6 +102,26 @@ HC-SMoE 的 `o_j = mean_t E_j(x_t)` + frequency；Enumerate 的全 expert 輸出
 `indices` 覆蓋全 n 顆 → 與 Ours 共用 `_route_multi_expert`（同 kernel 同路由，只差分群與凍結）。
 單元測試：群覆蓋全部、不重疊、群數 = K、freq 歸一。
 
+### WS-C′：MC-SMoE（merge–static；2026-07-16 新增，tex 同日加列）
+
+M-SMoE（Li et al. ICLR 2024）的 **merging 階段**（low-rank 壓縮與 KD 微調在
+expert-count 預算的 zero-shot 設定下無對應物，不實作）。吃 B1 既有產物
+（freq + router_logits），**不需要新 calibration**。
+
+**C3｜`scripts/build_mc_smoe.py`** + `clustering/mc_smoe.py`：dominant expert =
+adaptive layer-wise ratio（層內 max 正規化 freq、全域 top L·K，每層 ≥1 保證；
+**每層群數不固定，K 是平均**）；非 dominant 依 router-logits cosine（M-SMoE Eq.1，
+用 B1 的 `layer_<li>.pt` router_logits）靠攏最相似 dominant。輸出
+`output/mc_smoe/<tag>_K<K>.json`：每層 `{groups, dominant, freq}`
+（= HC-SMoE spec + 每群 dominant）。純 CPU 秒級。
+
+**C4｜`drafts/mc_smoe.py`**（registry `mc_smoe`）：繼承 `StaticMergeDraft`
+（static_merge 抽出 `_merge_group` hook，行為不變、tests 綠），唯一差異 =
+合併前把每個群員 **permutation-align 到該群 dominant**（Hungarian weight
+matching，SwiGLU 三矩陣 Frobenius 內積 cost；`prepare()` 一次性 ~5.4k 次
+768×768 LSA，幾分鐘）。SwiGLU 家族限定（qwen3/mixtral）；gptoss fused 版
+raise NotImplementedError。args 同 static_merge：`{spec_path, draft_top_k}`。
+
 ### WS-D：Enumerate（prune–static，NAEE）
 
 **D1｜`scripts/search_naee.py`**：讀 B1 快取。Mixtral 精確枚舉；Qwen3 抽樣 10⁵ 個
@@ -148,6 +168,7 @@ HC-SMoE 的 `o_j = mean_t E_j(x_t)` + frequency；Enumerate 的全 expert 輸出
 | Enumerate | Qwen3 / Mixtral / GPT-OSS | `static_mask` | D1+D2；Qwen3 sampled |
 | Random (merge) | Qwen3 / GPT-OSS | `random_merge{K:16 / 4}` | A2；固定分割 |
 | HC-SMoE | Qwen3 / Mixtral / GPT-OSS | `static_merge{K:16 / 1 / 4}` | C1+C2 |
+| MC-SMoE | Qwen3（Mixtral/GPT-OSS 待議） | `mc_smoe{spec_path}` | C3+C4；gptoss 需另解 fused 對齊 |
 | SpecMoE | GPT-OSS | `specmoe{N:4, route_top_k:4}` | G2；Qwen3/Mixtral 已有值 |
 | Ours | GPT-OSS | `topm_count{M:8, K:4, draft_top_k:4}` | G0；M=2K 慣例比照 Qwen3；Qwen3/Mixtral 已有值 |
 | MoE-Caching（Table 2） | Qwen3 | `draft: none`（offload） | A3；n=3 |
@@ -192,16 +213,19 @@ HC-SMoE 的 `o_j = mean_t E_j(x_t)` + frequency；Enumerate 的全 expert 輸出
 | B1 calibration 收集（Qwen3 / Mixtral / GPT-OSS） | 🔶 Qwen3 ✅ | job 259832（259816 因 phase-2 漏 no_grad OOM，已修）；產物 `output/calibration/Qwen3-30B-A3B-Base/`（1.7GB）；Mixtral/GPT-OSS 待送 |
 | C1 HC-SMoE 分群產物 | 🔶 Qwen3 ✅ | `output/hc_smoe/Qwen3-30B-A3B-Base_K16.json`。**觀察：128→16 下 average-linkage 退化為「~113 顆巨群 + 15 singleton」/層（資料健康已驗，是方法在 87.5% 壓縮比的真實行為；HC-SMoE 原文最多測 75%）→ 其 acceptance 預期偏弱，論文解讀時要記得這點** |
 | C2 static_merge draft + 測試 | ✅ 2026-07-11 | 含 lazy_build（259444 教訓）、freq 加權數值驗證、C1→C2 roundtrip；**GPU smoke ✅ job 259849**（q1 AccR 0.098，巨群預期內） |
+| C3 MC-SMoE 分群產物（build_mc_smoe.py + clustering/mc_smoe.py） | 🔶 Qwen3 ✅ 2026-07-16 | `output/mc_smoe/Qwen3-30B-A3B-Base_K16.json`（吃既有 B1 calibration）；adaptive：每層 dominant min 2 / max 30、總 768（=48×16）；群型態比 HC-SMoE 健康（最大群 ~30–80，非 113 巨群） |
+| C4 mc_smoe draft（permutation-aligned merge）+ 測試 | ✅ 2026-07-16 | 繼承 static_merge（`_merge_group` hook 抽出，行為不變）；Hungarian 對齊數值驗證（permuted-clone 恆等）+ registry + fail-fast；tests/unit 108 綠；**GPU smoke ✅ job 265209**（q1/mnt64 全 14 題 rc=0，overall AccR 0.0396 vs HC-SMoE 同協議 smoke 0.098——凝聚式分群偏弱符合 partition A/B 既有結論，正式值看 t1） |
+| Qwen3 acceptance：MC-SMoE（t1 協議） | ✅ 2026-07-17 | job 265221（`t1_qwen3_mcsmoe.yaml`）：**mean7 Overall 0.1255**（cells 已填 tex；> Random-merge 0.1026、< HC-SMoE 0.2939——凝聚式分群在 87.5% 壓縮劣勢，與 partition A/B 結論一致） |
 | D1 NAEE 搜尋產物（Q3 sampled / Mix+GPT exact） | 🔶 Qwen3 ✅ | job 259883（10⁵ 抽樣、31 分）→ `output/naee/Qwen3-30B-A3B-Base_r16.json`；mean/best loss 比中位數 1.21（搜尋有鑑別力）；Mixtral/GPT-OSS 待 B1 後跑 |
 | D2 static_mask draft + 測試 | ✅ 2026-07-12 | 凍結 mask、驗證 fail-fast；走現有 masked forward（259444 smoke 已驗該路徑）；tests/unit 62 綠 |
-| G0 GPT-OSS smoke（Ours / random_merge） | ⬜ | |
-| G1 gptoss masked forward | ⬜ | |
-| G2 gptoss substitute forward + flat weights | ⬜ | |
-| G3/G4 離線 script 的 gptoss 路徑 | ⬜ | |
+| G0 GPT-OSS smoke（Ours / random_merge） | 🔶 已送 | jobs 264776（randmerge）/ 264778（ours=hybrid a75）。**執行計劃移至 `gptoss_acceptance_plan.md`（2026-07-16）**：Ours 用戶拍板 hybrid a75 → 新增 hf-backend act-sim 捕捉（原本只有 offload engine 路徑，缺席時 hybrid 靜默退化純 cooccur） |
+| G1 gptoss masked forward | ✅ 2026-07-16 | softmax-after-topk on masked logits；tests 91 綠 |
+| G2 gptoss substitute forward + flat weights | ✅ 2026-07-16 | `gptoss_substitute_forward`（remap 碰撞 scatter_add_，GPU dense path 語義已核對）+ flat weights 含 bias |
+| G3/G4 離線 script 的 gptoss 路徑 | ✅ 2026-07-16 | hook 重算 full logits（gptoss output[1] 是 post-scatter scores）+ fused clamped-GLU 輸出 kernel + NAEE softmax_after_topk；calibration job 264785 已送 |
 | Qwen3 acceptance ×4（rand-p / rand-m / enum / hc） | 🔶 跑數中 | jobs 259977–259980；**t1 協議：T=5、qpc=15、mnt=512、humaneval、`mt_bench_pooled: true`（mt_bench 整包 15 題）** |
 | Qwen3 acceptance：Ours + SpecMoE 同協議重跑 | 🔶 跑數中 | jobs 259987（**Ours = topm/hybrid a75**，cache mode+C3，沿 f15_hybrid_a75）/ 259988（**SpecMoE ep1**，沿 f15_specmoe_ep1），run 段換成 t1 協議（含 humaneval/pooled，不 skip mt_bench）→ **Table 1 Qwen3 全六列將是同一協議，q5 舊值屆時整批汰換** |
-| Mixtral acceptance ×2（enum / hc） | ⬜ | |
-| GPT-OSS acceptance ×6 | ⬜ | |
+| Mixtral acceptance（全九列，mx1 系列） | 🔶 已送 2026-07-20 | **執行計劃移至 `mixtral_acceptance_plan.md`**：m1 協議（T=3/qpc=all/mnt=512/hf）、九列零新實作；jobs 268210–268224 dependency chain（smoke→full、calib→NAEE/HC/MC→後三列、DV search→DV） |
+| ~~GPT-OSS acceptance ×6~~ | ❌ 作廢 2026-07-21 | 用戶定案 GPT-OSS 行不通(merge 在粗粒度 expert 上崩潰,見 tex Table 3);第三模型改 **DeepSeek-MoE-16B**,候選評估(base vs chat)見 `deepseek_plan.md` |
 | humaneval-only 補跑：Table 1 ×6（hf）+ Table 2 ×2（offload） | ⬜ | |
 | MoE-Caching TPS n=3 | 🔶 r1 ✅ | job 259777（qpc5/mnt512/humaneval）：**overall TPS 7.6991**（vs Ours 3.7172 / SpecMoE 3.4382）。vram 稽核 peak 18.74GB「OVER」屬 audit 常態（歷史 spec run 同線 24.8–31.5GB——MoE-Caching 總用量反而更低，數字有效）。**⚠ batch-1 下 MoE-Caching 快 2×，Table 2 敘事待用戶拍板**；r2/r3 待該決策後再跑 |
 | close-call 補 n=3 | ⬜ | |

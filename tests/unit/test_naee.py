@@ -88,6 +88,52 @@ class TestNaeeLosses:
         assert all(len(set(row.tolist())) == 16 for row in a)
 
 
+# ── D1 gptoss semantics (softmax-after-topk, plan item G4) ──────────────
+
+def _masked_route_ref_gptoss(E, logits, kept, top_k):
+    """gpt-oss oracle: mask → topk the LOGITS → softmax over those k values
+    (mirrors gptoss.make_masked_forward). Loop form, no chunking."""
+    n, T, D = E.shape
+    keep = torch.zeros(n, dtype=torch.bool)
+    keep[torch.tensor(kept)] = True
+    out = torch.zeros(T, D)
+    for t in range(T):
+        lg = logits[t].clone().float()
+        lg[~keep] = float("-inf")
+        k = min(top_k, len(kept))
+        vals, idx = lg.topk(k)
+        w = vals.softmax(dim=-1)
+        out[t] = sum(w[j] * E[idx[j], t].float() for j in range(k))
+    return out
+
+
+class TestNaeeGptOssSemantics:
+    def test_matches_gptoss_oracle(self):
+        E, logits = TestNaeeLosses()._setup()
+        ref = _masked_route_ref_gptoss(E, logits, list(range(6)), top_k=2)
+        cands, _ = make_candidates(6, 3, budget=100, seed=0)
+        losses = naee_losses(E, logits, cands, top_k=2, ref=ref,
+                             softmax_after_topk=True,
+                             cand_chunk=7, token_chunk=3)
+        for c in range(cands.shape[0]):
+            oracle = (_masked_route_ref_gptoss(E, logits, cands[c].tolist(), 2)
+                      - ref).pow(2).sum().sqrt()
+            assert losses[c] == pytest.approx(float(oracle), rel=1e-4)
+
+    def test_equivalent_to_renormed_softmax_topk(self):
+        # A renormalised restriction of a softmax to its own top-k IS the
+        # softmax over those k logits — so with norm_topk_prob=True the two
+        # semantics must agree numerically. Cross-validates both branches.
+        E, logits = TestNaeeLosses()._setup()
+        ref = _masked_route_ref(E, logits, list(range(6)), top_k=2)
+        cands, _ = make_candidates(6, 3, budget=100, seed=0)
+        a = naee_losses(E, logits, cands, top_k=2, ref=ref,
+                        norm_topk_prob=True)
+        b = naee_losses(E, logits, cands, top_k=2, ref=ref,
+                        softmax_after_topk=True)
+        assert torch.allclose(a, b, rtol=1e-4)
+
+
 # ── D2: static_mask draft ───────────────────────────────────────────────
 
 def _write_spec(tmp_path, layers, r=2):

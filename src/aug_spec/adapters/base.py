@@ -209,6 +209,22 @@ class MoEAdapter:
         Overridden by adapters whose experts match the MoEMLP layout."""
         return None
 
+    def mlp_skip_output(self, hidden_states: torch.Tensor):
+        """What a skipped MoE SUBLAYER returns in draft phase (draft_verify /
+        dv_search): zero contribution in the decoder layer's return
+        convention. Default matches HF-native MoE blocks, whose decoder
+        layers unpack (out, router_logits) — qwen3 isinstance-guarded,
+        mixtral/gptoss unconditional. deepseek overrides (`h = self.mlp(h)`
+        takes the tensor alone)."""
+        return torch.zeros_like(hidden_states), None
+
+    def decoder_skip_output(self, hidden_states: torch.Tensor, *args, **kwargs):
+        """What a whole skipped DECODER LAYER returns in draft phase (speed):
+        identity in the layer's return convention. Default matches HF 4.5x
+        native layers (plain tensor). deepseek overrides (4.36-style tuple
+        whose caller indexes [1]/[2] for the pass-through cache)."""
+        return hidden_states
+
     def make_averaged_forward(self, controller, layer_idx: int, block: nn.Module):
         raise NotImplementedError
 

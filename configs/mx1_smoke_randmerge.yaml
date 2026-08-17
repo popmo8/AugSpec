@@ -1,0 +1,22 @@
+# hf-backend smoke for the mx1 (Mixtral Table-1) run — qpc=1, mnt=64.
+# Merge/Random: K=1 — all 8 experts uniform-merged into one (the seeded
+# partition is vacuous at K=1); draft_top_k clamps to K anyway.
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: random_merge
+  args:
+    K: 1
+    draft_top_k: 1
+    seed: 0
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: mx1_smoke_randmerge
+  dir: output/mx1_smoke_randmerge

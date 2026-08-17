@@ -1,0 +1,38 @@
+# dsm series (2026-07-21): DeepSeek-MoE-16B candidate eval (base vs chat) on
+# Ours / SpecMoE — picks the model that replaces GPT-OSS in Table 1.
+# m1-style protocol at qpc=15: T=3, mnt=512, B=1, humaneval, mt_bench_pooled.
+# HF BACKEND (trust_remote_code, cli default true). Budget: 12.5% of 64
+# routed experts -> 8 (shared experts are dense weights, outside the budget,
+# active in both phases for every method).
+# Ours: topm_count M16/K8 (M=2K convention), hybrid a75 — same method
+# definition as m1_ours; hf act-sim prefill capture lives in the deepseek
+# adapter's verify expert loop (check the [act_sim] engage line in the log).
+model:
+  id: deepseek-ai/deepseek-moe-16b-base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: topm_count
+  args:
+    M: 16
+    K: 8
+    draft_top_k: 6
+    record_history: false
+cluster:
+  name: hybrid
+  alpha: 0.75
+  metric: l2
+  norm: rank
+  cooccur_norm: raw
+  cooccur_scope: decode
+  within_weight: uniform
+run:
+  T: 3
+  questions_per_cat: 15
+  max_new_tokens: 512
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: dsm_base_ours
+  dir: output/dsm_base_ours

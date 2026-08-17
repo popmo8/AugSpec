@@ -12,12 +12,15 @@ from typing import Any, Dict, Type
 
 from .base import DraftStrategy, ScoreBasedAvgDraft
 from .count import CountDraft, PrunedCountDraft
+from .draft_verify import DraftVerifyDraft
+from .mc_smoe import MCSMoEDraft
 from .prefill_count import PrefillCountDraft
 from .prefill_topm_count import PrefillTopMCountDraft
 from .random_mask import RandomMaskDraft
 from .random_merge import RandomMergeDraft
 from .softmax import SoftmaxDraft
 from .specmoe import SpecMoeDraft
+from .speed import SpeedDraft
 from .static_mask import StaticMaskDraft
 from .static_merge import StaticMergeDraft
 from .topm_count import TopMCountDraft
@@ -35,8 +38,11 @@ _REGISTRY: Dict[str, Type[DraftStrategy]] = {
     "random_mask": RandomMaskDraft,
     "random_merge": RandomMergeDraft,
     "specmoe": SpecMoeDraft,
+    "speed": SpeedDraft,
+    "draft_verify": DraftVerifyDraft,
     "static_mask": StaticMaskDraft,
     "static_merge": StaticMergeDraft,
+    "mc_smoe": MCSMoEDraft,
 }
 
 
@@ -62,14 +68,17 @@ __all__ = [
     "ScoreBasedAvgDraft",
     "UniformDraft",
     "CountDraft",
+    "DraftVerifyDraft",
     "PrunedCountDraft",
     "TopMCountDraft",
     "PrefillCountDraft",
     "PrefillTopMCountDraft",
     "SoftmaxDraft",
+    "MCSMoEDraft",
     "RandomMaskDraft",
     "RandomMergeDraft",
     "SpecMoeDraft",
+    "SpeedDraft",
     "StaticMaskDraft",
     "StaticMergeDraft",
     "get_draft",

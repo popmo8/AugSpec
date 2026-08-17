@@ -11,7 +11,7 @@ model:
     vram_budget_ratio: 0.2
 
 draft:
-  name: none
+  name: moe_caching
 
 run:
   questions_per_cat: 5

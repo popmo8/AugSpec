@@ -23,7 +23,7 @@ model:
     # merged_backend: engine_bmm        # engine_bmm (default) | dispatch | bmm  (A4)
 
 draft:
-  name: uniform | count | pruned_count | topm_count | prefill_count | prefill_topm_count | softmax | random_mask | random_merge | specmoe | none   # REQUIRED
+  name: uniform | count | pruned_count | topm_count | prefill_count | prefill_topm_count | softmax | random_mask | random_merge | specmoe | speed | draft_verify | static_mask | static_merge | mc_smoe | moe_caching (alias none) | moe_precache | moe_ondemand   # REQUIRED
   args:
     # strategy-specific — see "Draft strategies" below
   # early_pin: 0                        # default: 0  — SpecMoE early-pin stage 0|1|2 (A4)
@@ -301,6 +301,86 @@ built offline by `scripts/build_hc_smoe.py` (average-linkage clustering on
 calibration expert outputs from `scripts/collect_calibration.py`), merges
 each group frequency-weighted ONCE, and stays frozen for the whole run.
 The `cluster` section is ignored — the partition lives in the spec file.
+
+#### `mc_smoe` — permutation-aligned merged experts (MC-SMoE baseline)
+
+```yaml
+draft:
+  name: mc_smoe
+  args:
+    spec_path: output/mc_smoe/Qwen3-30B-A3B-Base_K16.json   # REQUIRED
+    draft_top_k: 8         # clusters activated per token (default: native top-k)
+```
+
+The Table-1 "MC-SMoE" baseline (merge–static; M-SMoE, Li et al. ICLR
+2024). Same frozen static-merge machinery as `static_merge`, but the spec
+comes from `scripts/build_mc_smoe.py` (dominant experts by adaptive
+layer-wise frequency — the per-layer group count VARIES, K is the
+average — grouping by router-logits cosine) and, before each group's
+frequency-weighted average, every member is neuron-permutation-aligned to
+the group's dominant expert (Hungarian weight matching, done once in
+`prepare()` — a few minutes of one-time cost at run start). SwiGLU expert
+families only (qwen3/mixtral); merging stage only (no low-rank
+compression / KD — no zero-shot counterpart under the expert-count
+budget).
+
+#### `speed` — early-exit layer-skip draft (Speed baseline)
+
+```yaml
+draft:
+  name: speed
+  args:
+    num_layers: 6          # REQUIRED: leading decoder layers the draft runs
+```
+
+The Table-1 "Speed" baseline (prune, depth axis; SPEED, Hooper et al.
+NeurIPS-W 2023). The draft forward runs only the first `num_layers`
+decoder layers — every later layer is identity-skipped during the draft
+phase — and the model's own final norm + lm_head classify the early
+hidden state. Training-free adaptation (the original fine-tunes with a
+weighted early-exit loss, which we cannot do to the frozen target).
+Budget matching: `num_layers: 6` of Qwen3's 48 = 12.5% of expert memory,
+the same draft budget as the width-axis rows (SpecMoE's 16/128 per
+layer). The MoE blocks in the executed layers run standard full routing
+in both phases; verify runs all layers as usual. Requires a
+`model.model.layers`-style decoder (Qwen3-family). The `cluster` section
+is ignored.
+
+#### `draft_verify` — optimised sublayer-skip draft (Draft&Verify baseline)
+
+```yaml
+draft:
+  name: draft_verify        # no args needed — fully automatic by default
+  # args:                   # optional overrides:
+  #   num_keep: 6           #   kept-MoE-layer count (default: 12.5% budget)
+  #   keep_frac: 0.125      #   ...or override the budget fraction itself
+  #   spec_path: output/draft_verify/Qwen3-30B-A3B-Base_L6.json  # explicit spec
+  #   mlp_keep: [0, 9, 18, 27, 36, 45]   # inline keep-set (mechanism smokes)
+  #   attn_skip: []                      # attention sublayers to skip
+```
+
+The Table-1 "Draft&Verify" baseline (prune, layer-skip; Zhang et al.,
+ACL 2024). Sublayer-granular sibling of `speed`: instead of a depth
+prefix, the draft phase skips a *selected* set of intermediate MoE
+sublayers (attention is kept everywhere by default — it carries no
+expert memory, which only favours the baseline); verify runs the full
+model. The kept set comes from the paper's Bayesian-optimisation search
+(objective adapted to the acceptance-only Table 1: greedy draft/target
+token agreement on C4 dev continuations, under the fixed kept-layer
+budget — Qwen3 6/48 = 12.5% expert memory).
+
+**Auto mode (default)**: with no `spec_path`/`mlp_keep`, the run derives
+`num_keep` from the model's MoE layer count (12.5%), resolves
+`output/draft_verify/<model tag>_L<num_keep>.json`, and — if the file is
+missing — runs the BO search in-run at startup and saves it there
+(subsequent runs on the same model just read the file). Works on any
+backend/model the draft supports; on the offload backend the in-run
+search is fetch-bound, so prefer the offline route there:
+`sbatch scripts/run_search_dv.sh <model-id>`. `spec_path` and `mlp_keep`
+remain as explicit overrides (mutually exclusive). `attn_skip` must not
+contain layer 0 (HF cache-length bookkeeping reads layer 0). Requires a
+`model.model.layers`-style decoder (Qwen3-family). The `cluster` section
+is ignored.
 
 #### `none` — non-speculative baseline (e.g. MoE-Caching)
 

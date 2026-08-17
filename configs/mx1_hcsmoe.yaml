@@ -1,0 +1,24 @@
+# mx1 series (2026-07-20): Mixtral-8x7B Table-1 rows under the m1 protocol —
+# T=3, questions_per_cat=all (560 q), mnt=512, B=1, HF BACKEND ONLY
+# (Mixtral has no offload port, baseline_tables_plan.md S3).
+# Budget: 12.5% of 8 experts -> 1 draft-side expert per layer (8->1).
+# Merge/HC-SMoE: K=1 degenerate single cluster (freq-weighted merge of all 8;
+# baseline_tables_plan.md WS-C "8->1 degenerates, run as-is").
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: static_merge
+  args:
+    spec_path: output/hc_smoe/Mixtral-8x7B-v0.1_K1.json
+    draft_top_k: 1
+run:
+  T: 3
+  questions_per_cat: all
+  max_new_tokens: 512
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: mx1_hcsmoe
+  dir: output/mx1_hcsmoe

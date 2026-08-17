@@ -46,9 +46,14 @@ class DraftStrategy:
     #   draft args when absent (the CountDraft family).
     # needs_num_experts: requires the layer's expert count auto-filled when
     #   absent (random_mask).
+    # needs_layer_spec: consumes an offline-searched layer-keep spec; when
+    #   the YAML names neither spec_path nor an inline keep-set, cli
+    #   resolves the default spec path and, if the file is missing, runs
+    #   the search in-run (draft_verify).
     holds_merged_residency: bool = False
     needs_count_top_k: bool = False
     needs_num_experts: bool = False
+    needs_layer_spec: bool = False
 
     def prepare(self, adapter, blocks) -> None:
         """One-time setup before any inference (called once by the CLI after
@@ -75,6 +80,17 @@ class DraftStrategy:
 
     def lazy_build(self, layer_idx: int, block, adapter):
         return None
+
+    def post_install(self, controller) -> None:
+        """Called at the end of `Controller.install()`. Drafts whose
+        mechanism reaches beyond the MoE-block forward swap (e.g. speed's
+        decoder-layer skip) install their extra hooks here. Default no-op."""
+        pass
+
+    def post_uninstall(self, controller) -> None:
+        """Mirror of `post_install`, called from `Controller.uninstall()`
+        before the MoE-block forwards are restored. Default no-op."""
+        pass
 
 
 # =========================================================================
@@ -109,6 +125,17 @@ class ScoreBasedAvgDraft(DraftStrategy):
     # scores override to "float". Only consulted when record_history=True.
     history_value_kind: str = "float"
 
+    @property
+    def group_cap(self) -> int:
+        """Max experts per merged group (M-sweep support, 2026-07-25):
+        ceil(M/K) for top-M drafts, floor 2 = the classic pairing. Drives
+        greedy_group's capacity and merged_cache's adopt accounting."""
+        M = getattr(self, "M", None)
+        K = getattr(self, "K", 1) or 1
+        if not M:
+            return 2
+        return max(2, -(-int(M) // int(K)))
+
     def __init__(self, record_history: bool = False,
                  K: int = 1,
                  draft_top_k: Optional[int] = None,
@@ -136,6 +163,13 @@ class ScoreBasedAvgDraft(DraftStrategy):
         # cluster method needs it.
         self.act_sim_num: Dict[int, torch.Tensor] = {}
         self.act_sim_cnt: Dict[int, torch.Tensor] = {}
+        # hf-backend act-sim (hybrid-on-hf, e.g. GPT-OSS acceptance runs):
+        # layers whose prefill capture is done this question. The adapter's
+        # target forward gates on wants_prefill_act_sim() and feeds
+        # accumulate_prefill_act_sim(); offload runs never touch these (the
+        # C++ engine path in accumulate_activation_sim is unchanged).
+        self._act_sim_captured: set = set()
+        self._act_sim_hf_logged = False    # one INFO line per process
 
         # How active experts are partitioned into the K clusters. Defaults to
         # frequency-slice (the original behaviour); the CLI injects another
@@ -247,6 +281,7 @@ class ScoreBasedAvgDraft(DraftStrategy):
         self._prefill_seen.clear()     # next capture per layer = new prefill
         self.act_sim_num.clear()       # activation-similarity accumulates per-question
         self.act_sim_cnt.clear()
+        self._act_sim_captured.clear() # next question captures prefill anew
         self._cycle_in_question = -1
         # AUG_DUMP_ACTIVE_SET diagnostic: a new question starts here, so bump
         # the question id and restart the per-layer cycle counter. This lets
@@ -300,14 +335,42 @@ class ScoreBasedAvgDraft(DraftStrategy):
 
     def accumulate_activation_sim(self, layer_idx, dispatcher, n) -> None:
         """Pull this layer's captured per-expert outputs from the C++ engine and
-        accumulate, per co-firing token, the pairwise output-cosine into
-        act_sim_num[n,n] and the co-fire count into act_sim_cnt[n,n]. Called from
-        on_verify_layer (post-dispatch) when cluster_method.needs_activation_sim.
-        captured = list of (layer_idx, expert_idx, token_indices[t], output[t,D]).
+        fold them into the running act-sim tables. Called from on_verify_layer
+        (post-dispatch) when cluster_method.needs_activation_sim.
         """
         captured = dispatcher.get_captured_expert_outputs()
         if not captured:
             return
+        self._accumulate_act_sim(layer_idx, captured, n)
+
+    def wants_prefill_act_sim(self, layer_idx) -> bool:
+        """hf-backend act-sim gate: True when the adapter's TARGET forward
+        should recompute this layer's fired-expert outputs and feed
+        accumulate_prefill_act_sim. Only prefill-only cluster methods (hybrid)
+        qualify — per-cycle capture on hf would pay a full extra expert
+        forward every verify, and no current experiment needs it."""
+        cm = self.cluster_method
+        return (getattr(cm, "needs_activation_sim", False)
+                and getattr(cm, "act_sim_prefill_only", False)
+                and layer_idx not in self._act_sim_captured)
+
+    def accumulate_prefill_act_sim(self, layer_idx, captured, n) -> None:
+        """hf-backend act-sim entry: `captured` uses the same tuple format as
+        the C++ engine's get_captured_expert_outputs(). Freezes the layer for
+        the rest of the question (act_sim_prefill_only semantics — without
+        this line every verify would re-gate as "prefill not seen")."""
+        self._act_sim_captured.add(layer_idx)
+        if not self._act_sim_hf_logged:
+            print(f"[act_sim] hf prefill capture engaged (layer {layer_idx}, "
+                  f"{len(captured)} fired experts, n={n})")
+            self._act_sim_hf_logged = True
+        self._accumulate_act_sim(layer_idx, captured, n)
+
+    def _accumulate_act_sim(self, layer_idx, captured, n) -> None:
+        """Accumulate, per co-firing token, the pairwise output metric into
+        act_sim_num[n,n] and the co-fire count into act_sim_cnt[n,n].
+        captured = list of (layer_idx, expert_idx, token_indices[t], output[t,D]).
+        """
         metric = getattr(self.cluster_method, "metric", "cosine")
         # token id -> list of (expert, RAW output vec)
         tok: Dict[int, List] = {}
@@ -451,7 +514,8 @@ class ScoreBasedAvgDraft(DraftStrategy):
         ctx = ClusterContext(active=active, weights=weights,
                              layer_idx=layer_idx,
                              cooccur=self.cooccur.get(layer_idx),
-                             pair_sim=self._pair_sim_table(layer_idx))
+                             pair_sim=self._pair_sim_table(layer_idx),
+                             group_cap=self.group_cap)
         groups = self.cluster_method.assign(ctx, self.K)
         self._maybe_dump_pairs(layer_idx, active, groups)
 

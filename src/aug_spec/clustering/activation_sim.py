@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import List
 
-from .base import ClusterContext, ClusterMethod, greedy_pair
+from .base import ClusterContext, ClusterMethod, greedy_group
 
 
 class ActivationSimCluster(ClusterMethod):
@@ -29,4 +29,4 @@ class ActivationSimCluster(ClusterMethod):
         self.metric = metric
 
     def assign(self, ctx: ClusterContext, K: int) -> List[List[int]]:
-        return greedy_pair(ctx.pair_sim, list(ctx.active), K)
+        return greedy_group(ctx.pair_sim, list(ctx.active), K, ctx.group_cap)

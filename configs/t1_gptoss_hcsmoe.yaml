@@ -1,0 +1,8 @@
+# Table 1 — GPT-OSS HC-SMoE row (hf acceptance; gptoss_acceptance_plan.md)。
+# avg-linkage 32→4 群、freq-weighted merge;吃 C1 產物。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: static_merge
+  args: {spec_path: output/hc_smoe/gpt-oss-20b_K4.json, draft_top_k: 4}
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, humaneval: true, mt_bench_pooled: true}
+output: {label: t1_gptoss_hcsmoe, dir: output/t1_gptoss_hcsmoe}

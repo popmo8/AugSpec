@@ -1,0 +1,26 @@
+# md1 series (2026-07-21): DeepSeek-MoE-16B-base Table-1 rows under the m1
+# protocol - T=3, questions_per_cat=all (560 q), mnt=512, B=1, HF BACKEND
+# (trust_remote_code family; no offload port). Replaces the GPT-OSS block.
+# Budget: 12.5% of 64 routed experts -> 8 per layer (64->8). The 2 shared
+# experts are dense weights outside the budget, active in both phases for
+# every method. Model picked over -chat by the dsm candidate eval
+# (deepseek_plan.md: base 0.6970 vs chat 0.3737 on Ours).
+# Prune/Random: keep 8 of 64 routed experts per layer, drawn once per run.
+model:
+  id: deepseek-ai/deepseek-moe-16b-base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: random_mask
+  args:
+    seed: 0
+    num_keep: 8
+run:
+  T: 3
+  questions_per_cat: all
+  max_new_tokens: 512
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: md1_randmask
+  dir: output/md1_randmask

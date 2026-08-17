@@ -1,0 +1,15 @@
+# G0 smoke — GPT-OSS 20B「Random (merge)」列(hf backend, acceptance only)。
+# random_merge 全 32 顆隨機均分 4 群、uniform 合併、全 run 凍結(lazy_build 路徑)。
+# 正式 run = t1_gptoss_randmerge.yaml(qpc=15)。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: random_merge
+  args: {K: 4, draft_top_k: 4, seed: 0}
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 128
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output: {label: g0_gptoss_randmerge_smoke, dir: output/g0_gptoss_randmerge_smoke}

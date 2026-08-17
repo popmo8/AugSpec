@@ -7,18 +7,51 @@
 %   Table 2 (tab:throughput)     — system axis: offloading systems.
 % ==========================================================================
 %
-% Table 1: draft-construction baselines, {prune, merge} x {random,
-% static, dynamic}, on three MoE models. Acceptance rate per task, all
-% under the same 12.5% draft-side expert memory budget.
+% Table 1: draft-construction baselines grouped into expert-pruning and
+% expert-merging families, on three MoE models. Acceptance rate per task,
+% all under the same 12.5% draft-side expert memory budget.
+%   Prune rows: Random, Speed + Draft&Verify (layer-skipping), Enumerate
+%   (static NAEE), SpecMoE (dynamic). Merge rows: Random, MC-SMoE + HC-SMoE
+%   (static), Ours. (2026-07-16: added Speed/Draft&Verify/MC-SMoE rows.)
 % 2026-07-11: TPS column REMOVED from Table 1 — throughput lives only in
-% Table 2 (Qwen3-only). GPT-OSS rows kept in Table 1: acceptance WILL be
-% filled from hf-backend runs (no offload/TPS for GPT-OSS — the engine
-% does not support that family; see baseline_tables_plan.md WS-G).
+% Table 2 (Qwen3-only). 2026-07-21: the third model block is
+% DeepSeek-MoE-16B-base (GPT-OSS dropped — merging collapses on its coarse
+% experts, kept only as the Table 3 ablation): acceptance to be filled from
+% hf-backend md1 runs (no offload/TPS for that family; deepseek_plan.md).
 %
 % Data provenance (do not edit numbers by hand):
-%   QWEN3 rows: FINAL t1 runs (2026-07-13, jobs t1b 260170-260175), configs
-%   configs/t1_qwen3_{randmask,enum,specmoe,randmerge,hcsmoe,ours}.yaml.
-%   Protocol: T=5, qpc=15, max_new_tokens=512, humaneval on,
+%   QWEN3 rows: m1 series (FILLED 2026-07-20; supersedes the t1/T=5 numbers,
+%   which remain in git history). Protocol: T=3, questions_per_cat=all
+%   (Spec-Bench 80/subtask in FULL + HumanEval 80 of 164 seeded) -> 560 q/row,
+%   max_new_tokens=512, batch 1, mt_bench_pooled. Backends: hf (all-resident)
+%   for every row EXCEPT Ours, which runs the offload engine because hybrid's
+%   act-sim capture is engine-side for qwen3 (the hf act-sim path exists only
+%   for gptoss); acceptance is backend-independent (greedy target-exact).
+%   Configs configs/m1_{randmask,speed,dv,enum,specmoe,randmerge,mcsmoe,
+%   hcsmoe,ours}.yaml; jobs 265701-709 + retries.
+%   OURS cell provenance (job 265701 wedged at q370/560; two salvage runs):
+%     mt_bench/qa/math/humaneval = run-1 incremental per-question CSV
+%     (output/m1_ours_partial_265701.csv), cycles-weighted pooling (~= runner
+%     pooled, error <0.1pp); translation/summarization/rag = dedicated
+%     single-subtask runs (jobs 268199-201, full 80 q each). Merged record:
+%     output/m1_ours_merged/overall_summary.csv (per-cell provenance column).
+%   SPEED row: near-zero is REAL (depth-axis 6/48-layer early-exit at the
+%   12.5% budget; logit-lens — 47-layer control hit 0.72). FINAL 2026-07-20:
+%   job 268202 completed (560/560); translation cell updated 0.0008(partial)
+%   -> 0.0010 (full 80 q); mean7 unchanged at 0.0036.
+%   *** DEEPSEEK BLOCK (DONE 2026-07-24) ***: DeepSeek-MoE-16B-base (header swapped in
+%   2026-07-21; replaces GPT-OSS — user decision, merging collapses on its
+%   coarse experts, cf. Table 3). Model picked by the dsm candidate eval
+%   (base Ours 0.6970 / SpecMoE 0.5972 vs chat 0.3737 / 0.3124, qpc=15).
+%   Rows to be filled from the md1 series at the T=3/m1 protocol — 64->8
+%   budget (the 2 always-on shared experts are dense weights outside the
+%   routed-expert budget, active in both phases for every row); configs
+%   configs/md1_*.yaml. md1 chain LAUNCHED 2026-07-21, jobs 273065-273079
+%   (deepseek_plan.md §3/§5 for the DAG and resubmit SOP).
+%   NB Enumerate on this model is SAMPLED 1e5 (C(64,8)~4.4e9), like Qwen3.
+%   (Mixtral block: DONE 2026-07-21, all 9 rows at m1 — below.)
+%   Historical t1 protocol (for the method-definition notes below):
+%   T=5, qpc=15, max_new_tokens=512, humaneval on,
 %   mt_bench_pooled on (mt_bench = 15 q total, not per sub-cat) -> 105 q/row.
 %     Prune/Random = random_mask num_keep=16 (drawn once/run, seed 0);
 %     Enumerate    = static_mask, NAEE sampled 1e5 subsets (search_naee.py);
@@ -26,6 +59,50 @@
 %     Merge/Random = random_merge K=16 (random partition once/run, seed 0);
 %     HC-SMoE      = static_merge, avg-linkage K=16 freq-weighted (build_hc_smoe.py);
 %     Ours         = topm_count M32/K16 + hybrid alpha=0.75, cache mode.
+%   MC-SMOE Qwen3 row: FILLED 2026-07-17 from job 265221 (t1 protocol, same
+%   as the six t1b rows), config configs/t1_qwen3_mcsmoe.yaml, output
+%   output/t1_qwen3_mcsmoe. Method = M-SMoE merging stage only (adaptive
+%   dominant avg K=16 + router-logits grouping via build_mc_smoe.py on the
+%   B1 calibration, spec output/mc_smoe/Qwen3-30B-A3B-Base_K16.json;
+%   permutation-aligned freq-weighted merge in draft `mc_smoe`; no low-rank
+%   compression / KD — no zero-shot counterpart under the expert-count
+%   budget). Cells = overall_summary.csv per-subtask acceptance (same
+%   convention as the t1b rows); Overall = mean7 0.1255 (runner pooled
+%   0.1324). NOTE (finding): MC-SMoE (0.1255) beats Random-merge (0.1026)
+%   but loses to HC-SMoE (0.2939) — consistent with the project's partition
+%   A/B result that cohesive "merge the similar" grouping underperforms at
+%   87.5% compression; router-logits grouping is the most cohesive of the
+%   three.
+%   SPEED Qwen3 row: FILLED 2026-07-17 from job 265627 (t1 protocol, same
+%   as the six t1b rows), config configs/t1_qwen3_speed.yaml, output
+%   output/t1_qwen3_speed. Method = early-exit adaptation of SPEED (draft
+%   runs the first 6/48 decoder layers = 12.5% expert memory on the DEPTH
+%   axis, remaining layers identity-skipped in draft phase, own final
+%   norm + lm_head classifies; training-free — no weighted-loss finetune,
+%   the target is frozen). Overall = mean7 0.0026 (runner pooled 0.0023).
+%   Mechanism VALIDATED by a num_layers sweep (jobs 265241/265617, qpc=1
+%   smokes): 47/48 layers -> AccR 0.72 (skip machinery + KV handling
+%   correct), 24 -> 0.004, 6 -> 0.001. The near-zero acceptance is REAL,
+%   not a bug: without an early-exit-tuned head the residual stream only
+%   aligns with the output embedding in the last few layers (logit-lens /
+%   tuned-lens phenomenon). Say so in the text: DEPTH-axis pruning fails
+%   outright at this budget while width-axis pruning does not — even
+%   Random width-prune (0.366) dominates it by two orders of magnitude.
+%   DRAFT&VERIFY Qwen3 row (2026-07-17): implementation landed — sublayer-
+%   granular layer-skip adaptation (draft phase skips a BO-selected set of
+%   interior MoE sublayers, 6/48 kept = 12.5% expert memory; attention
+%   sublayers retained — they hold no expert memory, which only favours the
+%   baseline; verify runs the full model). Kept set from
+%   scripts/search_draft_verify.py: the paper's Bayesian optimisation (§3.3)
+%   with the objective adapted to the acceptance-only protocol — greedy
+%   draft/target token agreement, teacher-forced on full-model C4 dev
+%   continuations (the fixed budget already pins draft cost; the paper's
+%   adaptive draft-exit is superseded by the protocol's fixed T=5). Draft
+%   `draft_verify`, config configs/t1_qwen3_dv.yaml (auto mode: the run
+%   derives the 6/48 budget and resolves the spec
+%   output/draft_verify/Qwen3-30B-A3B-Base_L6.json, running the BO search
+%   in-run if the file is missing). NUMBER PENDING (BO search + t1 run in
+%   flight).
 %   `Overall` = equal-weight mean over the SEVEN per-subtask cells shown
 %   (verifiable by hand). NB the runner's overall_summary.csv reports the
 %   PROPOSAL-POOLED overall instead (pooled - mean7: ~+0.005 for most rows,
@@ -36,18 +113,75 @@
 %   (C(128,16) ~ 1e20; NAEE's own paper targets <=8 experts). Defensible but
 %   flag it in the text so a reviewer isn't surprised the "smart" static
 %   prune loses to random.
-%   MIXTRAL rows: still AAAI27_MergeSpec draft placeholders (Random-prune =
-%   draft "Random", Random-merge = draft "Average"); GPT-OSS rows: to be
-%   filled from hf-backend acceptance runs (baseline_tables_plan.md WS-G).
+%   MIXTRAL rows: ALL 9 FILLED 2026-07-21 from the mx1 runs — SAME m1 protocol
+%   as the Qwen3 block (T=3, qpc=all -> Spec-Bench 6x80 + HumanEval 80 = 560
+%   q/row, mnt=512, B=1), HF backend (Mixtral has no offload port; acceptance
+%   is backend-independent, per the caption). Cells = overall_summary.csv
+%   per-subtask acceptance_rate; Overall = mean7 (same convention as every
+%   other row). 8->1 budget = 1 draft expert/layer. Configs
+%   configs/mx1_<row>.yaml, outputs output/mx1_<row>/. Jobs & drafts:
+%     Prune: Random 268213 (random_mask num_keep=1 seed0); Speed 268217
+%       (num_layers=4 = 4/32 depth); Draft&Verify 268224 (draft_verify auto,
+%       4/32 MoE sublayers kept, BO spec _L4.json); Enumerate 268220
+%       (static_mask, NAEE EXACT C(8,1)=8 subsets/layer, _r1.json); SpecMoE
+%       268214 (specmoe N=1 route_top_k=2).
+%     Merge: Random 268215 (random_merge K=1 seed0); MC-SMoE 268222 (mc_smoe,
+%       avg K=1, _K1.json); HC-SMoE 268221 (static_merge, K=1 single cluster,
+%       _K1.json); Ours 268216 (topm_count M2/K1 — K=1 takes the single-dense
+%       merge path, cluster method bypassed; merge weights = decode vote-count
+%       freqs, the count-weighted linear merge).
+%   Bold: Ours is the per-column best on ALL 8 columns (like Qwen3).
+%   NOTE (8->1 findings, for the text): (a) at K=1 every merge baseline
+%   collapses to ONE merged expert per layer, so Random/MC-SMoE/HC-SMoE are
+%   near-identical (~0.80 overall, differ only by merge weighting: uniform vs
+%   router-logits vs freq) — grouping is vacuous with a single cluster. Ours
+%   wins (0.833) because top-M=2 merges only the 2 hottest experts instead of
+%   diluting with all 8. (b) Enumerate 0.701 < Random-prune 0.727 even under
+%   EXACT enumeration — the same "smart static prune loses to random" finding
+%   as Qwen3, here NOT a sampling artefact. (c) depth-axis pruning fails on
+%   Mixtral too: Speed ~0 (32->4 layers), Draft&Verify 0.043 — mirrors Qwen3.
+%   DEEPSEEK rows: ALL 9 FILLED 2026-07-24 from the md1 runs (protocol
+%   above, 560 q/row; cells = overall_summary per-subtask acceptance_rate,
+%   Overall = mean7). Configs configs/md1_<row>.yaml, outputs output/md1_*.
+%     Prune: Random 0.2305 (job 273068, num_keep=8 seed0); Speed 0.0009
+%       (273072, num_layers=4 -> 3/27 MoE depth budget); Draft&Verify
+%       0.0000 (273079, auto L3 spec from BO search job 273067); Enumerate
+%       0.2317 (273075, NAEE SAMPLED 1e5, spec _r8.json); SpecMoE 0.5945
+%       (273069, N=8 route_top_k=6).
+%     Merge: Random 0.1499 (273070, K=8 seed0); MC-SMoE 0.6218 (273077,
+%       _K8.json); HC-SMoE 0.7022 (273076, _K8.json); Ours 0.6936 (273071,
+%       topm_count M16/K8 + hybrid a75, [act_sim] engage verified in log).
+%   Consistency vs the dsm qpc=15 candidate eval: SpecMoE 0.5945/0.5972,
+%   Ours 0.6936/0.6970 — protocol scale-up stable. Bold applied 2026-07-24.
+%   *** FINDING (narrative-critical): HC-SMoE (0.7022) EDGES OURS (0.6936)
+%   on the DeepSeek overall — the only block where Ours is not the outright
+%   winner. Bold splits: Ours best on MT/Summ/Coding, HC-SMoE on
+%   Trans/QA/Math/RAG/Overall (QA by 0.0007). The 0.86pp overall gap is a
+%   single-run read-out below the project's pp-level noise bar — consider
+%   >=3 repeats of hcsmoe+ours before submission, and scope the text: on
+%   DeepSeek's 64 mildly-specialised experts a static freq-weighted global
+%   merge is already near-optimal, while Ours wins outright on Mixtral
+%   (coarse, 8E) and Qwen3 (fine-grained, 128E) and stays within noise of
+%   the best static baseline here; unlike HC-SMoE it needs no calibration
+%   corpus. Other findings mirror the other blocks: depth-axis pruning
+%   fails (Speed ~0, DV exactly 0 at 3/27 layers); Enumerate (0.2317) ~=
+%   Random-prune (0.2305) — the sampled NAEE search is again no better
+%   than random at this scale; cohesive MC-SMoE (0.6218) < HC-SMoE.
 %   Coding = HumanEval (our extension beyond Spec-Bench's six subtasks).
-%   TODO(bold): after final numbers land, \textbf the per-column best within
-%   each model block (caption promises it).
-%   TODO(cite): this table carries NO citations by design. Baseline
-%   identities (DECIDED 2026-07-08): Static-prune = NAEE / Enumeration
-%   Pruning (Lu et al., ACL 2024, arXiv 2402.14800; greedy variant for
-%   128-expert models), Static-merge = HC-SMoE (Chen et al., ICML 2025,
-%   arXiv 2410.08589), Dynamic-prune = SpecMoE. Their cites MUST live in
-%   the Baselines paragraph of the experimental setup — cite Sub-MoE and
+%   BOLD: done for Qwen3 + Mixtral (per-column best within each block).
+%   BOLD: done for all three blocks (per-column best within each block).
+%   CITE (2026-07-16): the table now carries ~\cite keys inline; these keys
+%   still need matching .bib entries. Key -> baseline:
+%     lu2024not          = Enumerate (NAEE / Enumeration Pruning, Lu et al.,
+%                          ACL 2024, arXiv 2402.14800; greedy variant for
+%                          128-expert models)
+%     bang2026specmoe    = SpecMoE (dynamic prune)
+%     hooper2025speed    = Speed        (layer-skipping pruning draft)
+%     zhang2024draftverify = Draft&Verify (layer-skipping pruning draft)
+%     hc_smoe            = HC-SMoE (Chen et al., ICML 2025, arXiv 2410.08589)
+%     m_smoe             = MC-SMoE (static merge)
+%   Random and Ours intentionally uncited. The same cites should ALSO appear
+%   in the Baselines paragraph of the experimental setup; cite Sub-MoE and
 %   Mosaic Pruning (both AAAI 2026) there as recent static refinements we
 %   deliberately do not instantiate. Swap the caption's "see Baselines in
 %   the experimental setup" for a concrete \ref{} once that section exists.
@@ -57,16 +191,13 @@
 
 \begin{table*}[t]
 \centering
-\caption{Acceptance rate ($T{=}5$) across Spec-Bench subtasks and Coding
-(HumanEval) for six draft
-constructions spanning \{prune, merge\}\,$\times$\,\{random, static,
-dynamic\}. All rows share the same draft-side resident expert memory budget
-(12.5\% of total expert memory: $8{\to}1$ for Mixtral, $32{\to}4$ for
-GPT-OSS-20B, $128{\to}16$ for Qwen3), the same CPU-offloading backend with
-no target-side expert cache, and greedy target-exact verification; MT-Bench
-uses first turns only. Enumerate and HC-SMoE instantiate the static
-expert-pruning / expert-merging baselines, and SpecMoE the dynamic
-pruning policy; see Baselines in the experimental setup for details and
+\caption{Acceptance rate ($T{=}3$) across Spec-Bench subtasks and Coding
+(HumanEval) for nine draft constructions grouped into expert-pruning and
+expert-merging families. All rows share the same draft-side resident expert
+memory budget (12.5\% of total expert memory: $8{\to}1$ for Mixtral,
+$64{\to}8$ for DeepSeek-MoE-16B, $128{\to}16$ for Qwen3) and greedy target-exact
+verification (acceptance is therefore backend-independent); MT-Bench uses
+first turns only. See Baselines in the experimental setup for details and
 citations. Higher is better. Best result per column within each model in
 \textbf{bold}.}
 \label{tab:main_baselines}
@@ -80,117 +211,471 @@ citations. Higher is better. Best result per column within each model in
 \textbf{Model} & \textbf{Draft} & \textbf{Policy}
  & MT-Bench & Trans. & Summ. & QA & Math & RAG & Coding & Overall \\
 \midrule
-\multirow{6}{*}{\shortstack[l]{Mixtral-8x7B\\{\scriptsize (8E, top-2, $8{\to}1$)}}}
- & \multirow{3}{*}{Prune}
-   & Random                    & 0.2066 & 0.3922 & 0.1417 & 0.3146 & 0.2594 & 0.2572 & -- & 0.2249 \\
- & & Enumerate                 & -- & -- & -- & -- & -- & -- & -- & -- \\
- & & SpecMoE                   & 0.6089 & 0.7680 & 0.8433 & 0.8240 & 0.8429 & 0.7235 & -- & 0.6719 \\
+\multirow{9}{*}{\shortstack[l]{Mixtral-8x7B\\{\scriptsize (8E, top-2, $8{\to}1$)}}}
+ & \multirow{5}{*}{Prune}
+   & Random                    & 0.5693 & 0.7911 & 0.7932 & 0.6551 & 0.8274 & 0.6836 & 0.7715 & 0.7273 \\
+ & & Speed~\cite{hooper2025speed}              & 0.0001 & 0.0000 & 0.0001 & 0.0001 & 0.0000 & 0.0000 & 0.0000 & 0.0000 \\
+ & & Draft\&Verify~\cite{zhang2024draftverify}      & 0.0357 & 0.0348 & 0.0277 & 0.0323 & 0.0487 & 0.0414 & 0.0782 & 0.0427 \\
+ & & Enumerate~\cite{lu2024not}          & 0.5627 & 0.7729 & 0.7690 & 0.6474 & 0.8247 & 0.6711 & 0.6576 & 0.7008 \\
+ & & SpecMoE~\cite{bang2026specmoe}            & 0.6556 & 0.8297 & 0.8323 & 0.7130 & 0.8667 & 0.7304 & 0.8597 & 0.7839 \\
 \cmidrule(lr){2-11}
- & \multirow{3}{*}{Merge}
-   & Random                    & 0.1332 & 0.2553 & 0.1111 & 0.2344 & 0.2528 & 0.1481 & -- & 0.1532 \\
- & & HC-SMoE                   & -- & -- & -- & -- & -- & -- & -- & -- \\
- & & \textbf{Ours}             & 0.6120 & 0.8783 & 0.8203 & 0.6777 & 0.8697 & 0.7669 & -- & 0.6746 \\
+ & \multirow{4}{*}{Merge}
+   & Random                    & 0.6828 & 0.8590 & 0.8584 & 0.7346 & 0.8817 & 0.7590 & 0.8377 & 0.8019 \\
+ & & MC-SMoE~\cite{m_smoe}            & 0.6817 & 0.8533 & 0.8575 & 0.7317 & 0.8819 & 0.7569 & 0.8522 & 0.8022 \\
+ & & HC-SMoE~\cite{hc_smoe}            & 0.6836 & 0.8581 & 0.8588 & 0.7334 & 0.8825 & 0.7597 & 0.8349 & 0.8016 \\
+ & & \textbf{Ours}             & \textbf{0.7251} & \textbf{0.8753} & \textbf{0.8786} & \textbf{0.7693} & \textbf{0.9018} & \textbf{0.7821} & \textbf{0.8969} & \textbf{0.8327} \\
 \midrule
-\multirow{6}{*}{\shortstack[l]{GPT-OSS-20B\\{\scriptsize (32E, top-4, $32{\to}4$)}}}
- & \multirow{3}{*}{Prune}
-   & Random                    & -- & -- & -- & -- & -- & -- & -- & -- \\
- & & Enumerate                 & -- & -- & -- & -- & -- & -- & -- & -- \\
- & & SpecMoE                   & -- & -- & -- & -- & -- & -- & -- & -- \\
+\multirow{9}{*}{\shortstack[l]{DeepSeek-MoE-16B\\{\scriptsize (64E, top-6, $64{\to}8$)}}}
+ & \multirow{5}{*}{Prune}
+   & Random                    & 0.2142 & 0.1945 & 0.1469 & 0.3024 & 0.3441 & 0.2322 & 0.1790 & 0.2305 \\
+ & & Speed~\cite{hooper2025speed}              & 0.0006 & 0.0007 & 0.0012 & 0.0008 & 0.0009 & 0.0013 & 0.0009 & 0.0009 \\
+ & & Draft\&Verify~\cite{zhang2024draftverify}      & 0.0000 & 0.0000 & 0.0000 & 0.0000 & 0.0000 & 0.0000 & 0.0000 & 0.0000 \\
+ & & Enumerate~\cite{lu2024not}          & 0.1740 & 0.2848 & 0.1411 & 0.2975 & 0.2957 & 0.2528 & 0.1762 & 0.2317 \\
+ & & SpecMoE~\cite{bang2026specmoe}            & 0.5256 & 0.6258 & 0.5777 & 0.5945 & 0.6683 & 0.5992 & 0.5707 & 0.5945 \\
 \cmidrule(lr){2-11}
- & \multirow{3}{*}{Merge}
-   & Random                    & -- & -- & -- & -- & -- & -- & -- & -- \\
- & & HC-SMoE                   & -- & -- & -- & -- & -- & -- & -- & -- \\
- & & \textbf{Ours}             & -- & -- & -- & -- & -- & -- & -- & -- \\
+ & \multirow{4}{*}{Merge}
+   & Random                    & 0.0895 & 0.1240 & 0.1746 & 0.0868 & 0.2152 & 0.2412 & 0.1181 & 0.1499 \\
+ & & MC-SMoE~\cite{m_smoe}            & 0.5092 & 0.6757 & 0.5941 & 0.6344 & 0.7828 & 0.6376 & 0.5189 & 0.6218 \\
+ & & HC-SMoE~\cite{hc_smoe}            & 0.5728 & \textbf{0.7656} & 0.6715 & \textbf{0.7003} & \textbf{0.8481} & \textbf{0.7063} & 0.6505 & \textbf{0.7022} \\
+ & & \textbf{Ours}             & \textbf{0.5877} & 0.7348 & \textbf{0.6756} & 0.6996 & 0.7835 & 0.6965 & \textbf{0.6774} & 0.6936 \\
 \midrule
-\multirow{6}{*}{\shortstack[l]{Qwen3-30B-A3B\\{\scriptsize (128E, top-8, $128{\to}16$)}}}
- & \multirow{3}{*}{Prune}
-   & Random                    & 0.1817 & 0.5194 & 0.4274 & 0.3676 & 0.3228 & 0.5028 & 0.2404 & 0.3660 \\
- & & Enumerate                 & 0.1966 & 0.3029 & 0.5131 & 0.3255 & 0.2779 & 0.4388 & 0.1494 & 0.3149 \\
- & & SpecMoE                   & 0.3205 & 0.7000 & 0.5238 & 0.4268 & 0.3825 & 0.4849 & 0.3850 & 0.4605 \\
+\multirow{9}{*}{\shortstack[l]{Qwen3-30B-A3B\\{\scriptsize (128E, top-8, $128{\to}16$)}}}
+ & \multirow{5}{*}{Prune}
+   & Random                    & 0.2499 & 0.6311 & 0.4724 & 0.5145 & 0.4012 & 0.6395 & 0.3202 & 0.4613 \\
+ & & Speed~\cite{hooper2025speed}              & 0.0045 & 0.0010 & 0.0043 & 0.0032 & 0.0064 & 0.0038 & 0.0022 & 0.0036 \\
+ & & Draft\&Verify~\cite{zhang2024draftverify}      & 0.1690 & 0.3106 & 0.3707 & 0.3765 & 0.2158 & 0.4382 & 0.1717 & 0.2932 \\
+ & & Enumerate~\cite{lu2024not}          & 0.2686 & 0.4168 & 0.5460 & 0.4410 & 0.3494 & 0.5779 & 0.2222 & 0.4031 \\
+ & & SpecMoE~\cite{bang2026specmoe}            & 0.3710 & 0.7204 & 0.4332 & 0.4772 & 0.4086 & 0.5397 & 0.4822 & 0.4903 \\
 \cmidrule(lr){2-11}
- & \multirow{3}{*}{Merge}
-   & Random                    & 0.0557 & 0.1909 & 0.0651 & 0.1595 & 0.0863 & 0.1108 & 0.0496 & 0.1026 \\
- & & HC-SMoE                   & 0.1161 & 0.4442 & 0.3661 & 0.3029 & 0.2057 & 0.4536 & 0.1690 & 0.2939 \\
- & & \textbf{Ours}             & \textbf{0.3512} & \textbf{0.7898} & \textbf{0.6956} & \textbf{0.5964} & \textbf{0.4388} & \textbf{0.6890} & \textbf{0.4590} & \textbf{0.5743} \\
+ & \multirow{4}{*}{Merge}
+   & Random                    & 0.0886 & 0.2862 & 0.1014 & 0.2570 & 0.1054 & 0.1828 & 0.0817 & 0.1576 \\
+ & & MC-SMoE~\cite{m_smoe}            & 0.0907 & 0.2928 & 0.1888 & 0.2689 & 0.1007 & 0.2591 & 0.0837 & 0.1835 \\
+ & & HC-SMoE~\cite{hc_smoe}            & 0.1693 & 0.5586 & 0.3936 & 0.4367 & 0.2667 & 0.5929 & 0.2525 & 0.3815 \\
+ & & \textbf{Ours}             & \textbf{0.5853} & \textbf{0.8774} & \textbf{0.8063} & \textbf{0.7631} & \textbf{0.6305} & \textbf{0.8585} & \textbf{0.6547} & \textbf{0.7394} \\
 \bottomrule
 \end{tabular}
 \end{table*}
 
 % ==========================================================================
-% Table 2 (system axis): end-to-end throughput vs offloading systems.
-% Rows: MoE-Caching (non-speculative anchor) / SpecMoE / Ours.
-% 2026-07-11: Table 2 is QWEN3-ONLY — Mixtral / GPT-OSS blocks removed
-% (user decision; Mixtral TPS is unmeasurable without porting the offload
-% routing to the mixtral adapter, see baseline_tables_plan.md S4).
-% Same day: Model column dropped from the tabular — the model is named in
-% the caption instead.
-% Companion to tab:main_baselines (method axis); a batch-sweep figure
-% (fig:batch_sweep, batch 1-256) should accompany this table for the
-% scaling story — this table is the precise single-point read-out.
-%
+% Table 2 (system axis): end-to-end throughput vs offloading systems,
+% UNIFIED batch-scaling table (2026-07-22, replaces the old single-B
+% Table 2 [B=64] and Table 2b [B=128] per user instruction).
+% Rows: six batch sizes (1/4/16/64/128/256), three methods each.
+% Protocol per block (all: mnt=512, batch_by_category affinity batching,
+% spec rows T=5, greedy target-exact verification, 0.2x VRAM budget):
+%   B=1/4/16  : qpc=16 (112 q/row), configs {tag}_q16b{B}
+%   B=64      : qpc=64 (448 q/row), configs *_q64b64 (the old Table 2)
+%   B=128/256 : qpc=all — each subtask's 80 questions CYCLED to fill the
+%               batch via run.batch_fill_repeat (replicas = ordinary seqs)
+% Per-subtask TPS = sum(tokens)/sum(batch walls) of that subtask's pure
+% batches; Overall = sum(tokens)/sum(all walls). Single runs each.
 % Data provenance (do not edit numbers by hand):
-%   PREFILLED cells (Qwen3 SpecMoE/Ours) come from the AAAI27_MergeSpec
-%   draft Table 2 and are placeholders until the final sweep replaces them.
-%   RESOLVED 2026-07-11: the caption's "batch size 64" claim was removed
-%   (numbers are single-request, batch 1). State the batch size explicitly
-%   in the experimental-setup text so the setting is still documented.
-%   FILLED 2026-07-13 (batch 1, single-request):
-%     MoE-Caching = output/t2_qwen3_moecaching_r1 (draft:none, job 259777;
-%       qpc=5, mt_bench NOT pooled, humaneval on -> 70 q, ALL 7 columns).
-%     SpecMoE = output/f15_specmoe_r1 (N=16 pin early_pin=2, qpc=15/mnt512,
-%       skip mt_bench, no humaneval -> 5 subtasks, 75 q).
-%     Ours    = output/f15_hybrid_a75_r1 (hybrid a75 + cache mode, same
-%       f15 protocol -> 5 subtasks, 75 q).
-%   MT-Bench + Coding blank for the spec rows (those f15 runs skipped
-%   mt_bench and predate the humaneval column).
-%   Overall = runner CSV pooled per-question mean TPS (NOT mean7; TPS is a
-%   rate, pooled is the natural headline — differs from Table 1's mean7).
-%   *** OPEN ITEMS ***
-%   (a) Overall column is NOT task-matched: MoE-Caching overall is over 7
-%       tasks, the spec rows over 5 (no mt_bench/coding). For a fair Overall,
-%       recompute MoE-Caching over the same 5 tasks (its per-subtask TPS is
-%       uniform ~7.7 so the value barely moves), or blank MoE-Caching's
-%       mt_bench/coding to match. TODO before submission.
-%   (b) Batch-1 narrative: MoE-Caching wins every column (~7.7 vs 3-4) —
-%       batch 1 is speculative decoding's worst case; the value proposition
-%       needs fig:batch_sweep (large-batch crossover). With the f15 data
-%       Ours (3.76) >= SpecMoE (3.66) on overall TPS (no reversal), and Ours
-%       also leads Table 1 acceptance (.574 vs .461).
-%   Bold intentionally omitted: literal column-best would bold MoE-Caching
-%   throughout (baseline "wins"); resolve with the narrative decision above.
-%   FINAL runs must use: full 80 q/subtask, T=5, fixed max_new_tokens,
-%   offload backend + no_overload, identical total GPU memory budget for
-%   every row. MoE-Caching's cache policy + its VRAM cap must be defined
-%   in Baselines (e.g. hottest experts up to the same budget the
-%   speculative rows spend on draft experts).
+%   B=1  : ondemand_ser_q16b1 (271783) / specmoe_t5_q16b1 (271784) /
+%          ours_t5_q16b1 (271785).
+%   B=4  : specmoe_t5_q16b4 (271787) / ours_t5_q16b4 (271788).
+%          MoE-On-Demand: 271786 stalled in math batch 3/4; its
+%          incremental CSV was then OVERWRITTEN by the (cancelled)
+%          same-dir re-run 272478, so no relay base survives — full
+%          re-run job 273061 (fresh dir ondemand_ser_q16b4_r2) will fill
+%          the whole row; the interim mt cell shows 272478's four
+%          completed mt batches. LESSON: re-runs must use fresh dirs.
+%   B=16 : specmoe_t5_q16b16 (271790) / ours_t5_q16b16 (271791).
+%          MoE-On-Demand: same relay pattern — 271789 stalled after
+%          mt/trans/summ/qa; math/rag/coding from relay job 273059
+%          (output ondemand_ser_q16b16_relay). Cells "--" until it lands.
+%   B=64 : ondemand_ser_q64b64 (265027) / specmoe_nobmm_q64b64 (264763,
+%          bmm-off) / ours_q64b64 (265026). T DECISION 2026-07-21: T=3
+%          re-runs (270253/254, *_q64b64_t3) lift absolute TPS but compress
+%          the contrast to noise; USER DECISION Table 2 stays T=5 (Table 1
+%          is T=3 — state the differing T per table in the setup text).
+%   B=128: specmoe_t5_b128 (271366) / ours_t5_b128 (271367).
+%          MoE-On-Demand merged from job 271504 (6 batches, stalled at
+%          humaneval) + humaneval-only re-run 271603 (ondemand_ser_b128_he).
+%   B=256: ondemand_ser_b256 (271505) / ours_t5_b256 (271598).
+%          SpecMoE: INFEASIBLE at B=256 — OOM x3 (271597/271778 at batch-3
+%          stacking, fixed by the cross-batch KV release; 272300 then OOM'd
+%          MID-DECODE of batch 1, cycle 160, torch 122GB on a 139GB H200).
+%          Structural, not a bug: at SpecMoE's MAT ~1.5 the dirty-hole
+%          scheme spends ~4 physical slots per committed token, so its
+%          tgt+ast KV alone outgrow VRAM during decode. Ours completes the
+%          same protocol because MAT ~3.3 halves the physical KV — report
+%          as a finding (acceptance rate bounds the feasible batch size).
+%   MoE-On-Demand = naive offloading anchor: moe_ondemand draft (no expert
+%   cache, per-step flush) + serial_dispatch (no fetch/compute overlap),
+%   non-speculative. SpecMoE = N=16 pin, early_pin=1, bmm-off. Ours =
+%   topm_count M32/K16 + hybrid alpha=0.75, cache mode + C3.
 %   Coding = HumanEval (our extension beyond Spec-Bench's six subtasks).
-%   TODO(bold): draft bolds were dropped; after final numbers land,
-%   \textbf the per-column best.
+%   Bold = per-column best WITHIN a batch-size block (only where >=2
+%   methods have the cell). "--" = run pending or failed (see above).
+%   *** OPEN ITEMS *** single runs (offload noise ~5-8%; add >=2 repeats
+%   for pp-level claims); SpecMoE cited variant is bmm-OFF; the B=64 bar
+%   figure and the fig:batch_sweep line figure below DUPLICATE numbers
+%   from this tabular — update them in the same edit.
 % ==========================================================================
 
 \begin{table*}[t]
 \centering
 \caption{End-to-end decoding throughput (tokens/sec) for
-Qwen3-30B-A3B (128E, top-8)
-across Spec-Bench subtasks and Coding (HumanEval), on the same
-CPU-offloading backend and total GPU memory budget as
-Table~\ref{tab:main_baselines}. MoE-Caching spends the budget on a
-target-side expert cache; SpecMoE and Ours spend it on draft experts
-(12.5\% of expert memory) with greedy target-exact verification
-($T{=}5$). Higher is better. Best result per column in
-\textbf{bold}.}
+Qwen3-30B-A3B (128E, top-8) across Spec-Bench subtasks and Coding
+(HumanEval), as the batch size $B$ scales from 1 to 256 with
+category-affinity batching (each batch holds $B$ same-subtask
+requests; at $B{>}80$ the subtask's questions are cycled to fill the
+batch). MoE-On-Demand is the non-speculative naive offloading anchor:
+every routed expert is fetched from host memory on demand, with no
+target-side expert cache and no fetch/compute overlap. SpecMoE and
+Ours spend the same GPU memory budget on draft experts (12.5\% of
+expert memory) with greedy target-exact verification ($T{=}5$).
+Higher is better. Best result per column within each batch-size block
+in \textbf{bold}; ``--'' marks runs still in flight.}
 \label{tab:throughput}
-\setlength{\tabcolsep}{5pt}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\small
+\begin{tabular}{r l c c c c c c c c}
+\toprule
+\textbf{B} & \textbf{Method}
+ & MT-Bench & Trans. & Summ. & QA & Math & RAG & Coding & \textbf{Overall} \\
+\midrule
+  1 & MoE-On-Demand  & \textbf{3.8040} & 3.9217 & \textbf{4.0504} & \textbf{3.8888} & \textbf{3.8504} & \textbf{4.0551} & \textbf{3.7388} & \textbf{4.0428} \\
+    & SpecMoE        & 2.4705 & 3.9149 & 3.3738 & 2.4842 & 2.5152 & 3.2855 & 2.9195 & 2.8593 \\
+    & \textbf{Ours}  & 2.3946 & \textbf{4.0376} & 3.7045 & 3.2438 & 2.8430 & 3.9710 & 2.4283 & 3.2934 \\
+\midrule
+  4 & MoE-On-Demand  & \textbf{4.8128} & 5.4423 & 5.6700 & \textbf{5.7254} & \textbf{4.8503} & 5.6582 & \textbf{4.2632} & \textbf{5.3015} \\
+    & SpecMoE        & 1.9353 & 6.9465 & 7.2600 & 2.7793 & 2.5924 & 4.6711 & 2.6791 & 3.7545 \\
+    & \textbf{Ours}  & 2.6105 & \textbf{8.0615} & \textbf{8.3971} & 2.9497 & 3.5543 & \textbf{6.6779} & 2.7339 & 4.7270 \\
+\midrule
+ 16 & MoE-On-Demand  & \textbf{6.5110} & 11.9031 & 11.0481 & 11.6067 & \textbf{7.9131} & 10.8173 & \textbf{7.0915} & 9.8138 \\
+    & SpecMoE        & 3.4874 & \textbf{23.4557} & 9.8018 & 6.2009 & 4.9345 & 8.3892 & 3.9776 & 7.2498 \\
+    & \textbf{Ours}  & 6.4815 & 21.4486 & \textbf{14.2263} & \textbf{12.2245} & 6.5009 & \textbf{15.6840} & 5.5464 & \textbf{11.2022} \\
+\midrule
+ 64 & MoE-On-Demand  & 13.7936 & 25.8010 & 25.7971 & 26.4706 & 18.3586 & 25.6408 & \textbf{16.3830} & 21.5961 \\
+    & SpecMoE        & 12.7625 & \textbf{46.9219} & 19.7317 & 18.9171 & 14.4456 & 24.4362 & 11.2569 & 19.4420 \\
+    & \textbf{Ours}  & \textbf{18.6136} & 45.4171 & \textbf{29.1642} & \textbf{30.3779} & \textbf{19.8286} & \textbf{26.5381} & 14.9422 & \textbf{25.4923} \\
+\midrule
+128 & MoE-On-Demand  & 24.7694 & 40.3761 & 39.5947 & 43.1664 & 23.1841 & 40.1706 & \textbf{33.7630} & 35.1379 \\
+    & SpecMoE        & 24.5552 & \textbf{82.3959} & 33.1452 & 43.0927 & 20.1603 & \textbf{45.9638} & 19.8143 & 34.3050 \\
+    & \textbf{Ours}  & \textbf{28.2174} & 75.0373 & \textbf{39.7965} & \textbf{52.0002} & \textbf{29.9264} & 43.4904 & 24.2083 & \textbf{39.8208} \\
+\midrule
+256 & MoE-On-Demand  & 35.5349 & 68.4324 & \textbf{59.9846} & 71.2330 & \textbf{45.0220} & \textbf{61.2792} & 31.6639 & 52.7211 \\
+    & SpecMoE        & -- & -- & -- & -- & -- & -- & -- & -- \\
+    & \textbf{Ours}  & \textbf{42.0644} & \textbf{105.7858} & 53.6834 & \textbf{89.9887} & 43.8379 & 51.2133 & \textbf{33.0071} & \textbf{55.5757} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+% ==========================================================================
+% Figure companions to Table 2: fig:throughput_bars = grouped bars of the
+% B=64 block's seven per-subtask TPS cells (Overall excluded);
+% fig:batch_sweep = Translation-vs-B grouped bars (below). The B=128 bar figure
+% was REMOVED 2026-07-22 (user instruction) in favor of the sweep.
+% DATA IS DUPLICATED from tab:throughput — do not edit the coordinates by
+% hand except in the same edit that changes the tabular.
+% Requires \usepackage{pgfplots} + \pgfplotsset{compat=1.17} in the main
+% preamble. Colors: Okabe-Ito CVD-safe triad (checked 2026-07-21).
+% ==========================================================================
+
+\definecolor{barOnDemand}{HTML}{999999}
+\definecolor{barSpecMoE}{HTML}{0072B2}
+\definecolor{barOurs}{HTML}{D55E00}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar=1pt,
+    bar width=4pt,
+    width=\columnwidth,
+    height=4.8cm,
+    ymin=0,
+    enlarge x limits=0.08,
+    enlarge y limits={upper, value=0.08},
+    ylabel={Throughput (tokens/s)},
+    symbolic x coords={MT-Bench, Trans., Summ., QA, Math, RAG, Coding},
+    xtick=data,
+    axis lines*=left,
+    axis line style={gray!60},
+    tick style={draw=none},
+    ymajorgrids,
+    major grid style={gray!25, line width=0.3pt},
+    label style={font=\footnotesize},
+    tick label style={font=\footnotesize},
+    x tick label style={font=\footnotesize, rotate=30, anchor=east},
+    legend style={draw=none, fill=none, at={(0.5,1.02)}, anchor=south,
+                  legend columns=-1, font=\footnotesize,
+                  /tikz/every even column/.append style={column sep=6pt}},
+    area legend,
+]
+\addplot[fill=barOnDemand, draw=none] coordinates {
+  (MT-Bench,13.7936) (Trans.,25.8010) (Summ.,25.7971) (QA,26.4706)
+  (Math,18.3586) (RAG,25.6408) (Coding,16.3830)};
+\addplot[fill=barSpecMoE, draw=none] coordinates {
+  (MT-Bench,12.7625) (Trans.,46.9219) (Summ.,19.7317) (QA,18.9171)
+  (Math,14.4456) (RAG,24.4362) (Coding,11.2569)};
+\addplot[fill=barOurs, draw=none] coordinates {
+  (MT-Bench,18.6136) (Trans.,45.4171) (Summ.,29.1642) (QA,30.3779)
+  (Math,19.8286) (RAG,26.5381) (Coding,14.9422)};
+\legend{MoE-On-Demand, SpecMoE, Ours}
+\end{axis}
+\end{tikzpicture}
+\caption{Per-subtask decoding throughput at batch size 64 (the $B{=}64$
+block of Table~\ref{tab:throughput}). Ours attains the highest
+throughput on five of the seven subtasks. SpecMoE leads only on
+translation, and the non-speculative MoE-On-Demand anchor keeps the
+lead on coding, the one subtask whose mean accepted length falls below
+the speculative break-even.}
+\label{fig:throughput_bars}
+\end{figure}
+
+% --------------------------------------------------------------------------
+% fig:batch_sweep — Translation TPS vs batch size, grouped bars:
+% MoE-On-Demand vs Ours. DATA = the Trans. column of tab:throughput
+% (B=1..256 blocks) — update together. Colors follow the entities as in
+% fig:throughput_bars (CVD-checked pair).
+% --------------------------------------------------------------------------
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar=2pt,
+    bar width=7pt,
+    width=\columnwidth,
+    height=5.2cm,
+    ymin=0,
+    enlarge x limits=0.12,
+    enlarge y limits={upper, value=0.08},
+    ylabel={Translation throughput (tokens/s)},
+    xlabel={Batch size $B$},
+    symbolic x coords={1,4,16,64,128,256},
+    xtick=data,
+    axis lines*=left,
+    axis line style={gray!60},
+    tick style={draw=none},
+    ymajorgrids,
+    major grid style={gray!25, line width=0.3pt},
+    label style={font=\footnotesize},
+    tick label style={font=\footnotesize},
+    legend style={draw=none, fill=none, at={(0.03,0.97)}, anchor=north west,
+                  font=\footnotesize, cells={anchor=west}},
+    area legend,
+]
+\addplot[fill=barOnDemand, draw=none] coordinates {
+  (1,3.9217) (4,5.4423) (16,11.9031) (64,25.8010)
+  (128,40.3761) (256,68.4324)};
+\addplot[fill=barOurs, draw=none] coordinates {
+  (1,4.0376) (4,8.0615) (16,21.4486) (64,45.4171)
+  (128,75.0373) (256,105.7858)};
+\legend{MoE-On-Demand, Ours}
+\end{axis}
+\end{tikzpicture}
+\caption{Translation throughput against batch size (the Trans.\ column
+of Table~\ref{tab:throughput}). Translation is the highest-acceptance
+subtask, so the speculative gain compounds with batching: Ours matches
+the naive on-demand anchor at $B{=}1$, overtakes it from $B{=}4$, and
+widens the margin up to $+86\%$ at $B{=}128$ ($+55\%$ at $B{=}256$).}
+\label{fig:batch_sweep}
+\end{figure}
+
+% --------------------------------------------------------------------------
+% fig:ragsweep — RAG @ B=16 input/output-length sweep (2026-07-25; layout
+% history: 4-panel figure* -> single-column pair -> FINAL two-column
+% figure*, one panel per column, user decision).
+% Full grid: prompt_token_cap x max_new_tokens in {32,128,512,1024}^2, one
+% pure 16-wide RAG batch per cell; per-cell TPS = that batch's
+% sum(tokens)/wall. Jobs: od=276710 / sm=276712 / ou=276713; dirs
+% output/ragsweep_{od,sm,ou}_i{in}_o{out} (48 runs — the other cells stay
+% available for reference).
+% FINAL LAYOUT (2026-07-25, user decision): 1x4 figure* row. Panels
+% left-to-right: TPS vs output at input cap 128 / 1024, then TPS vs input
+% at output 128 / 1024. output=1024 is Ours' most favourable column
+% (+40/105/102/103% over the naive anchor, 2.4-3.5x over SpecMoE);
+% output=128 shows the near-parity short-generation regime.
+% MECHANISM: Ours' acceptance RISES with output length (in=32: 0.06 -> 0.54)
+% — late tokens are self-conditioned continuation and draft-friendly — so
+% TPS climbs with output while both anchors stay flat-ish; input length
+% erodes the serial anchor (attention cost, no overlap to hide it) but
+% barely moves Ours.
+% OUTLIER kept as measured: SpecMoE i512/o1024 = 15.70 TPS (AccR 0.357 vs
+% ~0.1 neighbours; degenerate repetitive continuations on the truncated
+% context) — the bump on panel (b)'s SpecMoE line.
+% DATA DUPLICATES the output CSVs — regenerate coordinates from them.
+% NO extra pgfplots library needed (2026-07-25: groupplots version reverted
+% — it rendered blank when the preamble lacked \usepgfplotslibrary
+% {groupplots}). Equal panels now come from `scale only axis` on both axes
+% (width = the axis BOX itself, labels stick outside).
+% (re)declared so this fragment stays self-contained when split into its
+% own file (xcolor allows re-definition):
+\definecolor{barOnDemand}{HTML}{999999}
+\definecolor{barSpecMoE}{HTML}{0072B2}
+\definecolor{barOurs}{HTML}{D55E00}
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    scale only axis, width=0.205\textwidth, height=0.205\textwidth,
+    xmode=log, log basis x=2,
+    xtick={32,128,512,1024}, xticklabels={32,128,512,1024},
+    ymin=0, ymax=29,
+    axis lines*=left, axis line style={gray!60},
+    tick style={draw=none}, ymajorgrids,
+    major grid style={gray!25, line width=0.3pt},
+    tick label style={font=\scriptsize},
+    label style={font=\scriptsize},
+    title style={font=\scriptsize},
+    title={input cap $=$ 128},
+    xlabel={output tokens},
+    ylabel={RAG throughput (tokens/s)},
+    legend style={draw=none, fill=none, at={(0.03,0.97)}, anchor=north west, font=\tiny, cells={anchor=west}}
+]
+\addplot[color=barOnDemand, line width=1.2pt, mark=square*, mark size=1.6pt]
+  coordinates {(32,6.3275) (128,9.0332) (512,11.3737) (1024,13.1286)};
+\addplot[color=barSpecMoE, line width=1.2pt, mark=triangle*, mark size=2.0pt]
+  coordinates {(32,6.2523) (128,7.7961) (512,8.3301) (1024,7.6946)};
+\addplot[color=barOurs, line width=1.2pt, mark=*, mark size=1.7pt]
+  coordinates {(32,5.9508) (128,9.1824) (512,15.3936) (1024,26.8794)};
+\legend{MoE-On-Demand, SpecMoE, Ours}
+\end{axis}
+\end{tikzpicture}\hfill
+\begin{tikzpicture}
+\begin{axis}[
+    scale only axis, width=0.205\textwidth, height=0.205\textwidth,
+    xmode=log, log basis x=2,
+    xtick={32,128,512,1024}, xticklabels={32,128,512,1024},
+    ymin=0, ymax=29,
+    axis lines*=left, axis line style={gray!60},
+    tick style={draw=none}, ymajorgrids,
+    major grid style={gray!25, line width=0.3pt},
+    tick label style={font=\scriptsize},
+    label style={font=\scriptsize},
+    title style={font=\scriptsize},
+    title={input cap $=$ 1024},
+    xlabel={output tokens},
+    yticklabels=\empty
+]
+\addplot[color=barOnDemand, line width=1.2pt, mark=square*, mark size=1.6pt]
+  coordinates {(32,5.7687) (128,8.5897) (512,11.2651) (1024,10.3631)};
+\addplot[color=barSpecMoE, line width=1.2pt, mark=triangle*, mark size=2.0pt]
+  coordinates {(32,7.2006) (128,7.8476) (512,8.5129) (1024,8.4621)};
+\addplot[color=barOurs, line width=1.2pt, mark=*, mark size=1.7pt]
+  coordinates {(32,4.1976) (128,10.8784) (512,18.2578) (1024,21.0613)};
+\end{axis}
+\end{tikzpicture}\hfill
+\begin{tikzpicture}
+\begin{axis}[
+    scale only axis, width=0.205\textwidth, height=0.205\textwidth,
+    xmode=log, log basis x=2,
+    xtick={32,128,512,1024}, xticklabels={32,128,512,1024},
+    ymin=0, ymax=29,
+    axis lines*=left, axis line style={gray!60},
+    tick style={draw=none}, ymajorgrids,
+    major grid style={gray!25, line width=0.3pt},
+    tick label style={font=\scriptsize},
+    label style={font=\scriptsize},
+    title style={font=\scriptsize},
+    title={output $=$ 128},
+    xlabel={input tokens (cap)},
+    yticklabels=\empty
+]
+\addplot[color=barOnDemand, line width=1.2pt, mark=square*, mark size=1.6pt]
+  coordinates {(32,9.9053) (128,9.0332) (512,9.0719) (1024,8.5897)};
+\addplot[color=barSpecMoE, line width=1.2pt, mark=triangle*, mark size=2.0pt]
+  coordinates {(32,7.2540) (128,7.7961) (512,7.3629) (1024,7.8476)};
+\addplot[color=barOurs, line width=1.2pt, mark=*, mark size=1.7pt]
+  coordinates {(32,9.7235) (128,9.1824) (512,8.3282) (1024,10.8784)};
+\end{axis}
+\end{tikzpicture}\hfill
+\begin{tikzpicture}
+\begin{axis}[
+    scale only axis, width=0.205\textwidth, height=0.205\textwidth,
+    xmode=log, log basis x=2,
+    xtick={32,128,512,1024}, xticklabels={32,128,512,1024},
+    ymin=0, ymax=29,
+    axis lines*=left, axis line style={gray!60},
+    tick style={draw=none}, ymajorgrids,
+    major grid style={gray!25, line width=0.3pt},
+    tick label style={font=\scriptsize},
+    label style={font=\scriptsize},
+    title style={font=\scriptsize},
+    title={output $=$ 1024},
+    xlabel={input tokens (cap)},
+    yticklabels=\empty
+]
+\addplot[color=barOnDemand, line width=1.2pt, mark=square*, mark size=1.6pt]
+  coordinates {(32,14.1286) (128,13.1286) (512,12.6285) (1024,10.3631)};
+\addplot[color=barSpecMoE, line width=1.2pt, mark=triangle*, mark size=2.0pt]
+  coordinates {(32,8.3422) (128,7.6946) (512,15.7003) (1024,8.4621)};
+\addplot[color=barOurs, line width=1.2pt, mark=*, mark size=1.7pt]
+  coordinates {(32,19.8317) (128,26.8794) (512,25.5500) (1024,21.0613)};
+\end{axis}
+\end{tikzpicture}
+\caption{RAG throughput at batch size 16 across the
+input/output-length grid. \emph{Left two panels:}~throughput against
+output length with the prompt capped at 128 and 1024 tokens — Ours'
+acceptance rises as generation becomes self-conditioned, so its
+throughput climbs to ${\sim}2\times$ the naive on-demand anchor at
+1024-token outputs while both anchors stay nearly flat. \emph{Right
+two panels:}~throughput against input length at 128- and 1024-token
+outputs: with short generations speculation barely pays and the
+three systems cluster, whereas at long generations Ours leads across
+every input length ($+40\%$ to $+105\%$ over the anchor), and longer
+inputs erode the serial anchor while barely moving Ours.}
+\label{fig:ragsweep}
+\end{figure*}
+
+
+
+% ==========================================================================
+% Table 3 (ablation): isolating the MERGING step on GPT-OSS-20B.
+% Both rows use the same dynamic count-based candidate selection
+% (topm_count), the same resident draft budget (4 experts = 12.5%), the
+% same t1 protocol as Table 1; the ONLY difference is whether candidates
+% are pairwise-merged (top-8 -> 4 merged, hybrid lambda=0.75) or kept
+% verbatim (top-4 identity, M=K=4 -- merging degenerates to selection).
+%
+% Data provenance (do not edit numbers by hand):
+%   FILLED 2026-07-17 (hf backend, single runs; the gap dwarfs the <=3pp
+%   noise threshold on every cell):
+%     w/ merging  = output/t1_gptoss_ours (job 265219), config
+%       configs/t1_gptoss_ours.yaml — topm_count M8/K4 draft_top_k=4 +
+%       hybrid alpha=0.75 (hf act-sim prefill capture engaged, log-verified);
+%     w/o merging = output/t1_gptoss_m4k4 (job 265220), config
+%       configs/t1_gptoss_m4k4.yaml — topm_count M4/K4 draft_top_k=4,
+%       freq_slice singleton groups (cluster method vacuous), uniform.
+%   Protocol: T=5, qpc=15, max_new_tokens=512, humaneval on,
+%   mt_bench_pooled on -> 105 q/row. Overall = mean7 (same convention as
+%   Table 1; runner's pooled overalls: 0.0694 / 0.3355).
+%   Supporting diagnostics (smoke, qpc=1/mnt=128 — NOT protocol-comparable,
+%   cite as trend only, see gptoss_acceptance_plan.md): M8K8 identity-copy
+%   of top-8 through the same multi-expert path = 0.403 pooled (path
+%   correctness control); specmoe 0.228 / randmask 0.189 / randmerge 0.016.
+%   Mechanism (for the text): GPT-OSS expert mean outputs are highly
+%   co-directional (median pairwise cosine 0.67, NN 0.80, from B1
+%   calibration o_j) vs Qwen3's near-orthogonal 0.078 — coarse full-width
+%   experts carry a shared component plus a small discriminative residual
+%   that weight-space averaging destroys; fine-grained experts are
+%   composable fragments that tolerate merging (Table 1 Qwen3 block).
+% ==========================================================================
+
+\begin{table*}[t]
+\centering
+\caption{Ablation of the merging step on GPT-OSS-20B (32E, top-4).
+Both variants use the same dynamic count-based candidate selection and
+the same resident draft budget (4 experts, 12.5\% of expert memory),
+with greedy target-exact verification ($T{=}5$); they differ only in
+whether the top-8 candidates are pairwise merged into 4 experts or the
+top-4 candidates are kept verbatim (no merging). On this coarse-grained
+MoE, merging collapses acceptance on every subtask. Higher is better;
+best per column in \textbf{bold}.}
+\label{tab:gptoss_merge_ablation}
+\setlength{\tabcolsep}{4pt}
 \renewcommand{\arraystretch}{1.15}
 \small
 \begin{tabular}{l c c c c c c c c}
 \toprule
-\textbf{Method}
+\textbf{Draft construction}
  & MT-Bench & Trans. & Summ. & QA & Math & RAG & Coding & \textbf{Overall} \\
 \midrule
-MoE-Caching   & 7.5632 & 7.9505 & 7.9456 & 8.1731 & 7.7387 & 7.8973 & 7.5767 & 7.6991 \\
-SpecMoE       & -- & 4.3757 & 3.7514 & 3.0508 & 3.0478 & 4.0673 & -- & 3.6586 \\
-\textbf{Ours} & -- & 4.6674 & 4.0449 & 3.2935 & 3.1568 & 3.6264 & -- & 3.7578 \\
+w/ merging (top-8 $\to$ 4 merged) & 0.0648 & 0.0870 & 0.0434 & 0.0772 & 0.0837 & 0.0535 & 0.0796 & 0.0699 \\
+w/o merging (top-4 verbatim) & \textbf{0.3085} & \textbf{0.4633} & \textbf{0.2832} & \textbf{0.2881} & \textbf{0.4355} & \textbf{0.3153} & \textbf{0.3445} & \textbf{0.3483} \\
 \bottomrule
 \end{tabular}
 \end{table*}

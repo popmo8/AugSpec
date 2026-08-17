@@ -1,0 +1,20 @@
+# SPEED 機制診斷(非 Table 1 數字):num_layers=24(半深)。與 l47 一起
+# 驗證 early-exit 深度 → AccR 單調上升;若 l47 高、l24 居中,則 l6 的
+# 近零 AccR 是 shallow logit-lens 的真實失效而非 bug。qpc=1 / mnt=64。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+draft:
+  name: speed
+  args: {num_layers: 24}
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 64
+  prefill_warmup: true
+  skip_categories: [mt_bench]
+output: {label: smoke_speed_l24, dir: output/smoke_speed_l24}

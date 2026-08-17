@@ -148,11 +148,22 @@ def _category_matches(q_cat: str, subtask: str) -> bool:
     return q_cat == subtask
 
 
+# questions_per_cat == -1 (YAML "all") caps HumanEval here: Spec-Bench
+# categories run in full (80 each), but HumanEval has 164 problems — the
+# paper protocol uses 80 to match the other subtasks' size.
+_HUMANEVAL_ALL_CAP = 80
+
+
 def _sample_questions(all_q: List[Dict[str, Any]], questions_per_cat: int,
                       seed: int, skip_categories: Optional[List[str]],
                       mt_bench_pooled: bool) -> Tuple[List[Dict[str, Any]],
                                                       set]:
     """Per-category sampling (seeded shuffle, first `questions_per_cat`).
+
+    `questions_per_cat == -1` (YAML `questions_per_cat: all`) takes EVERY
+    question in each category, except humaneval which is capped at
+    `_HUMANEVAL_ALL_CAP` (80 of 164, seeded draw) to match the Spec-Bench
+    subtask size.
 
     `mt_bench_pooled` treats mt_bench's 8 sub-categories as ONE pool, so
     the whole mt_bench subtask contributes `questions_per_cat` questions
@@ -180,7 +191,11 @@ def _sample_questions(all_q: List[Dict[str, Any]], questions_per_cat: int,
     for cat in sorted(by_cat):
         pool = list(by_cat[cat])
         rng.shuffle(pool)
-        questions.extend(pool[:questions_per_cat])
+        if questions_per_cat == -1:
+            n = _HUMANEVAL_ALL_CAP if cat == "humaneval" else len(pool)
+        else:
+            n = questions_per_cat
+        questions.extend(pool[:n])
     return questions, skip
 
 
@@ -626,7 +641,8 @@ def run_specbench(
     title = f"  SpecBench [{label}]" if label else "  SpecBench"
     print(title)
     print(f"  T (fixed)     : {num_speculative}")
-    print(f"  Q/cat         : {questions_per_cat}")
+    print(f"  Q/cat         : "
+          f"{'all' if questions_per_cat == -1 else questions_per_cat}")
     n_cats = len({q["category"] for q in questions})
     print(f"  Total Q       : {len(questions)} ({n_cats} categories)")
     if output_dir is not None:
