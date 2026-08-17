@@ -1,0 +1,22 @@
+# hf-backend smoke for the md1 (DeepSeek Table-1) run - qpc=1, mnt=64.
+# Merge/Random: 64 routed experts random-partitioned into K=8 groups
+# (once per run, seed 0), uniform merge, draft routes top-6 of 8 clusters.
+model:
+  id: deepseek-ai/deepseek-moe-16b-base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: random_merge
+  args:
+    K: 8
+    draft_top_k: 6
+    seed: 0
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: md1_smoke_randmerge
+  dir: output/md1_smoke_randmerge

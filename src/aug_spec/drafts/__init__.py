@@ -12,11 +12,17 @@ from typing import Any, Dict, Type
 
 from .base import DraftStrategy, ScoreBasedAvgDraft
 from .count import CountDraft, PrunedCountDraft
+from .draft_verify import DraftVerifyDraft
+from .mc_smoe import MCSMoEDraft
 from .prefill_count import PrefillCountDraft
 from .prefill_topm_count import PrefillTopMCountDraft
 from .random_mask import RandomMaskDraft
+from .random_merge import RandomMergeDraft
 from .softmax import SoftmaxDraft
 from .specmoe import SpecMoeDraft
+from .speed import SpeedDraft
+from .static_mask import StaticMaskDraft
+from .static_merge import StaticMergeDraft
 from .topm_count import TopMCountDraft
 from .uniform import UniformDraft
 
@@ -30,16 +36,31 @@ _REGISTRY: Dict[str, Type[DraftStrategy]] = {
     "prefill_topm_count": PrefillTopMCountDraft,
     "softmax": SoftmaxDraft,
     "random_mask": RandomMaskDraft,
+    "random_merge": RandomMergeDraft,
     "specmoe": SpecMoeDraft,
+    "speed": SpeedDraft,
+    "draft_verify": DraftVerifyDraft,
+    "static_mask": StaticMaskDraft,
+    "static_merge": StaticMergeDraft,
+    "mc_smoe": MCSMoEDraft,
 }
+
+
+def get_draft_class(name: str) -> Type[DraftStrategy]:
+    """Look up a draft class by registered name *without* instantiating it.
+
+    Lets the CLI read class-level facts (holds_merged_residency /
+    needs_count_top_k / needs_num_experts) before the draft args (and the
+    model needed to fill them) are resolved."""
+    if name not in _REGISTRY:
+        known = ", ".join(sorted(_REGISTRY))
+        raise KeyError(f"unknown draft {name!r}; known: {known}")
+    return _REGISTRY[name]
 
 
 def get_draft(name: str, **kwargs: Any) -> DraftStrategy:
     """Instantiate a draft strategy by registered name with **kwargs."""
-    if name not in _REGISTRY:
-        known = ", ".join(sorted(_REGISTRY))
-        raise KeyError(f"unknown draft {name!r}; known: {known}")
-    return _REGISTRY[name](**kwargs)
+    return get_draft_class(name)(**kwargs)
 
 
 __all__ = [
@@ -47,12 +68,19 @@ __all__ = [
     "ScoreBasedAvgDraft",
     "UniformDraft",
     "CountDraft",
+    "DraftVerifyDraft",
     "PrunedCountDraft",
     "TopMCountDraft",
     "PrefillCountDraft",
     "PrefillTopMCountDraft",
     "SoftmaxDraft",
+    "MCSMoEDraft",
     "RandomMaskDraft",
+    "RandomMergeDraft",
     "SpecMoeDraft",
+    "SpeedDraft",
+    "StaticMaskDraft",
+    "StaticMergeDraft",
     "get_draft",
+    "get_draft_class",
 ]

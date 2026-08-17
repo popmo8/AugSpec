@@ -1,0 +1,15 @@
+# Same-engine comparison — SpecMoE (pinned kept-N) @ b=0.2, qpc=5, mnt=512.
+# Draft dispatches the kept-N real experts through the archer MoEMLP::forward
+# kernel. Pair of cmp_eng_topm (merged draft, same kernel via dispatch_merged).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+draft:
+  name: specmoe
+  args: {N: 16, route_top_k: 8, pin: true}
+run: {T: 5, questions_per_cat: 5, max_new_tokens: 512}
+output: {label: cmp_eng_specmoe, dir: output/cmp_eng_specmoe}

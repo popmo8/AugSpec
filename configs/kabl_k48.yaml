@@ -1,0 +1,39 @@
+# K sweep ablation (2026-07-25): K=48, M=2K=96, T=10;
+# vram_budget_ratio=1.0（用戶指示 2026-07-25：全預算消除 fetch 壓力，只看 AccR/M 飽和統計）。
+# 其餘 = t1_qwen3_ours (qpc=15, mnt=512, B=1)。topm_stats.json 記錄 M 飽和/丟棄。
+# NB kabl_k16 與 mabl_m32 是相同設定(交叉驗證/噪音參考)。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 1.0
+    merge_offload: true
+    merge_during_verify: true
+    merge_overlap: true
+draft:
+  name: topm_count
+  args:
+    M: 96
+    K: 48
+    draft_top_k: 8
+    record_history: false
+cluster:
+  name: hybrid
+  alpha: 0.75
+  metric: l2
+  norm: rank
+  cooccur_norm: raw
+  cooccur_scope: decode
+  within_weight: uniform
+run:
+  T: 10
+  questions_per_cat: 15
+  max_new_tokens: 512
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: kabl_k48
+  dir: output/kabl_k48

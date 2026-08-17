@@ -1,0 +1,32 @@
+# Table 1 — Qwen3 Ours row (topm/hybrid alpha=0.75, cache mode + C3 pipeline;
+# model/draft/cluster 沿用 f15_hybrid_a75_r1). Benchmark 協議 = t1 系列:
+# T=5, qpc=15, mnt=512, humaneval on, mt_bench_pooled on(mt_bench 共 15 題).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+    merge_overlap: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+cluster:
+  name: hybrid
+  alpha: 0.75
+  metric: l2
+  norm: rank
+  cooccur_norm: raw
+  cooccur_scope: decode
+  within_weight: uniform
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 128
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output: {label: prof_ours_b1, dir: output/prof_ours_b1}

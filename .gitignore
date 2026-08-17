@@ -11,7 +11,9 @@ dist/
 # experiment artefacts
 output/
 cache/
-data/spec_bench/
+# all downloaded benchmark/calibration data (spec_bench, c4, humaneval)
+# NB .gitignore has no trailing comments; the comment must be on its own line
+data/c4/
 moe_infinity/offload_output/
 moe_infinity/coverage-out/
 job_log/

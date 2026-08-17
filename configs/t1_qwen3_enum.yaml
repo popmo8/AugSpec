@@ -1,0 +1,7 @@
+# Table 1 — Qwen3 Enumerate (NAEE, sampled 1e5) row. Settings = existing.
+model: {id: Qwen/Qwen3-30B-A3B-Base, dtype: bfloat16, device_map: auto}
+draft:
+  name: static_mask
+  args: {spec_path: output/naee/Qwen3-30B-A3B-Base_r16.json}
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, humaneval: true, mt_bench_pooled: true}
+output: {label: t1_qwen3_enum, dir: output/t1_qwen3_enum}

@@ -1,0 +1,21 @@
+# Table 2 — MoE-Caching row, r1 (baseline_tables_plan.md WS-E / A3).
+# Non-speculative offload baseline: full 0.2x budget goes to the archer LFU
+# expert cache, no draft. Settings match the existing Table-2 placeholders
+# (q5_512: qpc=5, mnt=512); humaneval on for the Coding column.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+
+draft:
+  name: moe_caching
+
+run:
+  questions_per_cat: 5
+  max_new_tokens: 512
+  humaneval: true
+
+output: {label: t2_qwen3_moecaching_r1, dir: output/t2_qwen3_moecaching_r1}

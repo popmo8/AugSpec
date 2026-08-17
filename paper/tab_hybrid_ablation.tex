@@ -1,0 +1,46 @@
+% ==========================================================================
+% Ablation table: relation-map blend lambda (raw co-occurrence counts).
+%
+% Data provenance (do not edit numbers by hand):
+%   runs   : output/q15_hybrid_{a00,a25,a50,a75,a100}_r{1,2,3}
+%   jobs   : 252905-252909 (2026-07-04)
+%   config : Qwen3-30B-A3B-Base, offload backend, vram_budget_ratio 0.2,
+%            merge_during_verify, no_overload, topm_count M=32 K=16
+%            draft_top_k=8, cluster=hybrid (metric=l2, norm=rank,
+%            cooccur_norm=raw, cooccur_scope=decode), within_weight=uniform,
+%            T=5, max_new_tokens=512, 15 q/cat, Spec-Bench minus MT-Bench.
+%   values : mean +/- population std over the 3 repeats of
+%            overall_summary.csv :: overall
+%            acceptance_rate / mean_accept_tokens / tokens_per_second
+%            (aggregation: scripts/analyze_q15.py conventions).
+%
+% Requires \usepackage{booktabs}. If unavailable, replace the \*rule
+% commands with \hline. Caption references eq:blend from
+% paper/method_relation_merge.tex (compile together).
+% ==========================================================================
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\caption{Ablation of the relation-map blend $\lambda$
+(Eq.~\eqref{eq:blend}) on Qwen3-30B-A3B ($128 \rightarrow 16$,
+$K{=}16$ cluster-merge, uniform within-group coefficients),
+single-request serving on the CPU-offloading backend. Spec-Bench
+without MT-Bench, 15 questions per category, $T{=}5$. $\lambda{=}0$ uses
+the co-occurrence map only, $\lambda{=}1$ the activation-similarity map
+only. Each row is mean${}\pm{}$std over three runs. Best per column in
+\textbf{bold}.}
+\label{tab:hybrid-ablation}
+\begin{tabular}{lccc}
+\toprule
+Blend $\lambda$ & Accept. Rate & Accept. Len. & Tokens/sec \\
+\midrule
+$0.00$ (co-occur only)  & $0.644_{\pm.056}$ & $4.196_{\pm.28}$ & $3.691_{\pm.27}$ \\
+$0.25$                  & $0.656_{\pm.024}$ & $4.258_{\pm.12}$ & $3.845_{\pm.11}$ \\
+$0.50$                  & $0.636_{\pm.019}$ & $4.157_{\pm.09}$ & $3.668_{\pm.08}$ \\
+$0.75$                  & $0.661_{\pm.029}$ & $4.282_{\pm.15}$ & $3.910_{\pm.13}$ \\
+$1.00$ (act-sim only)   & $\mathbf{0.664}_{\pm.035}$ & $\mathbf{4.294}_{\pm.17}$ & $\mathbf{3.935}_{\pm.22}$ \\
+\bottomrule
+\end{tabular}
+\end{table}

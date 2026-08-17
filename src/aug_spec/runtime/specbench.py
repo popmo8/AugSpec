@@ -20,13 +20,17 @@
 
 from __future__ import annotations
 
+import copy
 import csv
+import functools
+import gzip
 import json
+import os
 import random
 import time
 import urllib.request
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -48,10 +52,19 @@ SPEC_BENCH_MT_BENCH_CATS = frozenset({
     "coding", "extraction", "stem", "humanities",
 })
 
-# Subtask order from Spec-Bench's evaluation/speed.py::get_single_speedup.
+# HumanEval (the paper tables' Coding column). Category name is
+# "humaneval", NOT "coding" — "coding" is an mt_bench sub-category and
+# reusing it would cross-contaminate both aggregations.
+HUMANEVAL_URL = (
+    "https://raw.githubusercontent.com/openai/human-eval/master/"
+    "data/HumanEval.jsonl.gz"
+)
+
+# Subtask order from Spec-Bench's evaluation/speed.py::get_single_speedup,
+# plus our humaneval extension (run.humaneval).
 SPEC_BENCH_SUBTASKS: Tuple[str, ...] = (
     "mt_bench", "translation", "summarization",
-    "qa", "math_reasoning", "rag", "overall",
+    "qa", "math_reasoning", "rag", "humaneval", "overall",
 )
 
 
@@ -72,6 +85,29 @@ def _load_spec_bench_questions(cache_dir: Path) -> List[Dict[str, Any]]:
             line = line.strip()
             if line:
                 questions.append(json.loads(line))
+    return questions
+
+
+def _load_humaneval_questions(cache_dir: Path) -> List[Dict[str, Any]]:
+    """Download (once) HumanEval and adapt it to the question schema
+    (`question_id` / `category` / `turns`). 164 problems; the shared
+    per-category sampler then draws `questions_per_cat` of them."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / "HumanEval.jsonl.gz"
+    if not cache_file.exists():
+        print(f"  Downloading HumanEval → {cache_file}")
+        urllib.request.urlretrieve(HUMANEVAL_URL, cache_file)
+    questions: List[Dict[str, Any]] = []
+    with gzip.open(cache_file, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rec = json.loads(line)
+                questions.append({
+                    "question_id": rec["task_id"],
+                    "category": "humaneval",
+                    "turns": [rec["prompt"]],
+                })
     return questions
 
 
@@ -110,6 +146,57 @@ def _category_matches(q_cat: str, subtask: str) -> bool:
     if subtask == "mt_bench":
         return q_cat in SPEC_BENCH_MT_BENCH_CATS
     return q_cat == subtask
+
+
+# questions_per_cat == -1 (YAML "all") caps HumanEval here: Spec-Bench
+# categories run in full (80 each), but HumanEval has 164 problems — the
+# paper protocol uses 80 to match the other subtasks' size.
+_HUMANEVAL_ALL_CAP = 80
+
+
+def _sample_questions(all_q: List[Dict[str, Any]], questions_per_cat: int,
+                      seed: int, skip_categories: Optional[List[str]],
+                      mt_bench_pooled: bool) -> Tuple[List[Dict[str, Any]],
+                                                      set]:
+    """Per-category sampling (seeded shuffle, first `questions_per_cat`).
+
+    `questions_per_cat == -1` (YAML `questions_per_cat: all`) takes EVERY
+    question in each category, except humaneval which is capped at
+    `_HUMANEVAL_ALL_CAP` (80 of 164, seeded draw) to match the Spec-Bench
+    subtask size.
+
+    `mt_bench_pooled` treats mt_bench's 8 sub-categories as ONE pool, so
+    the whole mt_bench subtask contributes `questions_per_cat` questions
+    (default False = legacy: qpc PER sub-category, i.e. up to 8×qpc).
+    Question dicts keep their original sub-category, so aggregation is
+    unchanged either way."""
+    skip: set = set()
+    for c in (skip_categories or []):
+        if c == "mt_bench":
+            skip |= set(SPEC_BENCH_MT_BENCH_CATS)
+        else:
+            skip.add(c)
+    by_cat: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for q in all_q:
+        if q["category"] in skip:
+            continue
+        by_cat[q["category"]].append(q)
+    if mt_bench_pooled:
+        pool = [q for c in sorted(SPEC_BENCH_MT_BENCH_CATS)
+                for q in by_cat.pop(c, [])]
+        if pool:
+            by_cat["mt_bench"] = pool
+    rng = random.Random(seed)
+    questions: List[Dict[str, Any]] = []
+    for cat in sorted(by_cat):
+        pool = list(by_cat[cat])
+        rng.shuffle(pool)
+        if questions_per_cat == -1:
+            n = _HUMANEVAL_ALL_CAP if cat == "humaneval" else len(pool)
+        else:
+            n = questions_per_cat
+        questions.extend(pool[:n])
+    return questions, skip
 
 
 # =============================================================================
@@ -164,15 +251,40 @@ class SpecBenchResult:
 @contextmanager
 def _locked_assist_patch(T: int,
                          lm_topk: int,
-                         on_verify: Callable[[CycleStats], None]):
+                         on_verify: Callable[[CycleStats], None],
+                         prefill_warmup: bool = False,
+                         on_prefill_warmup: Optional[Callable[[], None]] = None,
+                         target_model=None):
     """Monkey-patch AssistedCandidateGenerator to:
       - lock `num_assistant_tokens = T` (defeat HF's heuristic ±),
       - clip if HF ever returns more than T candidates,
       - capture per-cycle CycleStats and call `on_verify` after each
-        `update_candidate_strategy`.
+        `update_candidate_strategy`,
+      - `prefill_warmup` (C-BOOT, merged_cache_plan.md §2.4): make the FIRST
+        candidate round of each question return zero candidates, so the target
+        does a pure prefill (capturing routing stats + building the draft
+        state) before the first real draft. The early return happens BEFORE
+        the phase patch (`shared_model_phase_patch` wraps `orig_get`), so
+        `in_draft_phase` never flips and `on_draft_start`/`on_draft_end` do
+        not fire for the warmup round — the hybrid act-sim capture stays
+        armed through the prefill. `on_prefill_warmup` fires once after the
+        warmup round's target forward (from `update_candidate_strategy`), so
+        backends without the offload-merge engine (hf) can build the draft
+        cache there.
+      - KV copy (needs `target_model`): the first REAL candidate round seeds
+        the assistant's cache with a COPY of the target's warmup-prefill KV.
+        Target and draft share weights, so the target's prompt KV is the best
+        possible draft context (real-routing hidden states); without it the
+        assistant would re-encode the whole prompt through the merged/
+        substitute draft routing, and the degraded context collapses
+        acceptance (0.5 → 0.01 observed, jobs 258368/258378). The target's
+        cache is stashed by a transparent `target_model.forward` wrapper
+        (assistant calls are excluded via an in-draft flag).
     """
     from transformers.generation.candidate_generator import (
         AssistedCandidateGenerator,
+        _prepare_attention_mask,
+        _prepare_token_type_ids,
     )
 
     state: Dict[str, Any] = {
@@ -180,6 +292,8 @@ def _locked_assist_patch(T: int,
         "draft_tokens": None,        # List[int]
         "draft_top_vals": None,      # [T, K] fp16 cpu
         "draft_top_ids": None,       # [T, K] int64 cpu
+        "target_past": None,         # target's live KV cache (KV-copy source)
+        "in_draft_call": False,      # True inside orig_get (assistant forwards)
     }
 
     orig_get = AssistedCandidateGenerator.get_candidates
@@ -187,7 +301,46 @@ def _locked_assist_patch(T: int,
 
     def patched_get(self, input_ids):
         self.num_assistant_tokens = T
-        cand, lg = orig_get(self, input_ids)
+        # C-BOOT empty first round: a fresh AssistedCandidateGenerator is
+        # built per generate() call, so instance attrs track per-question
+        # state. Returning (input_ids, None) = zero candidates → HF runs the
+        # target on input_ids alone (pure prefill) and greedily emits one
+        # exact token (the TTFT token). No draft forward runs this round.
+        if prefill_warmup and not getattr(self, "_aug_warmed", False):
+            self._aug_warmed = True
+            state["draft_tokens"] = []
+            state["draft_top_vals"] = None
+            state["draft_top_ids"] = None
+            return input_ids, None
+        if prefill_warmup and not getattr(self, "_aug_kv_injected", False):
+            # KV copy (merged_cache_plan.md §2.4): seed the assistant with a
+            # COPY of the target's warmup-prefill KV — the draft then starts
+            # speculating directly instead of re-encoding the whole prompt
+            # through the merged/substitute routing (degraded context ⇒
+            # acceptance collapse, 0.5 → 0.01). deepcopy keeps the two caches
+            # independent (both sides crop/append their own).
+            self._aug_kv_injected = True
+            tgt = state.get("target_past")
+            if tgt is not None:
+                self.assistant_kwargs["past_key_values"] = copy.deepcopy(tgt)
+        if prefill_warmup and not getattr(self, "_aug_mask_synced", False):
+            # Belt-and-braces (also the fallback when target_past was never
+            # stashed): the skipped warmup round let the target grow input_ids
+            # past the assistant_kwargs snapshot taken at generator init. With
+            # a past injected above, orig_get's _update_past_and_masks does
+            # this itself; without one, HF's no-past first call would see a
+            # stale, one-short attention mask (rotary length mismatch).
+            self._aug_mask_synced = True
+            self.assistant_kwargs = _prepare_attention_mask(
+                self.assistant_kwargs, input_ids.shape[-1],
+                self.assistant_model.config.is_encoder_decoder)
+            self.assistant_kwargs = _prepare_token_type_ids(
+                self.assistant_kwargs, input_ids.shape[-1])
+        state["in_draft_call"] = True
+        try:
+            cand, lg = orig_get(self, input_ids)
+        finally:
+            state["in_draft_call"] = False
         target_len = input_ids.shape[1] + T
         if cand.shape[1] > target_len:
             cand = cand[:, :target_len]
@@ -257,10 +410,38 @@ def _locked_assist_patch(T: int,
             )
             on_verify(cs)
             state["cycle_idx"] += 1
+        elif (prefill_warmup and getattr(self, "_aug_warmed", False)
+                and not getattr(self, "_aug_warmup_done", False)):
+            # The warmup round's target forward just finished (routing stats
+            # captured for every layer) — build the draft state now so the
+            # first real draft never falls back. On the offload-merge engine
+            # this is a no-op rebuild-skip (merged already built per layer in
+            # on_verify_layer); on hf it does the actual merge.
+            self._aug_warmup_done = True
+            if on_prefill_warmup is not None:
+                on_prefill_warmup()
 
         result = orig_upd(self, input_ids, scores, num_matches)
         self.num_assistant_tokens = T
         return result
+
+    # KV-copy source: transparently stash the TARGET's live cache from its
+    # forward kwargs. Target and assistant are the SAME module here, so
+    # assistant forwards (inside orig_get) are excluded via `in_draft_call`.
+    wrapped_forward = False
+    if prefill_warmup and target_model is not None:
+        orig_forward = target_model.forward
+
+        @functools.wraps(orig_forward)
+        def stash_forward(*fargs, **fkwargs):
+            if not state["in_draft_call"]:
+                pkv = fkwargs.get("past_key_values")
+                if pkv is not None:
+                    state["target_past"] = pkv
+            return orig_forward(*fargs, **fkwargs)
+
+        target_model.forward = stash_forward
+        wrapped_forward = True
 
     AssistedCandidateGenerator.get_candidates = patched_get
     AssistedCandidateGenerator.update_candidate_strategy = patched_upd
@@ -269,6 +450,8 @@ def _locked_assist_patch(T: int,
     finally:
         AssistedCandidateGenerator.get_candidates = orig_get
         AssistedCandidateGenerator.update_candidate_strategy = orig_upd
+        if wrapped_forward:
+            target_model.forward = orig_forward
 
 
 # =============================================================================
@@ -378,38 +561,90 @@ def run_specbench(
     emit_tokens_csv: bool = True,
     progress_every: int = 5,
     warmup: bool = True,
+    prefill_warmup: bool = True,
+    on_prefill_warmup: Optional[Callable[[], None]] = None,
     lm_topk: int = LM_TOPK_DEFAULT,
     on_cycle: Optional[Callable[[QuestionResult, CycleStats], None]] = None,
     on_question_start: Optional[Callable[[Dict[str, Any]], None]] = None,
+    before_generate: Optional[Callable[[Any], None]] = None,
+    vram_limit_bytes: Optional[int] = None,
+    vram_guard: bool = False,
+    skip_categories: Optional[List[str]] = None,
+    include_humaneval: bool = False,
+    mt_bench_pooled: bool = False,
 ) -> SpecBenchResult:
     """Run SpecBench eval with a fixed-T speculative schedule.
 
     See module docstring for the full pipeline. Returns a `SpecBenchResult`
     with `per_question`, `per_subtask`, and `overall` aggregates.
+
+    `draft_model=None` runs the non-speculative baseline (e.g. MoE-Caching):
+    plain target-only `generate`, no assist patch; MAT/AccR come out zero
+    and TPS is the meaningful output.
+
+    `include_humaneval` (run.humaneval) appends HumanEval as its own
+    "humaneval" category (the tables' Coding column), sampled with the same
+    `questions_per_cat` and prompted as raw completion (no chat template).
+
+    `before_generate(input_ids)` (optional) runs immediately before every
+    `target_model.generate(...)` call (warmup + each question). The offload
+    backend wires `moe._configure_hook` here — moe_infinity needs fresh
+    expert-tracer sequence entries per generation. No-op (None) on hf.
     """
-    target_model.generation_config.num_assistant_tokens = num_speculative
-    target_model.generation_config.num_assistant_tokens_schedule = "constant"
-    draft_model.generation_config.assistant_confidence_threshold = 0
+    spec = draft_model is not None
+    if spec:
+        target_model.generation_config.num_assistant_tokens = num_speculative
+        target_model.generation_config.num_assistant_tokens_schedule = "constant"
+        draft_model.generation_config.assistant_confidence_threshold = 0
+
+    # VRAM budget audit + guard (verify_merge_plan.md §0.1). Driver-level total
+    # GPU memory (includes archer's cudaMalloc pool, which torch peak misses) is
+    # sampled per verify cycle: track the run peak, and warn once if it crosses
+    # the budget (×1.05 slack). This only DETECTS a breach — it never enforces;
+    # the budget is held structurally (archer cache cap + flush). No-op when
+    # vram_limit_bytes is None (hf backend / no budget set).
+    from aug_spec.runtime.loader import get_gpu_used_bytes
+    _vram_peak = [0]
+    _vram_warned = [False]
+
+    def _vram_sample(phase: str = "") -> None:
+        if vram_limit_bytes is None:
+            return
+        used = get_gpu_used_bytes(0)
+        if used < 0:
+            return
+        if used > _vram_peak[0]:
+            _vram_peak[0] = used
+        if (vram_guard and not _vram_warned[0]
+                and used > vram_limit_bytes * 1.05):
+            _vram_warned[0] = True
+            print(f"  [vram_guard] WARNING used={used / 1e9:.2f}GB > "
+                  f"limit={vram_limit_bytes / 1e9:.2f}GB ×1.05 (phase={phase}) — "
+                  f"total VRAM over budget (e.g. merged not flushed / leak). "
+                  f"Audit only; not enforced.", flush=True)
 
     cache_dir = (spec_bench_cache if spec_bench_cache is not None
                  else Path.cwd() / "data" / "spec_bench")
     all_q = _load_spec_bench_questions(cache_dir)
-    by_cat: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for q in all_q:
-        by_cat[q["category"]].append(q)
-    rng = random.Random(seed)
-    questions: List[Dict[str, Any]] = []
-    for cat in sorted(by_cat):
-        pool = list(by_cat[cat])
-        rng.shuffle(pool)
-        questions.extend(pool[:questions_per_cat])
+    if include_humaneval:
+        all_q = all_q + _load_humaneval_questions(cache_dir.parent / "humaneval")
+    questions, skip = _sample_questions(
+        all_q, questions_per_cat, seed, skip_categories, mt_bench_pooled)
+    if skip:
+        print(f"  Skipped cats  : {sorted(skip)}")
+    if mt_bench_pooled:
+        n_mt = sum(1 for q in questions
+                   if q["category"] in SPEC_BENCH_MT_BENCH_CATS)
+        print(f"  mt_bench      : pooled sampling — {n_mt} questions total")
 
     print("=" * 70)
     title = f"  SpecBench [{label}]" if label else "  SpecBench"
     print(title)
     print(f"  T (fixed)     : {num_speculative}")
-    print(f"  Q/cat         : {questions_per_cat}")
-    print(f"  Total Q       : {len(questions)} ({len(by_cat)} categories)")
+    print(f"  Q/cat         : "
+          f"{'all' if questions_per_cat == -1 else questions_per_cat}")
+    n_cats = len({q["category"] for q in questions})
+    print(f"  Total Q       : {len(questions)} ({n_cats} categories)")
     if output_dir is not None:
         print(f"  Output        : {output_dir}")
     print("=" * 70)
@@ -438,11 +673,29 @@ def run_specbench(
             tokenizer, [], "Briefly introduce yourself.")
         warm_in = tokenizer(warm_prompt, return_tensors="pt").to(
             get_model_device(target_model))
-        with torch.inference_mode():
-            target_model.generate(
-                **warm_in, max_new_tokens=8, do_sample=False,
-                assistant_model=draft_model,
-            )
+        # no_grad (not inference_mode): the offload backend's dispatcher does an
+        # in-place index_add_ on hidden_states inside its C++ thread; under
+        # inference_mode those are "inference tensors" and the in-place update
+        # aborts. The main loop already runs generate under plain no_grad, so
+        # warmup must match. (hf is unaffected either way.)
+        with torch.no_grad():
+            if before_generate is not None:
+                before_generate(warm_in["input_ids"])
+            # C-BOOT: the compile-warmup generate must run under the same
+            # assist patch as the questions — with prefill_warmup the draft
+            # would otherwise run first with an empty draft cache and trip the
+            # adapters' fail-fast assert. Non-speculative runs skip the patch.
+            warm_patch = (_locked_assist_patch(
+                num_speculative, lm_topk, lambda cs: None,
+                prefill_warmup=prefill_warmup,
+                on_prefill_warmup=on_prefill_warmup,
+                target_model=target_model,
+            ) if spec else nullcontext())
+            with warm_patch:
+                target_model.generate(
+                    **warm_in, max_new_tokens=8, do_sample=False,
+                    **({"assistant_model": draft_model} if spec else {}),
+                )
         print("    warmup done")
 
     per_question: List[QuestionResult] = []
@@ -457,7 +710,12 @@ def run_specbench(
                 on_question_start(q)
 
             user_msg = q["turns"][0]
-            prompt = _format_chat_prompt(tokenizer, [], user_msg)
+            if category == "humaneval":
+                # Raw completion — HumanEval prompts are code prefixes; a
+                # chat template would break the continuation task.
+                prompt = user_msg
+            else:
+                prompt = _format_chat_prompt(tokenizer, [], user_msg)
             inputs = tokenizer(prompt, return_tensors="pt").to(
                 get_model_device(target_model))
             input_len = int(inputs["input_ids"].shape[1])
@@ -478,25 +736,44 @@ def run_specbench(
                     _write_tokens_row(tokens_writer, _qid, _cat, cs)
                 if on_cycle is not None:
                     on_cycle(_qres, cs)
+                _vram_sample("verify_cycle")
 
             t0 = time.perf_counter()
             try:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                with _locked_assist_patch(
+                if before_generate is not None:
+                    before_generate(inputs["input_ids"])
+                gen_patch = (_locked_assist_patch(
                     num_speculative, lm_topk, _on_verify,
-                ):
+                    prefill_warmup=prefill_warmup,
+                    on_prefill_warmup=on_prefill_warmup,
+                    target_model=target_model,
+                ) if spec else nullcontext())
+                with gen_patch:
                     out = target_model.generate(
                         **inputs,
                         max_new_tokens=max_new_tokens,
                         do_sample=False,
-                        assistant_model=draft_model,
+                        **({"assistant_model": draft_model} if spec else {}),
                     )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 wall = time.perf_counter() - t0
+                # Per-question sample so the peak audit also covers
+                # non-speculative runs (draft:none has no verify cycles —
+                # the per-cycle sample above never fires there).
+                _vram_sample("question_end")
 
                 new_tokens = int(out.shape[1] - input_len)
+                # AUG_DUMP_COMMITTED=1: diagnostic — the exact generated token
+                # stream per question → <output_dir>/committed.jsonl, for the
+                # V1 batch-loop equivalence check. No-op when unset.
+                if os.environ.get("AUG_DUMP_COMMITTED") and output_dir:
+                    with open(output_dir / "committed.jsonl", "a") as _f:
+                        _f.write(json.dumps(
+                            {"qid": qid,
+                             "committed": out[0, input_len:].tolist()}) + "\n")
                 accept_lens = [1 + nm for _, nm in cycle_stats]
                 n_prop = sum(n for n, _ in cycle_stats)
                 n_acc = sum(nm for _, nm in cycle_stats)
@@ -575,6 +852,11 @@ def run_specbench(
                 })
 
     _print_final_table(label, per_subtask)
+    if vram_limit_bytes is not None and _vram_peak[0] > 0:
+        over = _vram_peak[0] > vram_limit_bytes
+        print(f"\n  [vram] peak={_vram_peak[0] / 1e9:.2f}GB  "
+              f"limit={vram_limit_bytes / 1e9:.2f}GB  "
+              f"{'OVER BUDGET ⚠' if over else 'within budget ✓'}")
     if output_dir is not None:
         print(f"\n  → CSVs saved to {output_dir}")
 

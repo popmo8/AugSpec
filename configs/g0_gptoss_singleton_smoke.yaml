@@ -1,0 +1,18 @@
+# 診斷 smoke — merge-path 二分(gptoss_acceptance_plan.md):K=M=8 singleton 群,
+# merged expert = 原 expert 恆等拷貝 → 走 multi 路徑但零合併損失。
+# AccR ~0.2+(≈specmoe/randmask)= 路徑正確、合併本身傷;~0.05 = multi 路徑 bug。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: topm_count
+  args: {M: 8, K: 8, draft_top_k: 4, record_history: false}
+cluster:
+  name: freq_slice
+  within_weight: uniform
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 128
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output: {label: g0_gptoss_singleton_smoke, dir: output/g0_gptoss_singleton_smoke}

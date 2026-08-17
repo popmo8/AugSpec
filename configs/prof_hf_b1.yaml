@@ -1,0 +1,14 @@
+# E2 (bottleneck report): all-resident GPU ceiling — same model, hf backend,
+# non-speculative plain generate. No offload engine at all. Qwen3-30B bf16
+# (61GB) fits on one H200. TPS here = the no-offload upper bound; the gap to
+# moe_caching/ondemand (~6-8 tok/s) is the offload machinery's total cost.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: hf
+  dtype: bfloat16
+draft:
+  name: moe_caching
+run:
+  questions_per_cat: 1
+  max_new_tokens: 128
+output: {label: prof_hf_b1, dir: output/prof_hf_b1}

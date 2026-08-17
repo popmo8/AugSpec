@@ -1,0 +1,15 @@
+# SpecMoE pinned kept-N via the engine's batched bmm (AUG_MERGED_BACKEND=
+# engine_bmm). 4th quadrant: vs cmp_eng_specmoe (dispatch) shows specmoe's bmm
+# speedup Δ; vs cmp_engbmm_topm shows the fair bmm-vs-bmm algorithm gap.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+draft:
+  name: specmoe
+  args: {N: 16, route_top_k: 8, pin: true}
+run: {T: 5, questions_per_cat: 5, max_new_tokens: 512}
+output: {label: cmp_engbmm_specmoe, dir: output/cmp_engbmm_specmoe}

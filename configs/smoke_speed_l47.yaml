@@ -1,0 +1,20 @@
+# SPEED 機制診斷(非 Table 1 數字):num_layers=47(只跳最後 1 層)。
+# draft ≈ target,AccR 必須很高——這是 skip 機制正確性的決定性檢查。
+# qpc=1 / mnt=64。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+draft:
+  name: speed
+  args: {num_layers: 47}
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 64
+  prefill_warmup: true
+  skip_categories: [mt_bench]
+output: {label: smoke_speed_l47, dir: output/smoke_speed_l47}

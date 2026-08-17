@@ -1,0 +1,31 @@
+# ondemand_ser B=128 humaneval-only 補跑 (2026-07-22): 271504 在第7個batch
+# (humaneval) wedge,前6個 subtask 已由增量 CSV 取得;本 config 只補 humaneval。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    serial_dispatch: true
+draft:
+  name: moe_ondemand
+run:
+  questions_per_cat: all
+  max_new_tokens: 512
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 128
+  batch_by_category: true
+  batch_fill_repeat: true
+  skip_categories:
+  - mt_bench
+  - translation
+  - summarization
+  - qa
+  - math_reasoning
+  - rag
+output:
+  label: ondemand_ser_b128_he
+  dir: output/ondemand_ser_b128_he

@@ -1,0 +1,20 @@
+# hf-backend smoke for the mx1 (Mixtral Table-1) run — qpc=1, mnt=64.
+# Prune/Enumerate: NAEE kept-set, EXACT enumeration (C(8,1)=8 subsets/layer);
+# spec from scripts/run_mx1_artifacts.sh (needs B1 calibration first).
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: static_mask
+  args:
+    spec_path: output/naee/Mixtral-8x7B-v0.1_r1.json
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: mx1_smoke_enum
+  dir: output/mx1_smoke_enum

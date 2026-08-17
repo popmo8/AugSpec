@@ -1,0 +1,15 @@
+# batch_fill_repeat smoke (batch_scale_plan S2): qpc=4 < B=8 → 每 subtask 一個
+# 8-wide batch(每題出現 2 次)。hf backend, moe_caching(非投機、最快)。
+model: {id: Qwen/Qwen3-30B-A3B-Base, dtype: bfloat16, device_map: auto}
+draft:
+  name: moe_caching
+run:
+  questions_per_cat: 4
+  max_new_tokens: 16
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 8
+  batch_by_category: true
+  batch_fill_repeat: true
+output: {label: smoke_fillrepeat, dir: output/smoke_fillrepeat}

@@ -1,0 +1,24 @@
+# m1 series (2026-07-17): T=3, qpc=all(560q), mnt=512, B=1.
+# BACKEND=hf (acceptance-only; TPS measured separately).
+# offload-only draft knobs (pin/early_pin) are inert on hf.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: specmoe
+  args:
+    N: 16
+    route_top_k: 8
+    pin: true
+  early_pin: 1
+run:
+  T: 3
+  questions_per_cat: all
+  max_new_tokens: 512
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: m1_specmoe
+  dir: output/m1_specmoe

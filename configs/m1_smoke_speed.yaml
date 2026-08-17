@@ -1,0 +1,19 @@
+# hf-backend smoke for the m1 run (layer-skip drafts never ran on hf).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: speed
+  args:
+    num_layers: 6
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: m1_smoke_speed
+  dir: output/m1_smoke_speed

@@ -1,0 +1,29 @@
+# mx1 series (2026-07-20): Mixtral-8x7B Table-1 rows under the m1 protocol —
+# T=3, questions_per_cat=all (560 q), mnt=512, B=1, HF BACKEND ONLY
+# (Mixtral has no offload port, baseline_tables_plan.md S3).
+# Budget: 12.5% of 8 experts -> 1 draft-side expert per layer (8->1).
+# Merge/Ours: top-M=2 by decode vote count merged into K=1 expert per layer
+# (M=2K convention; count_top_k auto-resolves to native top-2). K=1 takes the
+# single-dense-expert path in drafts/base.py — the cluster method is bypassed
+# entirely, so no cluster block (within_weight is N/A: merge weights are the
+# count frequencies, the paper's count-weighted linear merge).
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: topm_count
+  args:
+    M: 2
+    K: 1
+    record_history: false
+run:
+  T: 3
+  questions_per_cat: all
+  max_new_tokens: 512
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: mx1_ours
+  dir: output/mx1_ours

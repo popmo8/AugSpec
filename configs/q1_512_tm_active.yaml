@@ -1,0 +1,19 @@
+# Diagnostic run: q_per_cat=1, mnt=512, no_overload ON. Identical settings to
+# q5_512_tm_on.yaml / q1_512_tm_stats.yaml (qpc=1). Run with
+# AUG_DUMP_ACTIVE_SET=<path> to dump the per-(layer,question,cycle) selected
+# expert set, feeding the expert-pair co-occurrence and cycle-to-cycle
+# set-shift analyses (scripts/analyze_active_set.py).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+run: {T: 5, questions_per_cat: 1, max_new_tokens: 512}
+output: {label: q1_512_tm_active, dir: output/q1_512_tm_active}

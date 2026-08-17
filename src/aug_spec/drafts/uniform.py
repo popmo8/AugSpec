@@ -16,6 +16,11 @@ class UniformDraft(DraftStrategy):
 
     cache_kind = "averaged"
 
+    # Builds a merged dense expert (the 1/n average) like the score-based
+    # family, so it also reserves merged residency — even though it is not a
+    # ScoreBasedAvgDraft subclass.
+    holds_merged_residency = True
+
     def lazy_build(self, layer_idx, block, adapter):
         n = adapter.num_experts(block)
         return adapter.build_weighted_avg(block, [1.0 / n] * n)

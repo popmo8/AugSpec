@@ -1,0 +1,25 @@
+# V2 offload 統計等價驗收（batch_spec_plan.md §6）：specmoe_batch1
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merged_backend: dispatch
+
+draft:
+  name: specmoe
+  args: {N: 16, route_top_k: 8, pin: true}
+  early_pin: 1
+run:
+  T: 5
+  questions_per_cat: 64
+  max_new_tokens: 512
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 64
+  batch_by_category: true
+output: {label: specmoe_nobmm_q64b64, dir: output/specmoe_nobmm_q64b64}

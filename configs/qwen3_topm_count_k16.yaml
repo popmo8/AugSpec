@@ -1,4 +1,4 @@
-# Qwen3-30B-A3B-Base — top-M count draft, K=16 cluster-merged experts (no SVD).
+# Qwen3-30B-A3B-Base — top-M count draft, K=16 cluster-merged experts.
 #
 # Instead of collapsing the active experts into one dense expert, the top-M
 # experts are partitioned into K=16 frequency-slice clusters, each merged
@@ -7,12 +7,10 @@
 #
 # Motivation: merging 128→1 destroys far more functional diversity than the
 # 8→1 case on Mixtral. K=16 keeps the pool diverse while bounding the draft
-# fetch budget. This config isolates the effect of K from SVD alignment.
+# fetch budget. This config isolates the effect of K.
 #
 # Compare against:
-#   qwen3_topm_count          : K=1,  no SVD  (single-expert baseline)
-#   qwen3_topm_count_svd      : K=1,  SVD
-#   qwen3_topm_count_svd_k16  : K=16, SVD     (full treatment)
+#   qwen3_topm_count          : K=1  (single-expert baseline)
 
 model:
   id: Qwen/Qwen3-30B-A3B-Base
@@ -26,7 +24,6 @@ draft:
     M: 32           # active-expert pool drawn before clustering
     K: 16           # partition into 16 cluster-merged experts
     draft_top_k: 8  # run the 8 heaviest clusters in the draft forward
-    use_svd_merge: false
     record_history: true
 
 run:

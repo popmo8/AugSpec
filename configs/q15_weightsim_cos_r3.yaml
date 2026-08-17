@@ -1,0 +1,21 @@
+# q15: skip mt_bench, qpc=15, UNIFORM merge. method=weightsim_cos, repeat r3.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+    no_overload: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+cluster:
+  name: weight_similarity
+  metric: cosine
+  cache: cache/weightsim_cosine_qwen3.pt
+  within_weight: uniform
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, skip_categories: [mt_bench]}
+output: {label: q15_weightsim_cos_r3, dir: output/q15_weightsim_cos_r3}

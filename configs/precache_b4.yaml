@@ -1,0 +1,21 @@
+# moe_precache — B=4 full benchmark (t1 protocol: qpc=15, mnt=512, humaneval,
+# mt_bench_pooled). Non-speculative; batch_spec path (pooled prefill counts,
+# explicit pin after the prefill loop). Compare against moe_caching B=4.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+draft:
+  name: moe_precache
+  args:
+    pin_fraction: 0.10
+run:
+  questions_per_cat: 15
+  max_new_tokens: 512
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 4
+output: {label: precache_b4, dir: output/precache_b4}

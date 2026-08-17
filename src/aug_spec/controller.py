@@ -34,7 +34,17 @@ class Controller:
 
     def __init__(self, model: nn.Module,
                  adapter: MoEAdapter,
-                 draft: DraftStrategy):
+                 draft: DraftStrategy,
+                 cpu_source: nn.Module = None,
+                 merge_offload: bool = False,
+                 merge_during_verify: bool = False,
+                 flush_on_draft_end: bool = False,
+                 merge_overlap: bool = False,
+                 prefill_warmup: bool = True,
+                 cache_mode: bool = False,
+                 slots_per_layer: int = 0,
+                 expert_bytes: int = 0,
+                 singleton_pin_budget=None):
         self.model = model
         self.adapter = adapter
         self.draft = draft
@@ -45,11 +55,48 @@ class Controller:
                 f"No MoE layers found for adapter '{adapter.name}'.")
         self.num_moe_layers = len(self.blocks)
 
+        # Offload backend: the model's experts are placeholders, so draft-side
+        # merging must read weights from a CPU-resident copy. Attach each
+        # layer's CPU block + the target GPU onto the offload block; the
+        # adapter's build_weighted_avg picks them up (hf backend passes
+        # cpu_source=None and this is skipped).
+        if cpu_source is not None:
+            cpu_blocks = dict(adapter.iter_moe(cpu_source))
+            device = getattr(model, "device", None)
+            for li, block in self.blocks:
+                block._cpu_merge_source = cpu_blocks[li]
+                block._merge_device = device
+                # M9b: when enabled, build_weighted_avg merges GPU-resident
+                # experts via the archer dispatcher (zero PCIe for the experts
+                # verify just fetched) instead of CPU-merging cpu_source.
+                block._merge_offload = merge_offload
+
+        # Offload-merge engine: the isolated home for offload-merge
+        # optimisations (merge↔PCIe overlap, post-draft flush, ...). Built only
+        # for merge_offload runs; None everywhere else so shared hooks no-op.
+        self.merge_engine = None
+        if merge_offload and cpu_source is not None:
+            from aug_spec.runtime.offload_merge import OffloadMergeEngine
+            self.merge_engine = OffloadMergeEngine(
+                adapter, model, during_verify=merge_during_verify,
+                flush=flush_on_draft_end, overlap=merge_overlap,
+                cache_mode=cache_mode, slots_per_layer=slots_per_layer,
+                expert_bytes=expert_bytes,
+                singleton_pin_budget=singleton_pin_budget)
+            self.merge_engine.controller = self   # on_verify_layer → draft/cache
+            self.merge_engine.attach(self.blocks)
+
         self.draft_cache: Dict[int, Any] = {}
         self.update_count: int = 0
         self.cycle_misses: List[int] = []  # populated by drafts that track it
 
         self.in_draft_phase: bool = False
+        # run.prefill_warmup (C-BOOT, merged_cache_plan.md §2.4): the warmup
+        # round guarantees the draft state exists before the first real draft,
+        # so a missing draft cache in draft phase is a bug — adapter forwards
+        # raise instead of silently falling back to standard routing (the
+        # fallback stays legal only for the prefill_warmup=false ablation).
+        self.prefill_warmup: bool = prefill_warmup
         self._installed: bool = False
 
     # ── install / uninstall ────────────────────────────────────────────
@@ -75,9 +122,13 @@ class Controller:
             block.forward = (
                 lambda hidden_states, *a, _fn=fn, _block=block, **kw:
                 _fn(_block, hidden_states))
+        # Draft-specific hooks beyond the MoE-block swap (e.g. speed's
+        # decoder-layer skip). No-op for most drafts.
+        self.draft.post_install(self)
         self._installed = True
 
     def uninstall(self) -> None:
+        self.draft.post_uninstall(self)
         for _, block in self.blocks:
             if hasattr(block, "_aug_spec_orig_forward"):
                 block.forward = block._aug_spec_orig_forward
@@ -99,4 +150,6 @@ class Controller:
         self.draft.reset()
         self.draft_cache.clear()
         self.update_count = 0
+        if self.merge_engine is not None:
+            self.merge_engine.on_question_start()   # re-arm prefill capture
         self.draft.prepopulate(self.adapter, self.blocks, self.draft_cache)

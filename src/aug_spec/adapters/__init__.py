@@ -14,12 +14,14 @@ from __future__ import annotations
 from typing import Any, Dict, Type
 
 from .base import MoEAdapter
+from .deepseek import DeepseekMoeAdapter
 from .gptoss import GptOssAdapter
 from .mixtral import MixtralAdapter
 from .qwen3 import Qwen3MoeAdapter
 
 
 _REGISTRY: Dict[str, Type[MoEAdapter]] = {
+    DeepseekMoeAdapter.name: DeepseekMoeAdapter,
     MixtralAdapter.name: MixtralAdapter,
     GptOssAdapter.name: GptOssAdapter,
     Qwen3MoeAdapter.name: Qwen3MoeAdapter,
@@ -27,6 +29,7 @@ _REGISTRY: Dict[str, Type[MoEAdapter]] = {
 
 # HF `config.model_type` → adapter name.
 _MODEL_TYPE_MAP: Dict[str, str] = {
+    "deepseek": "deepseek_moe",
     "mixtral": "mixtral",
     "gpt_oss": "gptoss",
     "qwen3_moe": "qwen3_moe",
@@ -55,6 +58,7 @@ def adapter_for_config(config: Any) -> MoEAdapter:
 
 __all__ = [
     "MoEAdapter",
+    "DeepseekMoeAdapter",
     "MixtralAdapter",
     "GptOssAdapter",
     "Qwen3MoeAdapter",

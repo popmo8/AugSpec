@@ -1,0 +1,20 @@
+# m1 series (2026-07-17): Table-1(new) protocol — T=3, questions_per_cat=all (560 q), mnt=512, B=1.
+# Derived from t1_qwen3_randmask.yaml (method definition unchanged).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: random_mask
+  args:
+    seed: 0
+    num_keep: 16
+run:
+  T: 3
+  questions_per_cat: all
+  max_new_tokens: 512
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: m1_randmask
+  dir: output/m1_randmask

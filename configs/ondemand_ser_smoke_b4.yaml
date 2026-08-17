@@ -1,0 +1,18 @@
+# moe_ondemand smoke — B=1, tiny. Zero-cache lower bound: no pins, streaming
+# buffer only → every routed expert on-demand fetched + evicted. Correctness.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    serial_dispatch: true
+draft:
+  name: moe_ondemand
+run:
+  questions_per_cat: 1
+  max_new_tokens: 32
+  batch_loop: true
+  batch_size: 4
+output: {label: ondemand_ser_smoke_b4, dir: output/ondemand_ser_smoke_b4}

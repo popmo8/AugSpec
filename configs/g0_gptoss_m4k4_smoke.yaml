@@ -1,0 +1,19 @@
+# 診斷 smoke — 預算對齊版 singleton(gptoss_acceptance_plan.md):M=K=4,
+# count 前 4 名恆等拷貝(單元素群、零合併損失),draft 駐留 4 顆 = Ours(K=4)/
+# SpecMoE(N=4) 同預算。對照:M8K8 singleton 0.403、specmoe 0.228、
+# ours(M8→K4 merge) 0.047。此數 ≈「同預算下不合併的上界」。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: topm_count
+  args: {M: 4, K: 4, draft_top_k: 4, record_history: false}
+cluster:
+  name: freq_slice
+  within_weight: uniform
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 128
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output: {label: g0_gptoss_m4k4_smoke, dir: output/g0_gptoss_m4k4_smoke}

@@ -1,0 +1,250 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1580 660" font-family="Helvetica,Arial,sans-serif">
+<defs>
+<marker id="m" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#2b2b2b"/></marker>
+<marker id="mr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#d64545"/></marker>
+<marker id="mt" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#0f766e"/></marker>
+<marker id="mb" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#2b6cb0"/></marker>
+<linearGradient id="g13" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#a8d5a2"/><stop offset="1" stop-color="#a7c7e7"/></linearGradient>
+<linearGradient id="g25" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f2a7a7"/><stop offset="1" stop-color="#c3b1e1"/></linearGradient>
+</defs>
+<rect x="0" y="0" width="1580" height="660" fill="#fff"/>
+
+<!-- ============ stage boxes ============ -->
+<rect x="15" y="38" width="390" height="595" rx="12" fill="none" stroke="#444" stroke-width="2" stroke-dasharray="9 5"/>
+<text x="210" y="66" font-size="22" font-weight="700" fill="#2b2b2b" text-anchor="middle">Prefill Stage</text>
+<rect x="425" y="38" width="1140" height="595" rx="12" fill="none" stroke="#444" stroke-width="2" stroke-dasharray="9 5"/>
+<text x="995" y="66" font-size="22" font-weight="700" fill="#2b2b2b" text-anchor="middle">Decoding Stage</text>
+
+<!-- sub-region boxes inside decoding stage -->
+<rect x="440" y="80" width="470" height="540" rx="10" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="675" y="105" font-size="18" font-weight="700" fill="#2b2b2b" text-anchor="middle">Draft Preparation</text>
+<text x="675" y="121" font-size="11.5" fill="#777" text-anchor="middle">(per MoE layer &#8467;)</text>
+<rect x="925" y="80" width="625" height="310" rx="10" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="1237" y="105" font-size="18" font-weight="700" fill="#2b2b2b" text-anchor="middle">Draft Phase</text>
+<rect x="925" y="405" width="625" height="215" rx="10" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="945" y="436" font-size="19" font-weight="700" fill="#2b2b2b" text-anchor="start">Verification Phase</text>
+<text x="945" y="456" font-size="13" fill="#777" text-anchor="start">full target MoE</text>
+
+<!-- ============ PREFILL: prompt tokens ============ -->
+<text x="205" y="84" font-size="13" fill="#777" text-anchor="middle">prompt tokens</text>
+<rect x="139" y="90" width="20" height="20" rx="4" fill="#e8eef6" stroke="#5b8fc9" stroke-width="1.2"/>
+<text x="149" y="104" font-size="10.5" font-weight="600" fill="#2b6cb0" text-anchor="middle">t&#8321;</text>
+<rect x="167" y="90" width="20" height="20" rx="4" fill="#e8eef6" stroke="#5b8fc9" stroke-width="1.2"/>
+<text x="177" y="104" font-size="10.5" font-weight="600" fill="#2b6cb0" text-anchor="middle">t&#8322;</text>
+<rect x="195" y="90" width="20" height="20" rx="4" fill="#e8eef6" stroke="#5b8fc9" stroke-width="1.2"/>
+<text x="205" y="104" font-size="10.5" font-weight="600" fill="#2b6cb0" text-anchor="middle">t&#8323;</text>
+<rect x="223" y="90" width="20" height="20" rx="4" fill="#e8eef6" stroke="#5b8fc9" stroke-width="1.2"/>
+<text x="233" y="104" font-size="10.5" font-weight="600" fill="#2b6cb0" text-anchor="middle">t&#8324;</text>
+<rect x="251" y="90" width="20" height="20" rx="4" fill="#e8eef6" stroke="#5b8fc9" stroke-width="1.2"/>
+<text x="261" y="104" font-size="10.5" font-weight="600" fill="#2b6cb0" text-anchor="middle">t&#8325;</text>
+<line x1="205" y1="114" x2="205" y2="131" stroke="#2b2b2b" stroke-width="1.8" marker-end="url(#m)"/>
+
+<!-- PREFILL: target model layer stack -->
+<rect x="130" y="135" width="150" height="98" rx="8" fill="#f7f7f9" stroke="#666" stroke-width="1.4"/>
+<text transform="translate(122,184) rotate(-90)" font-size="11.5" fill="#777" text-anchor="middle">Target MoE</text>
+<rect x="140" y="143" width="130" height="22" rx="4" fill="#efefef" stroke="#999" stroke-width="1"/>
+<text x="205" y="158" font-size="11.5" fill="#555" text-anchor="middle">Layers 1 &#8230; &#8467;&#8722;1</text>
+<rect x="140" y="171" width="130" height="24" rx="4" fill="#fff3d6" stroke="#b45309" stroke-width="1.5"/>
+<text x="205" y="187.5" font-size="12.5" font-weight="700" fill="#8a4b06" text-anchor="middle">MoE Layer &#8467;</text>
+<rect x="140" y="201" width="130" height="22" rx="4" fill="#efefef" stroke="#999" stroke-width="1"/>
+<text x="205" y="216" font-size="11.5" fill="#555" text-anchor="middle">Layers &#8467;+1 &#8230; L</text>
+
+<!-- zoom lens into layer detail panel -->
+<line x1="140" y1="195" x2="40" y2="250" stroke="#b45309" stroke-width="1.1" stroke-dasharray="3 3"/>
+<line x1="270" y1="195" x2="380" y2="250" stroke="#b45309" stroke-width="1.1" stroke-dasharray="3 3"/>
+<rect x="40" y="250" width="340" height="185" rx="10" fill="#fffdf7" stroke="#b45309" stroke-width="1.2"/>
+<text x="210" y="266" font-size="11.5" fill="#777" text-anchor="middle">route each prompt token</text>
+<circle cx="210" cy="285" r="11" fill="#f6d24a" stroke="#8a6d3b" stroke-width="1.4"/>
+<line x1="199" y1="290" x2="78" y2="306" stroke="#2b2b2b" stroke-width="1.2" marker-end="url(#m)"/>
+<line x1="202" y1="293" x2="129" y2="306" stroke="#2b2b2b" stroke-width="1.2" marker-end="url(#m)"/>
+<line x1="207" y1="296" x2="179" y2="306" stroke="#2b2b2b" stroke-width="1.2" marker-end="url(#m)"/>
+<line x1="219" y1="293" x2="279" y2="306" stroke="#2b2b2b" stroke-width="1.2" marker-end="url(#m)"/>
+<!-- experts of layer l: activated colored, inactive gray -->
+<rect x="52" y="310" width="44" height="24" rx="5" fill="#a8d5a2" stroke="#555" stroke-width="1.2"/>
+<text x="74" y="326.5" font-size="12.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">E1</text>
+<rect x="104" y="310" width="44" height="24" rx="5" fill="#f2a7a7" stroke="#555" stroke-width="1.2"/>
+<text x="126" y="326.5" font-size="12.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">E2</text>
+<rect x="156" y="310" width="44" height="24" rx="5" fill="#a7c7e7" stroke="#555" stroke-width="1.2"/>
+<text x="178" y="326.5" font-size="12.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">E3</text>
+<rect x="208" y="310" width="44" height="24" rx="5" fill="#e5e5e5" stroke="#aaa" stroke-width="1.2" stroke-dasharray="3 2"/>
+<text x="230" y="326.5" font-size="12.5" font-weight="600" fill="#999" text-anchor="middle">E4</text>
+<rect x="260" y="310" width="44" height="24" rx="5" fill="#c3b1e1" stroke="#555" stroke-width="1.2"/>
+<text x="282" y="326.5" font-size="12.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">E5</text>
+<rect x="312" y="310" width="44" height="24" rx="5" fill="#e5e5e5" stroke="#aaa" stroke-width="1.2" stroke-dasharray="3 2"/>
+<text x="334" y="326.5" font-size="12.5" font-weight="600" fill="#999" text-anchor="middle">E6</text>
+<!-- expert outputs -->
+<line x1="74" y1="334" x2="74" y2="342" stroke="#555" stroke-width="1"/>
+<line x1="126" y1="334" x2="126" y2="342" stroke="#555" stroke-width="1"/>
+<line x1="178" y1="334" x2="178" y2="342" stroke="#555" stroke-width="1"/>
+<line x1="282" y1="334" x2="282" y2="342" stroke="#555" stroke-width="1"/>
+<rect x="59" y="342" width="30" height="16" rx="4" fill="#fff" stroke="#777" stroke-width="1"/>
+<text x="74" y="354" font-size="11" font-style="italic" fill="#2b2b2b" text-anchor="middle">o&#8321;</text>
+<rect x="111" y="342" width="30" height="16" rx="4" fill="#fff" stroke="#777" stroke-width="1"/>
+<text x="126" y="354" font-size="11" font-style="italic" fill="#2b2b2b" text-anchor="middle">o&#8322;</text>
+<rect x="163" y="342" width="30" height="16" rx="4" fill="#fff" stroke="#777" stroke-width="1"/>
+<text x="178" y="354" font-size="11" font-style="italic" fill="#2b2b2b" text-anchor="middle">o&#8323;</text>
+<rect x="267" y="342" width="30" height="16" rx="4" fill="#fff" stroke="#777" stroke-width="1"/>
+<text x="282" y="354" font-size="11" font-style="italic" fill="#2b2b2b" text-anchor="middle">o&#8325;</text>
+<line x1="74" y1="358" x2="207" y2="371" stroke="#999" stroke-width="1"/>
+<line x1="126" y1="358" x2="208" y2="371" stroke="#999" stroke-width="1"/>
+<line x1="178" y1="358" x2="209" y2="371" stroke="#999" stroke-width="1"/>
+<line x1="282" y1="358" x2="212" y2="371" stroke="#999" stroke-width="1"/>
+<text x="210" y="386" font-size="12.5" font-weight="700" fill="#2b2b2b" text-anchor="middle">pairwise output similarity</text>
+<text x="210" y="402" font-size="11.5" fill="#777" text-anchor="middle">&#194;&#8467;[i,j] &#8592; &#8722;&#8214;o&#7522; &#8722; o&#11388;&#8214;&#8322;</text>
+<line x1="210" y1="408" x2="210" y2="452" stroke="#2b2b2b" stroke-width="1.8" marker-end="url(#m)"/>
+
+<!-- PREFILL: similarity map (full size) -->
+<rect x="165" y="458" width="15" height="15" fill="#5b8fc9"/><rect x="180" y="458" width="15" height="15" fill="#dbe8f7"/><rect x="195" y="458" width="15" height="15" fill="#2b6cb0"/><rect x="210" y="458" width="15" height="15" fill="#eef4fb"/><rect x="225" y="458" width="15" height="15" fill="#bcd4ee"/><rect x="240" y="458" width="15" height="15" fill="#eef4fb"/>
+<rect x="165" y="473" width="15" height="15" fill="#dbe8f7"/><rect x="180" y="473" width="15" height="15" fill="#5b8fc9"/><rect x="195" y="473" width="15" height="15" fill="#bcd4ee"/><rect x="210" y="473" width="15" height="15" fill="#eef4fb"/><rect x="225" y="473" width="15" height="15" fill="#2b6cb0"/><rect x="240" y="473" width="15" height="15" fill="#eef4fb"/>
+<rect x="165" y="488" width="15" height="15" fill="#2b6cb0"/><rect x="180" y="488" width="15" height="15" fill="#bcd4ee"/><rect x="195" y="488" width="15" height="15" fill="#5b8fc9"/><rect x="210" y="488" width="15" height="15" fill="#eef4fb"/><rect x="225" y="488" width="15" height="15" fill="#8fb6e0"/><rect x="240" y="488" width="15" height="15" fill="#eef4fb"/>
+<rect x="165" y="503" width="15" height="15" fill="#eef4fb"/><rect x="180" y="503" width="15" height="15" fill="#eef4fb"/><rect x="195" y="503" width="15" height="15" fill="#eef4fb"/><rect x="210" y="503" width="15" height="15" fill="#eef4fb"/><rect x="225" y="503" width="15" height="15" fill="#eef4fb"/><rect x="240" y="503" width="15" height="15" fill="#eef4fb"/>
+<rect x="165" y="518" width="15" height="15" fill="#bcd4ee"/><rect x="180" y="518" width="15" height="15" fill="#2b6cb0"/><rect x="195" y="518" width="15" height="15" fill="#8fb6e0"/><rect x="210" y="518" width="15" height="15" fill="#eef4fb"/><rect x="225" y="518" width="15" height="15" fill="#5b8fc9"/><rect x="240" y="518" width="15" height="15" fill="#eef4fb"/>
+<rect x="165" y="533" width="15" height="15" fill="#eef4fb"/><rect x="180" y="533" width="15" height="15" fill="#eef4fb"/><rect x="195" y="533" width="15" height="15" fill="#eef4fb"/><rect x="210" y="533" width="15" height="15" fill="#eef4fb"/><rect x="225" y="533" width="15" height="15" fill="#eef4fb"/><rect x="240" y="533" width="15" height="15" fill="#eef4fb"/>
+<rect x="165" y="458" width="90" height="90" fill="none" stroke="#bbb" stroke-width="0.8"/>
+<text x="210" y="566" font-size="15" font-weight="700" fill="#2b2b2b" text-anchor="middle">Similarity Map &#194;&#8467;</text>
+<text x="210" y="582" font-size="12" fill="#777" text-anchor="middle">accumulated over prefill</text>
+
+<!-- freeze arrow: prefill map -> frozen copy in draft preparation -->
+<path d="M 257 503 L 415 503 L 415 195 L 461 195" fill="none" stroke="#2b6cb0" stroke-width="2.2" marker-end="url(#mb)"/>
+<circle cx="415" cy="349" r="12" fill="#fff" stroke="#2b6cb0" stroke-width="1.5"/>
+<text x="415" y="354" font-size="13" fill="#2b6cb0" text-anchor="middle">&#10052;</text>
+
+<!-- ============ DRAFT PREPARATION: frozen similarity copy ============ -->
+<text x="505" y="145" font-size="14" font-weight="700" fill="#2b2b2b" text-anchor="middle">Similarity Map</text>
+<rect x="466" y="156" width="13" height="13" fill="#5b8fc9"/><rect x="479" y="156" width="13" height="13" fill="#dbe8f7"/><rect x="492" y="156" width="13" height="13" fill="#2b6cb0"/><rect x="505" y="156" width="13" height="13" fill="#eef4fb"/><rect x="518" y="156" width="13" height="13" fill="#bcd4ee"/><rect x="531" y="156" width="13" height="13" fill="#eef4fb"/>
+<rect x="466" y="169" width="13" height="13" fill="#dbe8f7"/><rect x="479" y="169" width="13" height="13" fill="#5b8fc9"/><rect x="492" y="169" width="13" height="13" fill="#bcd4ee"/><rect x="505" y="169" width="13" height="13" fill="#eef4fb"/><rect x="518" y="169" width="13" height="13" fill="#2b6cb0"/><rect x="531" y="169" width="13" height="13" fill="#eef4fb"/>
+<rect x="466" y="182" width="13" height="13" fill="#2b6cb0"/><rect x="479" y="182" width="13" height="13" fill="#bcd4ee"/><rect x="492" y="182" width="13" height="13" fill="#5b8fc9"/><rect x="505" y="182" width="13" height="13" fill="#eef4fb"/><rect x="518" y="182" width="13" height="13" fill="#8fb6e0"/><rect x="531" y="182" width="13" height="13" fill="#eef4fb"/>
+<rect x="466" y="195" width="13" height="13" fill="#eef4fb"/><rect x="479" y="195" width="13" height="13" fill="#eef4fb"/><rect x="492" y="195" width="13" height="13" fill="#eef4fb"/><rect x="505" y="195" width="13" height="13" fill="#eef4fb"/><rect x="518" y="195" width="13" height="13" fill="#eef4fb"/><rect x="531" y="195" width="13" height="13" fill="#eef4fb"/>
+<rect x="466" y="208" width="13" height="13" fill="#bcd4ee"/><rect x="479" y="208" width="13" height="13" fill="#2b6cb0"/><rect x="492" y="208" width="13" height="13" fill="#8fb6e0"/><rect x="505" y="208" width="13" height="13" fill="#eef4fb"/><rect x="518" y="208" width="13" height="13" fill="#5b8fc9"/><rect x="531" y="208" width="13" height="13" fill="#eef4fb"/>
+<rect x="466" y="221" width="13" height="13" fill="#eef4fb"/><rect x="479" y="221" width="13" height="13" fill="#eef4fb"/><rect x="492" y="221" width="13" height="13" fill="#eef4fb"/><rect x="505" y="221" width="13" height="13" fill="#eef4fb"/><rect x="518" y="221" width="13" height="13" fill="#eef4fb"/><rect x="531" y="221" width="13" height="13" fill="#eef4fb"/>
+<rect x="466" y="156" width="78" height="78" fill="none" stroke="#bbb" stroke-width="0.8"/>
+<circle cx="546" cy="158" r="9" fill="#fff" stroke="#2b6cb0" stroke-width="1.4"/>
+<text x="546" y="162" font-size="10.5" fill="#2b6cb0" text-anchor="middle">&#10052;</text>
+<text x="505" y="250" font-size="11.5" fill="#777" text-anchor="middle">frozen &#183; read-only</text>
+
+<!-- DRAFT PREPARATION: co-occur map (live) -->
+<text x="505" y="308" font-size="14" font-weight="700" fill="#2b2b2b" text-anchor="middle">Co-occur Map &#264;&#8467;</text>
+<text x="505" y="322" font-size="11.5" fill="#777" text-anchor="middle">decode &#183; live</text>
+<rect x="466" y="330" width="13" height="13" fill="#3f9e8c"/><rect x="479" y="330" width="13" height="13" fill="#aedcd3"/><rect x="492" y="330" width="13" height="13" fill="#0f766e"/><rect x="505" y="330" width="13" height="13" fill="#d2ece7"/><rect x="518" y="330" width="13" height="13" fill="#7cc4b6"/><rect x="531" y="330" width="13" height="13" fill="#eaf6f4"/>
+<rect x="466" y="343" width="13" height="13" fill="#aedcd3"/><rect x="479" y="343" width="13" height="13" fill="#3f9e8c"/><rect x="492" y="343" width="13" height="13" fill="#d2ece7"/><rect x="505" y="343" width="13" height="13" fill="#aedcd3"/><rect x="518" y="343" width="13" height="13" fill="#0f766e"/><rect x="531" y="343" width="13" height="13" fill="#eaf6f4"/>
+<rect x="466" y="356" width="13" height="13" fill="#0f766e"/><rect x="479" y="356" width="13" height="13" fill="#d2ece7"/><rect x="492" y="356" width="13" height="13" fill="#3f9e8c"/><rect x="505" y="356" width="13" height="13" fill="#7cc4b6"/><rect x="518" y="356" width="13" height="13" fill="#aedcd3"/><rect x="531" y="356" width="13" height="13" fill="#eaf6f4"/>
+<rect x="466" y="369" width="13" height="13" fill="#d2ece7"/><rect x="479" y="369" width="13" height="13" fill="#aedcd3"/><rect x="492" y="369" width="13" height="13" fill="#7cc4b6"/><rect x="505" y="369" width="13" height="13" fill="#0f766e"/><rect x="518" y="369" width="13" height="13" fill="#d2ece7"/><rect x="531" y="369" width="13" height="13" fill="#aedcd3"/>
+<rect x="466" y="382" width="13" height="13" fill="#7cc4b6"/><rect x="479" y="382" width="13" height="13" fill="#0f766e"/><rect x="492" y="382" width="13" height="13" fill="#aedcd3"/><rect x="505" y="382" width="13" height="13" fill="#d2ece7"/><rect x="518" y="382" width="13" height="13" fill="#3f9e8c"/><rect x="531" y="382" width="13" height="13" fill="#eaf6f4"/>
+<rect x="466" y="395" width="13" height="13" fill="#eaf6f4"/><rect x="479" y="395" width="13" height="13" fill="#eaf6f4"/><rect x="492" y="395" width="13" height="13" fill="#eaf6f4"/><rect x="505" y="395" width="13" height="13" fill="#aedcd3"/><rect x="518" y="395" width="13" height="13" fill="#eaf6f4"/><rect x="531" y="395" width="13" height="13" fill="#7cc4b6"/>
+<rect x="466" y="330" width="78" height="78" fill="none" stroke="#bbb" stroke-width="0.8"/>
+
+<!-- blend into relation map -->
+<line x1="548" y1="200" x2="610" y2="264" stroke="#2b2b2b" stroke-width="2" marker-end="url(#m)"/>
+<line x1="548" y1="362" x2="610" y2="300" stroke="#2b2b2b" stroke-width="2" marker-end="url(#m)"/>
+<text x="578" y="289" font-size="13.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">blend &#955;</text>
+
+<!-- DRAFT PREPARATION: expert relation map -->
+<text x="664" y="213" font-size="14.5" font-weight="700" fill="#2b2b2b" text-anchor="middle">Expert Relation Map</text>
+<text x="624" y="231" font-size="8.5" fill="#999" text-anchor="middle">1</text><text x="640" y="231" font-size="8.5" fill="#999" text-anchor="middle">2</text><text x="656" y="231" font-size="8.5" fill="#999" text-anchor="middle">3</text><text x="672" y="231" font-size="8.5" fill="#999" text-anchor="middle">4</text><text x="688" y="231" font-size="8.5" fill="#999" text-anchor="middle">5</text><text x="704" y="231" font-size="8.5" fill="#999" text-anchor="middle">6</text>
+<text x="612" y="245" font-size="8.5" fill="#999" text-anchor="end">1</text><text x="612" y="261" font-size="8.5" fill="#999" text-anchor="end">2</text><text x="612" y="277" font-size="8.5" fill="#999" text-anchor="end">3</text><text x="612" y="293" font-size="8.5" fill="#999" text-anchor="end">4</text><text x="612" y="309" font-size="8.5" fill="#999" text-anchor="end">5</text><text x="612" y="325" font-size="8.5" fill="#999" text-anchor="end">6</text>
+<rect x="616" y="234" width="16" height="16" fill="#7d74c0"/><rect x="632" y="234" width="16" height="16" fill="#c3bfe4"/><rect x="648" y="234" width="16" height="16" fill="#5548a8"/><rect x="664" y="234" width="16" height="16" fill="#dcdaf0"/><rect x="680" y="234" width="16" height="16" fill="#a29bd4"/><rect x="696" y="234" width="16" height="16" fill="#efeef8"/>
+<rect x="616" y="250" width="16" height="16" fill="#c3bfe4"/><rect x="632" y="250" width="16" height="16" fill="#7d74c0"/><rect x="648" y="250" width="16" height="16" fill="#dcdaf0"/><rect x="664" y="250" width="16" height="16" fill="#c3bfe4"/><rect x="680" y="250" width="16" height="16" fill="#5548a8"/><rect x="696" y="250" width="16" height="16" fill="#efeef8"/>
+<rect x="616" y="266" width="16" height="16" fill="#5548a8"/><rect x="632" y="266" width="16" height="16" fill="#dcdaf0"/><rect x="648" y="266" width="16" height="16" fill="#7d74c0"/><rect x="664" y="266" width="16" height="16" fill="#a29bd4"/><rect x="680" y="266" width="16" height="16" fill="#c3bfe4"/><rect x="696" y="266" width="16" height="16" fill="#efeef8"/>
+<rect x="616" y="282" width="16" height="16" fill="#dcdaf0"/><rect x="632" y="282" width="16" height="16" fill="#c3bfe4"/><rect x="648" y="282" width="16" height="16" fill="#a29bd4"/><rect x="664" y="282" width="16" height="16" fill="#5548a8"/><rect x="680" y="282" width="16" height="16" fill="#dcdaf0"/><rect x="696" y="282" width="16" height="16" fill="#c3bfe4"/>
+<rect x="616" y="298" width="16" height="16" fill="#a29bd4"/><rect x="632" y="298" width="16" height="16" fill="#5548a8"/><rect x="648" y="298" width="16" height="16" fill="#c3bfe4"/><rect x="664" y="298" width="16" height="16" fill="#dcdaf0"/><rect x="680" y="298" width="16" height="16" fill="#7d74c0"/><rect x="696" y="298" width="16" height="16" fill="#efeef8"/>
+<rect x="616" y="314" width="16" height="16" fill="#efeef8"/><rect x="632" y="314" width="16" height="16" fill="#efeef8"/><rect x="648" y="314" width="16" height="16" fill="#efeef8"/><rect x="664" y="314" width="16" height="16" fill="#c3bfe4"/><rect x="680" y="314" width="16" height="16" fill="#efeef8"/><rect x="696" y="314" width="16" height="16" fill="#a29bd4"/>
+<rect x="616" y="234" width="96" height="96" fill="none" stroke="#bbb" stroke-width="0.8"/>
+<text x="640" y="349" font-size="11.5" fill="#777" text-anchor="middle">R&#8467; = &#955;&#183;&#194;&#8467; + (1&#8722;&#955;)&#183;&#264;&#8467;</text>
+
+<!-- picked pairs / singleton on relation map -->
+<circle cx="656" cy="242" r="11" fill="none" stroke="#d64545" stroke-width="1.9" stroke-dasharray="4 3"/>
+<circle cx="688" cy="258" r="11" fill="none" stroke="#d64545" stroke-width="1.9" stroke-dasharray="4 3"/>
+<circle cx="672" cy="290" r="11" fill="none" stroke="#d64545" stroke-width="1.9" stroke-dasharray="4 3"/>
+<path d="M 667 236 C 700 222, 730 200, 754 182" fill="none" stroke="#d64545" stroke-width="1.9" stroke-dasharray="5 4" marker-end="url(#mr)"/>
+<path d="M 699 260 C 725 274, 742 287, 756 296" fill="none" stroke="#d64545" stroke-width="1.9" stroke-dasharray="5 4" marker-end="url(#mr)"/>
+<path d="M 678 300 C 710 340, 736 382, 756 410" fill="none" stroke="#d64545" stroke-width="1.9" stroke-dasharray="5 4" marker-end="url(#mr)"/>
+
+<!-- PAIR / SINGLETON boxes -->
+<text x="820" y="124" font-size="11.5" font-weight="600" fill="#777" text-anchor="middle">greedy pairing over</text>
+<text x="820" y="138" font-size="11.5" font-weight="600" fill="#777" text-anchor="middle">top-M active experts</text>
+<rect x="764" y="150" width="112" height="62" rx="11" fill="#f0f7ee" stroke="#666" stroke-width="1.3"/>
+<text x="820" y="166" font-size="12" font-weight="700" fill="#777" text-anchor="middle">PAIR</text>
+<rect x="774" y="174" width="42" height="26" rx="6" fill="#a8d5a2" stroke="#555" stroke-width="1.3"/>
+<text x="795" y="191.5" font-size="14.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">E1</text>
+<rect x="824" y="174" width="42" height="26" rx="6" fill="#a7c7e7" stroke="#555" stroke-width="1.3"/>
+<text x="845" y="191.5" font-size="14.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">E3</text>
+<rect x="764" y="270" width="112" height="62" rx="11" fill="#fdf1f3" stroke="#666" stroke-width="1.3"/>
+<text x="820" y="286" font-size="12" font-weight="700" fill="#777" text-anchor="middle">PAIR</text>
+<rect x="774" y="294" width="42" height="26" rx="6" fill="#f2a7a7" stroke="#555" stroke-width="1.3"/>
+<text x="795" y="311.5" font-size="14.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">E2</text>
+<rect x="824" y="294" width="42" height="26" rx="6" fill="#c3b1e1" stroke="#555" stroke-width="1.3"/>
+<text x="845" y="311.5" font-size="14.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">E5</text>
+<rect x="764" y="390" width="112" height="62" rx="11" fill="#fef7ec" stroke="#666" stroke-width="1.3"/>
+<text x="820" y="406" font-size="11.5" font-weight="700" fill="#777" text-anchor="middle">SINGLETON</text>
+<rect x="799" y="414" width="42" height="26" rx="6" fill="#f6c98f" stroke="#555" stroke-width="1.3"/>
+<text x="820" y="431.5" font-size="14.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">E4</text>
+
+<!-- merge / keep arrows into draft model -->
+<line x1="878" y1="181" x2="994" y2="202" stroke="#2b2b2b" stroke-width="2" marker-end="url(#m)"/>
+<line x1="878" y1="301" x2="994" y2="252" stroke="#2b2b2b" stroke-width="2" marker-end="url(#m)"/>
+<line x1="878" y1="421" x2="994" y2="300" stroke="#2b2b2b" stroke-width="2" marker-end="url(#m)"/>
+<text x="958" y="183" font-size="14" font-weight="700" fill="#2b2b2b" text-anchor="middle">merge</text>
+<text x="965" y="305" font-size="13" font-weight="700" fill="#555" text-anchor="middle">keep</text>
+
+<!-- ============ DRAFT PHASE: draft model ============ -->
+<rect x="985" y="130" width="320" height="230" rx="12" fill="#f7fafd" stroke="#2b6cb0" stroke-width="2"/>
+<text x="1145" y="157" font-size="16" font-weight="700" fill="#1d4f80" text-anchor="middle">Draft Model</text>
+<text x="1145" y="174" font-size="12.5" fill="#777" text-anchor="middle">merged experts + singleton</text>
+<rect x="1000" y="188" width="120" height="34" rx="7" fill="url(#g13)" stroke="#555" stroke-width="1.3"/>
+<text x="1060" y="210" font-size="15.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">&#202;&#8321;</text>
+<rect x="1000" y="236" width="120" height="34" rx="7" fill="url(#g25)" stroke="#555" stroke-width="1.3"/>
+<text x="1060" y="258" font-size="15.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">&#202;&#8322;</text>
+<rect x="1000" y="284" width="120" height="34" rx="7" fill="#f6c98f" stroke="#555" stroke-width="1.3"/>
+<text x="1060" y="306" font-size="15.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">E4</text>
+<rect x="1170" y="188" width="110" height="34" rx="7" fill="#efe9f8" stroke="#777" stroke-width="1.3"/>
+<text x="1225" y="210" font-size="14.5" font-weight="600" fill="#2b2b2b" text-anchor="middle">&#202;&#8323; &#8230; &#202;&#8342;</text>
+<text x="1225" y="252" font-size="11" fill="#777" text-anchor="middle">substitute routing:</text>
+<text x="1225" y="267" font-size="11" fill="#777" text-anchor="middle">expert id &#8594; merged slot</text>
+<text x="1145" y="345" font-size="12.5" font-weight="600" fill="#0f766e" text-anchor="middle">all slots GPU-resident &#183; zero expert fetch</text>
+
+<!-- draft tokens out -->
+<line x1="1305" y1="246" x2="1330" y2="246" stroke="#2b2b2b" stroke-width="2" marker-end="url(#m)"/>
+<text x="1375" y="226" font-size="14" font-weight="700" fill="#2b2b2b" text-anchor="middle">&#947; draft tokens</text>
+<rect x="1336" y="234" width="22" height="22" rx="4" fill="#eef4fb" stroke="#2b6cb0" stroke-width="1.3"/>
+<text x="1347" y="249" font-size="11" font-weight="600" fill="#2b6cb0" text-anchor="middle">d&#8321;</text>
+<rect x="1364" y="234" width="22" height="22" rx="4" fill="#eef4fb" stroke="#2b6cb0" stroke-width="1.3"/>
+<text x="1375" y="249" font-size="11" font-weight="600" fill="#2b6cb0" text-anchor="middle">d&#8322;</text>
+<rect x="1392" y="234" width="22" height="22" rx="4" fill="#eef4fb" stroke="#2b6cb0" stroke-width="1.3"/>
+<text x="1403" y="249" font-size="11" font-weight="600" fill="#2b6cb0" text-anchor="middle">d&#8323;</text>
+<path d="M 1375 260 L 1375 376 L 1196 376 L 1196 461" fill="none" stroke="#2b2b2b" stroke-width="2.2" marker-end="url(#m)"/>
+
+<!-- ============ VERIFICATION PHASE ============ -->
+<circle cx="1196" cy="477" r="12" fill="#f6d24a" stroke="#8a6d3b" stroke-width="1.4"/>
+<line x1="1185" y1="483" x2="1030" y2="507" stroke="#2b2b2b" stroke-width="1.3" marker-end="url(#m)"/>
+<line x1="1191" y1="488" x2="1160" y2="507" stroke="#2b2b2b" stroke-width="1.3" marker-end="url(#m)"/>
+<line x1="1201" y1="488" x2="1222" y2="507" stroke="#2b2b2b" stroke-width="1.3" marker-end="url(#m)"/>
+<line x1="1207" y1="483" x2="1286" y2="507" stroke="#2b2b2b" stroke-width="1.3" marker-end="url(#m)"/>
+<rect x="1000" y="512" width="52" height="28" rx="6" fill="#a8d5a2" stroke="#555" stroke-width="1.3"/>
+<text x="1026" y="530.5" font-size="13" font-weight="600" fill="#2b2b2b" text-anchor="middle">E1</text>
+<rect x="1066" y="512" width="52" height="28" rx="6" fill="#e5e5e5" stroke="#aaa" stroke-width="1.3" stroke-dasharray="3 2"/>
+<text x="1092" y="530.5" font-size="13" font-weight="600" fill="#999" text-anchor="middle">E2</text>
+<rect x="1132" y="512" width="52" height="28" rx="6" fill="#a7c7e7" stroke="#555" stroke-width="1.3"/>
+<text x="1158" y="530.5" font-size="13" font-weight="600" fill="#2b2b2b" text-anchor="middle">E3</text>
+<rect x="1198" y="512" width="52" height="28" rx="6" fill="#f6c98f" stroke="#555" stroke-width="1.3"/>
+<text x="1224" y="530.5" font-size="13" font-weight="600" fill="#2b2b2b" text-anchor="middle">E4</text>
+<rect x="1264" y="512" width="52" height="28" rx="6" fill="#c3b1e1" stroke="#555" stroke-width="1.3"/>
+<text x="1290" y="530.5" font-size="13" font-weight="600" fill="#2b2b2b" text-anchor="middle">E5</text>
+<rect x="1330" y="512" width="52" height="28" rx="6" fill="#e5e5e5" stroke="#aaa" stroke-width="1.3" stroke-dasharray="3 2"/>
+<text x="1356" y="530.5" font-size="13" font-weight="600" fill="#999" text-anchor="middle">E6</text>
+<text x="1356" y="560" font-size="11.5" font-style="italic" fill="#999" text-anchor="middle">gray = not routed</text>
+
+<!-- accept row -->
+<text x="1040" y="592" font-size="15" font-weight="700" fill="#2b2b2b" text-anchor="start">accept</text>
+<text x="1098" y="592" font-family="Georgia,serif" font-size="15.6" font-weight="700" font-style="italic" fill="#2b2b2b" text-anchor="start">a</text>
+<text x="1108" y="596" font-family="Georgia,serif" font-size="12" font-weight="700" font-style="italic" fill="#2b2b2b" text-anchor="start">s</text>
+<rect x="1124" y="578" width="18" height="18" rx="4" fill="#fff" stroke="#2f9e44" stroke-width="1.5"/>
+<text x="1133" y="592" font-size="14.4" font-weight="700" fill="#2f9e44" text-anchor="middle">&#10003;</text>
+<rect x="1148" y="578" width="18" height="18" rx="4" fill="#fff" stroke="#2f9e44" stroke-width="1.5"/>
+<text x="1157" y="592" font-size="14.4" font-weight="700" fill="#2f9e44" text-anchor="middle">&#10003;</text>
+<rect x="1172" y="578" width="18" height="18" rx="4" fill="#fff" stroke="#d64545" stroke-width="1.5"/>
+<text x="1181" y="592" font-size="14.4" font-weight="700" fill="#d64545" text-anchor="middle">&#10007;</text>
+
+<!-- co-occur feedback -->
+<path d="M 1070 606 L 505 606 L 505 414" fill="none" stroke="#0f766e" stroke-width="2.4" marker-end="url(#mt)"/>
+<text x="800" y="598" font-size="13.5" font-weight="600" fill="#0f766e" text-anchor="middle">top-k routing counts</text>
+</svg>

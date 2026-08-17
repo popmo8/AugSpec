@@ -1,0 +1,25 @@
+# C-BOOT 規模驗證 A — topm,qpc=5 / mnt=512 / skip mt_bench,prefill_warmup ON
+# (現行預設 stack:C-DEL + 空首輪 + KV-copy)。與 q5_512_boot_off 唯一差異
+# = prefill_warmup,AccR 差距即 C-BOOT 的語意代價(預期 <1pp)。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+cluster:
+  name: freq_slice
+  within_weight: freq
+run:
+  T: 5
+  questions_per_cat: 5
+  max_new_tokens: 512
+  prefill_warmup: true
+  skip_categories: [mt_bench]
+output: {label: q5_512_boot_on, dir: output/q5_512_boot_on}

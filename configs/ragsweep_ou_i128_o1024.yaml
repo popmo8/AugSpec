@@ -1,0 +1,47 @@
+# RAG@B=16 input/output sweep (2026-07-25): in=128 out=1024, base=ours_t5_q16b16.yaml
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+    merge_overlap: true
+draft:
+  name: topm_count
+  args:
+    M: 32
+    K: 16
+    draft_top_k: 8
+    record_history: false
+cluster:
+  name: hybrid
+  alpha: 0.75
+  metric: l2
+  norm: rank
+  cooccur_norm: raw
+  cooccur_scope: decode
+  within_weight: uniform
+run:
+  T: 5
+  questions_per_cat: 16
+  max_new_tokens: 1024
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 16
+  batch_by_category: true
+  skip_categories:
+  - mt_bench
+  - translation
+  - summarization
+  - qa
+  - math_reasoning
+  - humaneval
+  prompt_token_cap: 128
+output:
+  label: ragsweep_ou_i128_o1024
+  dir: output/ragsweep_ou_i128_o1024

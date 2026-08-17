@@ -13,7 +13,7 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
-from .base import MoEAdapter, _svd_decompose, _svd_remerge, _weighted_sum
+from .base import MoEAdapter
 
 
 def _wrap_chat_template_with_reasoning(tokenizer, reasoning_effort: str):
@@ -108,32 +108,6 @@ class GptOssAdapter(MoEAdapter):
         del gate_up_sum, gate_up_bias_sum, down_sum, down_bias_sum
         return out
 
-    def build_svd_basis(self, mlp, rank=256, store_dtype=torch.bfloat16):
-        experts = mlp.experts
-        n = experts.gate_up_proj.shape[0]
-        # Weight matrices get an SVD basis; biases are 1-D (no subspace), so
-        # we keep the static per-expert bias tensors for a per-cycle plain avg.
-        return {
-            "dtype": experts.gate_up_proj.dtype,
-            "gate_up": _svd_decompose(
-                [experts.gate_up_proj[e].float() for e in range(n)],
-                rank, store_dtype),
-            "down": _svd_decompose(
-                [experts.down_proj[e].float() for e in range(n)],
-                rank, store_dtype),
-            "gate_up_bias": [experts.gate_up_proj_bias[e] for e in range(n)],
-            "down_bias":    [experts.down_proj_bias[e] for e in range(n)],
-        }
-
-    def build_svd_from_basis(self, basis, weights):
-        dtype = basis["dtype"]
-        return {
-            "gate_up_proj":      _svd_remerge(basis["gate_up"], weights).to(dtype),
-            "gate_up_proj_bias": _weighted_sum(basis["gate_up_bias"], weights).to(dtype),
-            "down_proj":         _svd_remerge(basis["down"], weights).to(dtype),
-            "down_proj_bias":    _weighted_sum(basis["down_bias"], weights).to(dtype),
-        }
-
     def _run_dense_expert(self, avg, flat):
         alpha = self._alpha
         limit = self._limit
@@ -143,6 +117,24 @@ class GptOssAdapter(MoEAdapter):
         glu = gate * torch.sigmoid(gate * alpha)
         gated = (up + 1) * glu
         return gated @ avg["down_proj"] + avg["down_proj_bias"]
+
+    def _fired_expert_outputs(self, layer_idx, experts, flat, router_indices):
+        """Raw (pre-routing-weight) outputs of every fired expert over the
+        tokens routed to it, in the engine-capture tuple format
+        [(layer, expert, token_idx[t], out[t,D])]. CPU tensors so the draft's
+        per-token accumulation never syncs the GPU."""
+        captured = []
+        for e in router_indices.unique().tolist():
+            tok_idx = (router_indices == e).any(dim=-1).nonzero(as_tuple=True)[0]
+            slices = {
+                "gate_up_proj": experts.gate_up_proj[e],
+                "gate_up_proj_bias": experts.gate_up_proj_bias[e],
+                "down_proj": experts.down_proj[e],
+                "down_proj_bias": experts.down_proj_bias[e],
+            }
+            out = self._run_dense_expert(slices, flat[tok_idx])
+            captured.append((layer_idx, int(e), tok_idx.cpu(), out.float().cpu()))
+        return captured
 
     def make_averaged_forward(self, controller, layer_idx, mlp):
         adapter = self
@@ -157,6 +149,13 @@ class GptOssAdapter(MoEAdapter):
                     avg = controller.draft.lazy_build(layer_idx, mlp, adapter)
                     if avg is not None:
                         controller.draft_cache[layer_idx] = avg
+                # C-BOOT: see qwen3.py — missing draft cache under
+                # run.prefill_warmup is a bug; fail fast, don't fall back.
+                if avg is None and getattr(controller, "prefill_warmup", False):
+                    raise RuntimeError(
+                        f"draft cache missing for MoE layer {layer_idx} in "
+                        f"draft phase despite run.prefill_warmup=true "
+                        f"(merged_cache_plan.md §2.4)")
                 if avg is not None:
                     if avg.get("kind") == "multi":
                         # Run the gate (one linear) for per-token cluster scores.
@@ -165,7 +164,7 @@ class GptOssAdapter(MoEAdapter):
                         gate_probs = gate_logits.softmax(dim=-1)
                         top_k = controller.draft.draft_top_k or router.top_k
                         out = adapter._route_multi_expert(
-                            avg, gate_probs, flat, top_k)
+                            avg, gate_probs, flat, top_k, mlp)
                     else:
                         out = adapter._run_dense_expert(avg, flat)
                     return out.reshape(batch_size, sequence_length, hidden_dim), None
@@ -188,6 +187,18 @@ class GptOssAdapter(MoEAdapter):
 
             top_val, router_indices = torch.topk(
                 router_logits, router.top_k, dim=-1)
+            # hybrid-on-hf act-sim (gptoss_acceptance_plan.md Step 0.5): on
+            # the prefill forward only, recompute the fired experts' raw
+            # outputs and feed the draft's pair-similarity accumulator — the
+            # offload-engine capture that normally supplies this doesn't
+            # exist on the hf backend.
+            wants = getattr(controller.draft, "wants_prefill_act_sim", None)
+            if wants is not None and wants(layer_idx):
+                controller.draft.accumulate_prefill_act_sim(
+                    layer_idx,
+                    adapter._fired_expert_outputs(
+                        layer_idx, mlp.experts, flat, router_indices),
+                    router_logits.shape[-1])
             top_val = F.softmax(top_val, dim=1, dtype=top_val.dtype)
             router_scores = torch.zeros_like(router_logits).scatter_(
                 1, router_indices, top_val)
@@ -201,6 +212,53 @@ class GptOssAdapter(MoEAdapter):
         return fwd
 
     def make_masked_forward(self, controller, layer_idx, mlp):
-        raise NotImplementedError(
-            "GPT-OSS masked forward is not implemented (no current experiment "
-            "needs it). Add it here when one does.")
+        def fwd(mlp, hidden_states):
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            router = mlp.router
+            router_logits = F.linear(flat, router.weight, router.bias)
+
+            if controller.in_draft_phase:
+                mask = controller.draft_cache.get(layer_idx)
+                if mask is not None:
+                    inactive = (~mask).to(router_logits.device)
+                    gate_logits = router_logits.masked_fill(
+                        inactive.unsqueeze(0), float("-inf"))
+                else:
+                    gate_logits = router_logits
+            else:
+                gate_logits = router_logits  # target verify: no capture
+                # (masked drafts are frozen sets — same as qwen3/mixtral)
+
+            # softmax-after-topk on the (possibly masked) logits — the
+            # gpt-oss routing semantic, opposite order to qwen3.
+            top_val, router_indices = torch.topk(
+                gate_logits, router.top_k, dim=-1)
+            top_val = F.softmax(top_val, dim=1, dtype=top_val.dtype)
+            router_scores = torch.zeros_like(router_logits).scatter_(
+                1, router_indices, top_val)
+            routed_out = mlp.experts(
+                hidden_states,
+                router_indices=router_indices,
+                routing_weights=router_scores,
+            )
+            return routed_out, router_scores
+
+        return fwd
+
+    def make_substitute_forward(self, controller, layer_idx, block):
+        # Lazy import: the SpecMoE forward lives in drafts/specmoe.py (A5);
+        # importing it at module top would cycle (adapters <-> drafts).
+        from aug_spec.drafts.specmoe import gptoss_substitute_forward
+        return gptoss_substitute_forward(controller, layer_idx, block)
+
+    def expert_flat_weights(self, block):
+        experts = block.experts
+        return [
+            torch.cat([
+                experts.gate_up_proj[e].detach().flatten().float(),
+                experts.gate_up_proj_bias[e].detach().flatten().float(),
+                experts.down_proj[e].detach().flatten().float(),
+                experts.down_proj_bias[e].detach().flatten().float(),
+            ])
+            for e in range(experts.gate_up_proj.shape[0])
+        ]

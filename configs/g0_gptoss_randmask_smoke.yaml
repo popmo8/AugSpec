@@ -1,0 +1,14 @@
+# G0 smoke — GPT-OSS Random (prune) 列(hf acceptance)。驗 G1 masked forward
+# 的 GPU 路徑(softmax-after-topk on masked logits)。正式 run = t1_gptoss_randmask。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: random_mask
+  args: {seed: 0, num_keep: 4}
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 128
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output: {label: g0_gptoss_randmask_smoke, dir: output/g0_gptoss_randmask_smoke}

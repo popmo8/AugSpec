@@ -1,0 +1,13 @@
+# SpecMoE pin ablation OFF — kept-N pinned (忠實 SpecMoE). b=0.2. qpc=1, mnt=64.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+draft:
+  name: specmoe
+  args: {N: 16, route_top_k: 8, pin: true}
+run: {T: 5, questions_per_cat: 1, max_new_tokens: 64}
+output: {label: specmoe_pin_on, dir: output/specmoe_pin_on}

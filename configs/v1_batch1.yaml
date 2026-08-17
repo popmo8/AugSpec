@@ -1,0 +1,6 @@
+# V1 等價驗收 — batch loop B=1，其餘與 v1_legacy 完全相同。
+model: {id: Qwen/Qwen3-30B-A3B-Base, dtype: bfloat16, device_map: auto}
+draft: {name: topm_count, args: {M: 32, K: 16, draft_top_k: 8}}
+run: {T: 5, questions_per_cat: 2, max_new_tokens: 64, humaneval: true, mt_bench_pooled: true,
+      batch_loop: true, batch_size: 1}
+output: {label: v1_batch1, dir: output/v1_batch1}

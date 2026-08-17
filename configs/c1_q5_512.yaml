@@ -1,0 +1,27 @@
+# C1 規模驗證 — cache mode(uniform)qpc=5 / mnt=512 / skip mt_bench。
+# 對照組:(a) q15_freqslice_r1–r3(qpc=15,同 uniform 軸,AccR 參考);
+# (b) q5_512_boot_on(freq 軸,同 stack,TPS/draft_fetch 參考)。
+# 驗收:AccR 同量級、singleton_verify_hit > 0、merged_cache hit rate 上報、
+# legacy-fallback ≈ 0、assert/starvation 零觸發。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+cluster:
+  name: freq_slice
+  within_weight: uniform
+run:
+  T: 5
+  questions_per_cat: 5
+  max_new_tokens: 512
+  prefill_warmup: true
+  skip_categories: [mt_bench]
+output: {label: c1_q5_512, dir: output/c1_q5_512}

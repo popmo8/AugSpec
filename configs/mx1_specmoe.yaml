@@ -1,0 +1,27 @@
+# mx1 series (2026-07-20): Mixtral-8x7B Table-1 rows under the m1 protocol —
+# T=3, questions_per_cat=all (560 q), mnt=512, B=1, HF BACKEND ONLY
+# (Mixtral has no offload port, baseline_tables_plan.md S3).
+# Budget: 12.5% of 8 experts -> 1 draft-side expert per layer (8->1).
+# Prune/SpecMoE: kept-mask N=1 (8->1), native top-2 routing in both phases.
+# pin/early_pin are offload-only knobs — inert on hf (mirrors m1_specmoe).
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: specmoe
+  args:
+    N: 1
+    route_top_k: 2
+    pin: true
+  early_pin: 1
+run:
+  T: 3
+  questions_per_cat: all
+  max_new_tokens: 512
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: mx1_specmoe
+  dir: output/mx1_specmoe

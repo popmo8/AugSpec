@@ -1,0 +1,37 @@
+# RAG@B=16 input/output sweep (2026-07-25): in=512 out=128, base=specmoe_t5_q16b16.yaml
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merged_backend: dispatch
+draft:
+  name: specmoe
+  args:
+    N: 16
+    route_top_k: 8
+    pin: true
+  early_pin: 1
+run:
+  T: 5
+  questions_per_cat: 16
+  max_new_tokens: 128
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+  batch_loop: true
+  batch_size: 16
+  batch_by_category: true
+  skip_categories:
+  - mt_bench
+  - translation
+  - summarization
+  - qa
+  - math_reasoning
+  - humaneval
+  prompt_token_cap: 512
+output:
+  label: ragsweep_sm_i512_o128
+  dir: output/ragsweep_sm_i512_o128

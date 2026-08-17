@@ -1,0 +1,82 @@
+% ==========================================================================
+% MergeSpec method subsection: "Merge-Aware System Optimization"
+% (2026-07-06 REWRITE: the former "Reconstructive Fetching" material was
+% removed entirely; this file now holds the system-optimization subsection.
+% File name kept so existing \input lines continue to work.)
+%
+% Insert AFTER \subsection{Relation-Guided Cluster-and-Merge}
+% (paper/method_relation_merge.tex).
+%
+% Notation inherited from the draft and method_relation_merge.tex:
+% layer $\ell$, merged $\widehat{\mathbf{W}}_{\ell,j}$ (Eq. 9), groups
+% $\mathcal{C}_{\ell,j}$, budget $K$, candidates $\mathcal{M}_\ell$,
+% co-occurrence map $\mathbf{C}_{\ell}$, cycle $s$. No new symbols and
+% no new equations: this subsection is descriptive system design; a
+% schematic figure (TODO: \ref to the hierarchy+pipeline figure) will
+% carry the mechanics.
+%
+% Length target: 0.5--0.75 column-page.
+% ==========================================================================
+
+\subsection{Merge-Aware System Optimization}
+
+The draft path of MergeSpec is rebuilt every cycle, so its cost must be
+kept off the serving critical path. MergeSpec achieves this with two
+system-level mechanisms: a memory hierarchy that decides \emph{where}
+merged experts live, and a pipelining schedule that decides \emph{when}
+they are built.
+
+\paragraph{Merged-expert memory hierarchy.}
+Under uniform coefficients, a merged expert is determined by its member
+set alone: $\widehat{\mathbf{W}}_{\ell,j}$ in Eq.~(9) depends on
+$\mathcal{C}_{\ell,j}$ but not on the request, the decoding step, or any
+routing statistics. Merged experts are therefore content addressable,
+and MergeSpec organises them in a two-level hierarchy. The GPU level is
+a merged-expert cache: the $K$ resident draft slots at each layer hold
+the most recently built merged experts, so the cache lives inside the
+draft memory budget of Eq.~(3) and adds nothing to it. The CPU level is
+the backing store: it keeps the complete original expert weights, from
+which any merged expert can be rebuilt. When the partition at cycle $s$
+requests the merged expert of a group, MergeSpec first probes the GPU
+cache; a hit returns the slot as is and elides both the member transfers
+and the merge. On a miss, the absent members are fetched from CPU
+memory and combined on GPU by Eq.~(9), at the cost of one transfer per
+absent member.
+
+Cache slots are scarce, so retention follows the probability that a
+cached pair is requested again. When the partition changes, MergeSpec
+protects first the slots whose two members both remain among the
+current candidates $\mathcal{M}_{\ell}$, since the grouping step is
+likely to reproduce exactly these pairs, and ranks the remaining slots
+by their co-occurrence score; the lowest-ranked slots are evicted.
+Both criteria are read directly from state the draft already
+maintains. The co-occurrence map thus serves double duty: it guides
+which experts merge through Eq.~(8), and it predicts which merged
+experts stay useful, so a partition aligned with the temporal locality
+of routing converts directly into cache hits and elided merge work.
+
+\paragraph{Fetch-Overlapped Merge Pipelining.}
+The second mechanism exploits the fact that CPU--GPU transfers and GPU
+computation run on independent engines. In offloaded verification, each
+layer must fetch its absent routed experts and execute them. Reading an
+expert over the interconnect is one to two orders of magnitude slower
+than running it over the speculative window and folding it into a
+merge, both of which stream the same weights through GPU memory
+bandwidth. Verification is therefore transfer-bound, and the compute
+engine is idle for most of each layer. MergeSpec fills this idle time
+by scheduling the order in which the layer's experts are served instead
+of leaving it arbitrary. Experts that belong to a next-draft group and
+are absent from the merged-expert cache are fetched first. Each such
+expert enters verification inference as soon as it arrives, and a group
+is merged immediately once its last member has been executed, while the
+remaining experts of the layer continue streaming behind it. Because
+compute is far faster than transfer, the inference and merge work of
+the early-scheduled experts completes well before the tail of the
+transfer stream, so by the time the layer's last expert arrives, every
+merged expert needed by the next draft cycle is already built. Merge
+construction and the residual fetches thus hide entirely behind the
+transfer bottleneck that offloaded verification must pay anyway, and
+the draft phase starts immediately after verification ends. Both
+mechanisms leave the draft weights unchanged, so acceptance is
+untouched; their effect is purely to remove merge construction from the
+critical path.

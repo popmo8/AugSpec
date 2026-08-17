@@ -1,0 +1,29 @@
+# dsm series (2026-07-21): DeepSeek-MoE-16B candidate eval (base vs chat) on
+# Ours / SpecMoE — picks the model that replaces GPT-OSS in Table 1.
+# m1-style protocol at qpc=15: T=3, mnt=512, B=1, humaneval, mt_bench_pooled.
+# HF BACKEND (trust_remote_code, cli default true). Budget: 12.5% of 64
+# routed experts -> 8 (shared experts are dense weights, outside the budget,
+# active in both phases for every method).
+# SpecMoE: kept-mask N=8 (64->8), native top-6 routing in both phases.
+# pin/early_pin are offload-only knobs - inert on hf (mirrors m1_specmoe).
+model:
+  id: deepseek-ai/deepseek-moe-16b-base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: specmoe
+  args:
+    N: 8
+    route_top_k: 6
+    pin: true
+  early_pin: 1
+run:
+  T: 3
+  questions_per_cat: 15
+  max_new_tokens: 512
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: dsm_base_specmoe
+  dir: output/dsm_base_specmoe

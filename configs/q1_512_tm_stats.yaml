@@ -1,0 +1,19 @@
+# Diagnostic run: q_per_cat=1, mnt=512, no_overload ON, within-cluster merge =
+# FREQUENCY (non-uniform — the AUG_CLUSTER_UNIFORM=0 / default case). Same model
+# + draft as q5_512_tm_on.yaml; only questions_per_cat drops to 1. Run with
+# AUG_DUMP_CLUSTER_WEIGHTS=<path> to dump per-cluster within-cluster weights so
+# we can quantify how far the non-uniform weights spread vs the uniform 1/|g|.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+run: {T: 5, questions_per_cat: 1, max_new_tokens: 512}
+output: {label: q1_512_tm_stats, dir: output/q1_512_tm_stats}

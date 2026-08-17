@@ -1,0 +1,21 @@
+# q5, mnt=512. Random cluster partition + uniform within-cluster weighting.
+# Exercises the new clustering.random method (A3 registry) and within_weight:
+# uniform (A4). Same model/draft/budget as q5_512_tm_on.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+    no_overload: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+cluster:
+  name: random
+  within_weight: uniform
+run: {T: 5, questions_per_cat: 5, max_new_tokens: 512}
+output: {label: q5_512_tm_rand_uniform, dir: output/q5_512_tm_rand_uniform}

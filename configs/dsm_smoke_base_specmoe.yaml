@@ -1,0 +1,24 @@
+# hf-backend smoke for the dsm run (first-ever deepseek-family run) - qpc=1, mnt=64.
+# SpecMoE: kept-mask N=8 (64->8), native top-6 routing in both phases.
+# pin/early_pin are offload-only knobs - inert on hf (mirrors m1_specmoe).
+model:
+  id: deepseek-ai/deepseek-moe-16b-base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: specmoe
+  args:
+    N: 8
+    route_top_k: 6
+    pin: true
+  early_pin: 1
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: dsm_smoke_base_specmoe
+  dir: output/dsm_smoke_base_specmoe

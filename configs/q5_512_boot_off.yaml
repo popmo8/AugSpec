@@ -1,0 +1,24 @@
+# C-BOOT 規模驗證 B — 同 q5_512_boot_on 但 prefill_warmup OFF(舊 fallback
+# 語意;stack 上仍含 C-DEL)。作為 on 的對照組。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+cluster:
+  name: freq_slice
+  within_weight: freq
+run:
+  T: 5
+  questions_per_cat: 5
+  max_new_tokens: 512
+  prefill_warmup: false
+  skip_categories: [mt_bench]
+output: {label: q5_512_boot_off, dir: output/q5_512_boot_off}

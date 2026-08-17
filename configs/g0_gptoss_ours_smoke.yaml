@@ -1,0 +1,24 @@
+# G0 smoke — GPT-OSS 20B「Ours」列(hf backend, acceptance only)。
+# 驗:hybrid act-sim 的 hf 捕捉路徑有生效(看 INFO,防靜默退化)、multi 路由、AccR 合理。
+# cluster = hybrid a75(K1 決策:與 Qwen3 Ours 同方法定義,沿 t1_qwen3_ours)。
+# 依賴 Step 0.5(hf act-sim 捕捉)落地後才可送。正式 run = t1_gptoss_ours.yaml(qpc=15)。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: topm_count
+  args: {M: 8, K: 4, draft_top_k: 4, record_history: false}
+cluster:
+  name: hybrid
+  alpha: 0.75
+  metric: l2
+  norm: rank
+  cooccur_norm: raw
+  cooccur_scope: decode
+  within_weight: uniform
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 128
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output: {label: g0_gptoss_ours_smoke, dir: output/g0_gptoss_ours_smoke}

@@ -1,0 +1,50 @@
+% ==========================================================================
+% Main comparison: acceptance rate + throughput across Spec-Bench subtasks.
+%
+% Data provenance (do not edit numbers by hand):
+%   runs   : output/q15_{specmoe,random,freqslice,actsim_l2,cooccur,
+%            hybrid_a100,hybrid_a75}_r{1,2,3}
+%   jobs   : q15 sweep (2026-07-04) + 252905-252909 (hybrid, 2026-07-04)
+%   config : Qwen3-30B-A3B-Base, offload backend, vram_budget_ratio 0.2,
+%            merge_during_verify, no_overload, K=16 cluster-merge,
+%            within_weight=uniform, T=5, max_new_tokens=512, 15 q/cat,
+%            Spec-Bench minus MT-Bench. act-sim: metric=l2; co-occur: raw
+%            counts; hybrid: metric=l2 + raw co-occur, blend lambda (Eq. blend).
+%   values : mean over the 3 repeats of overall_summary.csv :: overall
+%            acceptance_rate / tokens_per_second (analyze_q15.py conventions).
+%   NOTE: single-request runs (batch size 1). If the caption's "batch size"
+%         clause is kept, it must match the actual measurement.
+%
+% Requires \usepackage{booktabs,multirow}.
+% ==========================================================================
+
+\begin{table*}[t]
+\centering
+\caption{Acceptance rate ($T=5$) and end-to-end throughput (tokens/sec) on Spec-Bench across five subtasks for Qwen3-30B-A3B ($128\rightarrow16$, $K=16$ cluster-merge, uniform within-group coefficients). Throughput is measured on the same CPU-offloading backend with \emph{no} target-side expert cache. \textsc{act-sim} uses the $L_2$ output metric; \textsc{co-occur} uses raw counts; \textsc{hybrid} blends the two by $\lambda$ (Eq.~\eqref{eq:blend}). Higher is better. Best result per task within each metric in \textbf{bold}.}
+\label{tab:acc_tps}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{l l c c c c c c}
+\toprule
+\textbf{Metric} & \textbf{Method} & Translation & Summ. & QA & Math & RAG & \textbf{Overall} \\
+\midrule
+\multirow{7}{*}{Acceptance Rate}
+  & SpecMoE                & 0.6845 & 0.4698 & 0.3957 & 0.3538 & 0.4827 & 0.4771 \\
+  & random                 & 0.8196 & 0.7244 & \textbf{0.6467} & 0.4866 & 0.7266 & 0.6879 \\
+  & freq                   & 0.8133 & 0.7537 & 0.6278 & \textbf{0.5061} & \textbf{0.7569} & 0.7064 \\
+  & act-sim                & \textbf{0.8438} & 0.7584 & 0.6012 & 0.5050 & 0.7454 & \textbf{0.7066} \\
+  & co-occur               & 0.7026 & 0.7193 & 0.5454 & 0.4241 & 0.6987 & 0.6367 \\
+  & hybrid ($\lambda{=}1.0$)  & 0.8345 & 0.7439 & 0.5756 & 0.4365 & 0.6765 & 0.6635 \\
+  & hybrid ($\lambda{=}0.75$) & 0.7906 & \textbf{0.7659} & 0.5091 & 0.3827 & 0.7470 & 0.6608 \\
+\midrule
+\multirow{7}{*}{Tokens/sec}
+  & SpecMoE                & 4.0179 & 3.3424 & 2.7982 & 2.7066 & 3.4226 & 3.2575 \\
+  & random                 & 4.4301 & 4.5507 & \textbf{3.6603} & 3.3157 & \textbf{4.6609} & \textbf{4.1235} \\
+  & freq                   & 4.2801 & \textbf{4.6647} & 3.5836 & \textbf{3.3850} & 4.6562 & 4.1139 \\
+  & act-sim                & 4.1641 & 3.9679 & 3.1781 & 2.9529 & 3.8544 & 3.6235 \\
+  & co-occur               & 4.0461 & 4.3901 & 3.2266 & 3.1415 & 4.4676 & 3.8544 \\
+  & hybrid ($\lambda{=}1.0$)  & \textbf{4.7089} & 4.4171 & 3.4115 & 2.9180 & 4.2192 & 3.9350 \\
+  & hybrid ($\lambda{=}0.75$) & 4.4380 & 4.6005 & 3.0974 & 2.9082 & 4.5040 & 3.9096 \\
+\bottomrule
+\end{tabular}
+\end{table*}

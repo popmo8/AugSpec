@@ -1,0 +1,20 @@
+# hf-backend smoke for the mx1 (Mixtral Table-1) run — qpc=1, mnt=64.
+# Prune/Draft&Verify: auto mode — resolves 12.5% budget (4/32 MoE sublayers)
+# and reads output/draft_verify/Mixtral-8x7B-v0.1_L4.json (BO search via
+# scripts/run_search_dv.sh; missing file would trigger the in-run search).
+model:
+  id: mistralai/Mixtral-8x7B-v0.1
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: draft_verify
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: mx1_smoke_dv
+  dir: output/mx1_smoke_dv

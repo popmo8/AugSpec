@@ -1,0 +1,30 @@
+======================================================================
+M9a (v2) — 五個基礎時間量測
+  model=Qwen/Qwen3-30B-A3B  ratio=0.2  M=2
+======================================================================
+  MoE layers=48  hidden=2048  expert_size=9.44 MB  total experts=128  M=2
+
+[量測中] T_cpu_merge ...
+[量測中] 上傳 M 顆 expert 到 GPU (用於 GPU merge 計時，不計入結果) ...
+[量測中] T_gpu_merge ...
+[量測中] T_pcie ...
+[量測中] T_expert_fwd ...
+[量測中] T_layer_fwd (10 full-model forwards) ...
+
+======================================================================
+結果 (median,  n_tokens=5,  M=2):
+
+  1. T_expert_fwd  單顆 expert forward        (GPU)  :    0.069 ms
+  2. T_layer_fwd   整個 MoE block forward     (GPU)  :     8.12 ms
+  3. T_cpu_merge   CPU merge ( 2 experts → 1)  (CPU)  :     2.21 ms
+  4. T_gpu_merge   GPU merge ( 2 experts → 1)  (GPU)  :     0.12 ms
+  5. T_pcie        單顆 expert H2D (9.4 MB)    :    0.753 ms  (12.5 GB/s)
+
+比值分析:
+  T_cpu_merge / T_layer_fwd  = 2.21 / 8.12 = 0.27  → 可藏進單層 ✓
+  T_gpu_merge / T_layer_fwd  = 0.12 / 8.12 = 0.02
+  T_pcie / T_layer_fwd       = 0.753 / 8.12 = 0.093  (單顆 expert 上傳 vs 一層 forward)
+  T_pcie × M / T_layer_fwd   = 1.51 / 8.12 = 0.19  (M 顆 expert 上傳 vs 一層 forward)
+
+  GPU used (ratio=0.2) : 24.3 GB
+======================================================================

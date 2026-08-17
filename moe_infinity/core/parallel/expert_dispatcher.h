@@ -6,10 +6,19 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <list>
+#include <optional>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -40,7 +49,6 @@ class ExpertDispatcher : public base::noncopyable {
     ExpertNodePtr expert_node = nullptr;
     int out_gpu_id = -1;
     torch::ScalarType out_dtype = torch::kFloat32;
-    bool evict = false;
     bool hit = false;
   } ExecArgs;
   typedef std::tuple<torch::Tensor, int, int, int> CallResult;
@@ -50,6 +58,11 @@ class ExpertDispatcher : public base::noncopyable {
                             int expert_type, int num_threads = 1);
   ~ExpertDispatcher() {
     main_thread_stop_flag_.store(true);
+    if (merge_thread_started_.load()) {
+      std::shared_ptr<MergeJob> sentinel;   // Push 只收 lvalue
+      merge_ready_.Push(sentinel);          // nullptr → MergeThreadFunc exits
+      if (merge_thread_.joinable()) merge_thread_.join();
+    }
     for (auto& thread : threads_) {
       thread->join();
     }
@@ -84,6 +97,125 @@ class ExpertDispatcher : public base::noncopyable {
   std::vector<CallResult> WaitExpert() { return Wait(); }
   torch::Tensor WaitHiddenStates();
 
+  // aug_spec / M9b: read-only access to an expert's GPU-resident weight
+  // tensors (the ones a recent verify fetched). Returns the weight tensors
+  // (gate_proj, up_proj, down_proj order for Qwen3) only when the expert is
+  // currently resident on `gpu_id`; returns an empty vector otherwise so the
+  // Python caller can detect a miss. Must be called in a dispatch-quiescent
+  // window (between wait_expert and the next dispatch) — the background fetch
+  // thread is then idle on an empty input queue, so no eviction races.
+  std::vector<torch::Tensor> GetResidentExpertWeights(int layer_idx,
+                                                      int expert_idx,
+                                                      int gpu_id);
+
+  // aug_spec / M9b: weighted merge of `expert_ids` (with `weights`) on layer
+  // `layer_idx` into a single dense expert, returned as {gate_proj, up_proj,
+  // down_proj} GPU tensors in the model weight dtype, fp32-accumulated.
+  // GPU-resident sources (a recent verify fetched them) are read in place with
+  // zero PCIe; non-resident sources are copied host->GPU transiently just for
+  // this merge and freed on return — the dispatcher cache is never mutated, so
+  // no eviction bookkeeping / races. Accumulation order follows `expert_ids`
+  // (caller passes ascending nonzero indices to mirror the CPU-merge order).
+  std::vector<torch::Tensor> MergeExpertsLocal(
+      int layer_idx, const std::vector<int>& expert_ids,
+      const std::vector<double>& weights, int gpu_id);
+
+  // ── merged-expert slots (merged_cache_plan.md C0) ─────────────────────────
+  // Persistent per-(layer, slot) GPU buffers for merged draft experts. They
+  // are TORCH-allocator memory inside the slot budget the cli carves out of
+  // `usable` at load (pool = usable − S×L×expert) — they must NEVER touch the
+  // archer ledger (cache_sizes_): ghost debits there drained the ledger and
+  // live-locked the fetch thread (2026-07-10). Reclaim = DISCARD (buffers
+  // freed; content reconstructible by re-merge — no host backing).
+  // Python owns ALL policy (which member set lives in which slot, retention,
+  // pin choice); C++ only stores, merges-into, pins and discards. Concurrency
+  // convention as the merge/read APIs above: Python calls dispatch-quiescent;
+  // the fetch thread touches slots only via the two-tier reclaim while a
+  // dispatch is in flight. Zero slots until InitMergedSlots → existing runs
+  // are byte-for-byte unaffected.
+  void InitMergedSlots(int num_layers, int slots_per_layer);
+  bool MergeExpertsToSlot(int layer_idx, int slot_idx,
+                          const std::vector<int>& expert_ids,
+                          const std::vector<double>& weights, int gpu_id);
+  std::vector<torch::Tensor> GetMergedSlot(int layer_idx, int slot_idx,
+                                           int gpu_id);   // empty = probe miss
+  void SetMergedSlotPinned(int layer_idx, const std::vector<int>& slot_ids,
+                           int gpu_id);
+
+  // ── C3 merge-job pipeline (c3_pipeline_plan.md D1) ────────────────────
+  // Submit this layer's miss-group merges BEFORE dispatch. Parallel arrays:
+  // one job per index. `routed` = experts this verify pass will fetch/compute;
+  // a non-resident member NOT in `routed` never arrives → the job does not
+  // gate on it (read H2D from the host copy at exec instead). Jobs whose
+  // routed members are all resident go straight to the merge thread; the rest
+  // fire when their last routed member lands (NotifyExpertArrived).
+  bool SubmitMergeJobs(int layer_idx, const std::vector<int>& slots,
+                       const std::vector<std::vector<int>>& members,
+                       const std::vector<std::vector<double>>& weights,
+                       const std::vector<int>& routed);
+  // Block until every submitted job has run AND its kernels completed.
+  // timeout → forensic dump + fatal (no degraded mode). The only drain point:
+  // draft start / question boundary.
+  void WaitMergesDone(double timeout_s);   // replaces the layer's slot pins
+
+  // aug_spec: run K merged dense draft experts through the SAME MoEMLP::forward
+  // kernel the archer dispatch uses, so the merged-expert draft and the SpecMoE
+  // (substitute) draft share one expert-execution engine — the comparison then
+  // isolates the algorithm, not the kernel. `merged` holds K experts, each a
+  // {gate, up, down} GPU-tensor list in tensor-id order (as MergeExpertsLocal
+  // returns). `weight` is [T, K]: token t routes to cluster k with this combine
+  // weight (0 = not selected). Synchronous (merged are resident, no fetch); the
+  // archer worker threads are idle during the draft so modules_[gpu_id] is free.
+  torch::Tensor DispatchMergedLocal(
+      torch::Tensor hidden_states, torch::Tensor weight,
+      const std::vector<std::vector<torch::Tensor>>& merged, int gpu_id);
+
+  // aug_spec v1: batched bmm over a set of resident experts (topm merged or
+  // specmoe pinned kept-N) — unifies the resident-expert draft compute inside
+  // the engine. Weights arrive PRE-STACKED (Python memoises the stack once per
+  // cycle, so there is no per-call re-stack): gw/uw are [E, D, I], dw is
+  // [E, I, D]; `weight` is [T, E] routing (0 = not selected). The op sequence is
+  // identical to the Python torch.bmm path, so results match bit-for-bit. (v2
+  // will swap the body for a CUTLASS grouped GEMM behind this same signature.)
+  torch::Tensor DispatchBmm(torch::Tensor hidden, torch::Tensor gw,
+                            torch::Tensor uw, torch::Tensor dw,
+                            torch::Tensor weight, int gpu_id);
+
+  // aug_spec profiling (AUG_PROFILE=1; zero cost otherwise). SetProfilePhase
+  // tags fetches as verify(0) / draft(1) so SpecMoE's draft re-fetches are
+  // separable. DumpProfile returns cumulative counters (times in µs); used to
+  // see where each cycle spends time and what serialises vs overlaps.
+  void SetProfilePhase(int phase);
+  std::map<std::string, int64_t> DumpProfile();
+  void ResetProfile();
+
+  // aug_spec / verify_merge_plan.md P1: evict every GPU-resident expert on
+  // `gpu_id` back to host and reset the sparse-cache budget to full. Cheap —
+  // the host copies are the offload source, so this just frees the GPU mirrors
+  // (no D2H). Called at draft start (the merged-dense draft never touches the
+  // archer cache, so it is idle) to make the budget room phase-exclusive with
+  // the merged experts (§1.4). Must be called dispatch-quiescent (between
+  // verify and draft), like the read/merge methods above.
+  void FlushCache(int gpu_id);
+
+  // aug_spec / specmoe_pin_plan.md: mark layer `layer_idx`'s `expert_ids` as
+  // pinned (the SpecMoE kept-N draft set) so FindExpertEvict never evicts them.
+  // SetPinned replaces the whole pinned set for that layer; ClearPinned drops
+  // all pins (the experts then evict normally). The kept-N get cached by the
+  // draft's own dispatch (batch_size==1 → FindExpertEvict path, which now skips
+  // pinned to make room from the non-pinned verify experts). Quiescent-window
+  // calls (refresh, between verify and draft).
+  void SetPinned(int layer_idx, const std::vector<int>& expert_ids, int gpu_id);
+  void ClearPinned(int gpu_id);
+
+  // aug_spec activation_similarity: when capture is on, OutputFunc stashes each
+  // expert's RAW (pre-weight) output + its token indices, so the draft can
+  // compute per-token pairwise output-cosine. get_captured returns + clears the
+  // per-forward buffer (call after wait_dispatch_local). No cost when off.
+  void SetCaptureExpertOut(bool on) { capture_expert_out_ = on; }
+  std::vector<std::tuple<int64_t, int64_t, torch::Tensor, torch::Tensor>>
+  GetCapturedExpertOutputs();
+
  private:
   void Enqueue(CallArgs& args);
   std::vector<CallResult> Wait();
@@ -97,7 +229,11 @@ class ExpertDispatcher : public base::noncopyable {
   void OutputFunc(ExecArgs args, torch::Tensor output, torch::Tensor token_mask,
                   int gpu_id);
 
-  ExpertNodePtr FindExpertEvict(int gpu_id);
+  ExpertNodePtr FindExpertEvict(int gpu_id, bool* all_pinned = nullptr);
+  // Shared fp32 accumulation body of MergeExpertsLocal / MergeExpertsToSlot.
+  std::vector<torch::Tensor> MergeAccumulate(
+      int layer_idx, const std::vector<int>& expert_ids,
+      const std::vector<double>& weights, const torch::Device& device);
 
  private:
   std::vector<std::unique_ptr<base::Thread>> threads_;
@@ -130,11 +266,8 @@ class ExpertDispatcher : public base::noncopyable {
 
   std::mutex output_mutex_;
   // std::mutex exec_mutex_;
-  // std::mutex gpu_overload_mutex_;
 
   std::vector<cudaStream_t> exec_streams_;
-
-  std::vector<bool> gpu_overload_;
 
   torch::Tensor hidden_states_;
   torch::Tensor final_hidden_states_;
@@ -143,10 +276,83 @@ class ExpertDispatcher : public base::noncopyable {
 
   std::vector<int64_t> cache_sizes_;
   std::vector<std::unordered_set<uint64_t>> cached_experts_;
+  std::vector<std::unordered_set<uint64_t>> pinned_;   // specmoe kept-N (no evict)
+  // Merged-expert slot table [layer][slot] (merged_cache_plan.md C0). Sized by
+  // InitMergedSlots; empty by default. See the public API block for semantics.
+  struct MergedSlot {
+    // Persistent GPU buffers, pre-allocated at InitMergedSlots (D0,
+    // c3_pipeline_plan.md): handles are valid BEFORE content is written —
+    // required by the plan-ahead emit (D2). Content is overwritten in place
+    // by merges; there is no discard path.
+    std::vector<torch::Tensor> tensors;
+    int64_t byte_size = 0;
+    bool pinned = false;   // draft working set / protected history (no evict)
+  };
+  std::vector<std::vector<MergedSlot>> merged_slots_;
+  // Per-GPU in-flight exec count (pop -> OutputFunc returned). Part of the
+  // pinned-starvation guard in GPUFetchFunc: all-pinned cache + drained exec
+  // pipeline = provable deadlock (remove_overload_plan.md §5).
+  std::vector<std::atomic<int64_t>> exec_active_;
 
   int cache_capacity_ = 0;
 
+  // ── C3 merge-job pipeline state (guarded by merge_mu_) ────────────────
+  struct MergeJob {
+    int layer = 0;
+    int slot = 0;
+    std::vector<int> experts;
+    std::vector<double> weights;
+    int missing = 0;          // routed members not yet resident
+    int64_t submit_us = 0;
+  };
+  std::mutex merge_mu_;
+  std::condition_variable merge_cv_;
+  std::unordered_map<uint64_t, std::vector<std::shared_ptr<MergeJob>>>
+      merge_watch_;           // (layer,expert) → jobs gated on its arrival
+  ThreadSafeQueue<std::shared_ptr<MergeJob>> merge_ready_;
+  std::atomic<int64_t> merge_pending_{0};
+  std::atomic<bool> merge_thread_started_{false};
+  std::thread merge_thread_;
+  std::optional<c10::cuda::CUDAStream> merge_stream_;
+  void MergeThreadFunc();
+  void ExecMergeJob(const std::shared_ptr<MergeJob>& job);
+  // Fetch-thread hook: fires gated jobs whose last routed member landed.
+  void NotifyExpertArrived(int64_t layer_idx, int64_t expert_idx);
+
   std::vector<MoEMLP*> modules_;
+
+  // aug_spec profiling counters (times in µs, all atomic — touched by the
+  // fetch/exec worker threads and the main dispatch thread).
+  struct ProfileCounters {
+    std::atomic<int64_t> verify_fetch_n{0}, verify_fetch_us{0},
+        verify_fetch_bytes{0};
+    std::atomic<int64_t> draft_fetch_n{0}, draft_fetch_us{0},
+        draft_fetch_bytes{0};
+    std::atomic<int64_t> evict_n{0}, evict_us{0};
+    // singleton_verify_hit (merged_cache_plan.md §4.3): verify-phase requests
+    // served by a resident PINNED expert — the draft working-set pin elided a
+    // verify fetch (dual identity). Also counts specmoe's pinned kept-N hits.
+    std::atomic<int64_t> pinned_hit_n{0}, pinned_hit_bytes{0};
+    std::atomic<int64_t> enqueue_wait_n{0}, enqueue_wait_us{0};
+    std::atomic<int64_t> forward_n{0}, forward_us{0};
+    std::atomic<int64_t> merge_n{0}, merge_us{0};
+    std::atomic<int64_t> dispatch_n{0}, dispatch_us{0};
+    // C3 pipeline (c3_pipeline_plan.md §4.3): job counts, arrival-gate wait,
+    // cold member H2D bytes read inside jobs, and the drain wait at draft
+    // start — drain_wait≈0 is the C3 KPI (merge fully hidden by verify).
+    std::atomic<int64_t> mg_jobs_n{0}, mg_gated_n{0}, mg_gate_wait_us{0};
+    std::atomic<int64_t> mg_cold_bytes{0};
+    std::atomic<int64_t> drain_n{0}, drain_wait_us{0};
+  };
+  ProfileCounters prof_;
+  std::atomic<int> profile_phase_{0};   // 0 = verify, 1 = draft
+  bool profile_enabled_ = false;
+
+  // aug_spec activation_similarity capture (see SetCaptureExpertOut).
+  bool capture_expert_out_ = false;
+  std::mutex capture_mutex_;
+  std::vector<std::tuple<int64_t, int64_t, torch::Tensor, torch::Tensor>>
+      captured_outputs_;
 };
 
 #define SET_TENSORS_AND_MODULE_FROM_BLOB(cls, module, node, device, \

@@ -1,0 +1,18 @@
+# C-BOOT 診斷 — hf backend,prefill_warmup OFF(對照組,舊 fallback 行為)。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: hf
+  dtype: bfloat16
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+cluster:
+  name: freq_slice
+  within_weight: freq
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 64
+  prefill_warmup: false
+  skip_categories: [mt_bench]
+output: {label: cboot_hf_off, dir: output/cboot_hf_off}

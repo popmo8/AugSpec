@@ -96,6 +96,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       //  .def("wait_expert", &ExpertDispatcher::WaitExpert)
       .def("wait_expert", &ExpertDispatcher::WaitHiddenStates)
       .def("notify_fetch_start", &ExpertDispatcher::NotifyFetchStart)
+      .def("get_resident_expert_weights",
+           &ExpertDispatcher::GetResidentExpertWeights)
+      .def("merge_experts_local", &ExpertDispatcher::MergeExpertsLocal)
+      .def("init_merged_slots", &ExpertDispatcher::InitMergedSlots)
+      .def("merge_experts_to_slot", &ExpertDispatcher::MergeExpertsToSlot)
+      .def("get_merged_slot", &ExpertDispatcher::GetMergedSlot)
+      .def("set_merged_slot_pinned", &ExpertDispatcher::SetMergedSlotPinned)
+      .def("submit_merge_jobs", &ExpertDispatcher::SubmitMergeJobs)
+      .def("wait_merges_done", &ExpertDispatcher::WaitMergesDone)
+      .def("dispatch_merged_local", &ExpertDispatcher::DispatchMergedLocal)
+      .def("dispatch_bmm", &ExpertDispatcher::DispatchBmm)
+      .def("set_profile_phase", &ExpertDispatcher::SetProfilePhase)
+      .def("dump_profile", &ExpertDispatcher::DumpProfile)
+      .def("reset_profile", &ExpertDispatcher::ResetProfile)
+      .def("flush_cache", &ExpertDispatcher::FlushCache)
+      .def("set_pinned", &ExpertDispatcher::SetPinned)
+      .def("clear_pinned", &ExpertDispatcher::ClearPinned)
+      .def("set_capture_expert_out", &ExpertDispatcher::SetCaptureExpertOut)
+      .def("get_captured_expert_outputs",
+           &ExpertDispatcher::GetCapturedExpertOutputs)
       .def("clear_expert_cache_counts",
            &ExpertDispatcher::ClearExpertCacheCounts);
 }

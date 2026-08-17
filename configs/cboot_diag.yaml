@@ -1,0 +1,25 @@
+# C-BOOT 診斷 — 同 cboot_tm_on(warmup on,AccR 崩潰重現)+ emit_tokens_csv,
+# 供 token 級移位分析(draft[i] vs real[i±1])。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+draft:
+  name: topm_count
+  args: {M: 32, K: 16, draft_top_k: 8, record_history: false}
+cluster:
+  name: freq_slice
+  within_weight: freq
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 64
+  prefill_warmup: true
+  skip_categories: [mt_bench]
+  emit_tokens_csv: true
+output: {label: cboot_diag, dir: output/cboot_diag}

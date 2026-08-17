@@ -1,0 +1,18 @@
+# moe_precache smoke — B=4 (batch_spec path): pooled prefill counts across the
+# batch, explicit pin() after the prefill loop, per-batch reset. Correctness.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+draft:
+  name: moe_precache
+  args:
+    pin_fraction: 0.10
+run:
+  questions_per_cat: 1
+  max_new_tokens: 32
+  batch_loop: true
+  batch_size: 4
+output: {label: precache_smoke_b4, dir: output/precache_smoke_b4}

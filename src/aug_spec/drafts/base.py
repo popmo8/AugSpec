@@ -20,15 +20,40 @@ The Controller calls these in this order per question:
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
+
+from aug_spec.clustering import ClusterContext, ClusterMethod, get_cluster_method
+from aug_spec.merging import linear_merge
 
 
 class DraftStrategy:
     """Abstract draft strategy. Override only what you need."""
 
     cache_kind: str = "averaged"  # or "masked" / "substitute"
+
+    # --- class-level "what kind of draft am I" facts (consumed by cli.py) ----
+    # Kept as class attributes (not hardcoded name lists in cli.py) so a new
+    # draft declares its own behaviour and cli never needs editing (A1).
+    #
+    # holds_merged_residency: caches a merged dense expert, so the offload-merge
+    #   engine must reserve its VRAM out of the budget. True for the
+    #   ScoreBasedAvgDraft family and UniformDraft; SpecMoe / random_mask hold
+    #   none.
+    # needs_count_top_k: requires the adapter's native top-k auto-filled into
+    #   draft args when absent (the CountDraft family).
+    # needs_num_experts: requires the layer's expert count auto-filled when
+    #   absent (random_mask).
+    # needs_layer_spec: consumes an offline-searched layer-keep spec; when
+    #   the YAML names neither spec_path nor an inline keep-set, cli
+    #   resolves the default spec path and, if the file is missing, runs
+    #   the search in-run (draft_verify).
+    holds_merged_residency: bool = False
+    needs_count_top_k: bool = False
+    needs_num_experts: bool = False
+    needs_layer_spec: bool = False
 
     def prepare(self, adapter, blocks) -> None:
         """One-time setup before any inference (called once by the CLI after
@@ -56,6 +81,17 @@ class DraftStrategy:
     def lazy_build(self, layer_idx: int, block, adapter):
         return None
 
+    def post_install(self, controller) -> None:
+        """Called at the end of `Controller.install()`. Drafts whose
+        mechanism reaches beyond the MoE-block forward swap (e.g. speed's
+        decoder-layer skip) install their extra hooks here. Default no-op."""
+        pass
+
+    def post_uninstall(self, controller) -> None:
+        """Mirror of `post_install`, called from `Controller.uninstall()`
+        before the MoE-block forwards are restored. Default no-op."""
+        pass
+
 
 # =========================================================================
 # Shared base: per-cycle weighted average from captured target-side scores
@@ -69,9 +105,6 @@ class ScoreBasedAvgDraft(DraftStrategy):
     `[num_experts]` fp32 tensor that gets normalised and used as
     per-expert weights for the chosen merge method.
 
-    Set `use_svd_merge=True` (and optionally `svd_rank`) to use the
-    Sub-MoE subspace merging strategy instead of naive weighted averaging.
-
     Set `K>1` to keep K merged experts per layer (a mini-MoE) instead of a
     single dense expert. Active experts are partitioned into K clusters and
     each cluster is merged independently; the draft forward then runs the
@@ -82,26 +115,72 @@ class ScoreBasedAvgDraft(DraftStrategy):
 
     cache_kind = "averaged"
 
+    # Every score-based averaged draft builds a merged dense expert, so the
+    # whole family reserves merged residency (covers count / pruned_count /
+    # topm_count / softmax / prefill* via inheritance).
+    holds_merged_residency = True
+
     # History encoding for `expert_weights_history.json`. Count-style
     # scorers produce integer-valued tensors; subclasses with continuous
     # scores override to "float". Only consulted when record_history=True.
     history_value_kind: str = "float"
 
+    @property
+    def group_cap(self) -> int:
+        """Max experts per merged group (M-sweep support, 2026-07-25):
+        ceil(M/K) for top-M drafts, floor 2 = the classic pairing. Drives
+        greedy_group's capacity and merged_cache's adopt accounting."""
+        M = getattr(self, "M", None)
+        K = getattr(self, "K", 1) or 1
+        if not M:
+            return 2
+        return max(2, -(-int(M) // int(K)))
+
     def __init__(self, record_history: bool = False,
-                 use_svd_merge: bool = False,
-                 svd_rank: int = 256,
                  K: int = 1,
-                 draft_top_k: Optional[int] = None):
+                 draft_top_k: Optional[int] = None,
+                 cluster_method: Optional[ClusterMethod] = None,
+                 within_weight: str = "freq"):
         # layer_idx → CPU fp32 tensor [num_experts]
         self.target_score: Dict[int, torch.Tensor] = {}
-        self.use_svd_merge = use_svd_merge
-        self.svd_rank = svd_rank
 
-        # layer_idx → cached SVD basis (one joint decomposition over all
-        # experts). Built lazily on first use, then reused every cycle and
-        # across questions — the expert weights are static, so this is NOT
-        # cleared by reset(). Empty unless use_svd_merge is set.
-        self._svd_basis: Dict[int, Any] = {}
+        # layer_idx → CPU fp32 [num_experts, num_experts] co-occurrence,
+        # ACCUMULATED across the whole question (prefill + decode), cleared per
+        # question in reset(). Only populated when the cluster method needs it
+        # (cluster_method.needs_cooccur); otherwise stays empty (zero overhead).
+        self.cooccur: Dict[int, torch.Tensor] = {}
+        self._cooccur_scorer = None     # lazily built from count_top_k
+        # Layers whose prefill forward has been seen this question — used to
+        # skip the prefill contribution when the cluster method asks for
+        # decode-only co-occurrence (hybrid's cooccur_scope="decode").
+        self._prefill_seen: set = set()
+
+        # activation_similarity (cluster.name=activation_similarity): running
+        # sum of pairwise output-cosine (act_sim_num) and co-fire count
+        # (act_sim_cnt) per layer [n,n], accumulated from the C++ engine's
+        # captured per-expert outputs across the question, cleared in reset().
+        # ctx.pair_sim = num/cnt (-1 where cnt==0). Populated only when the
+        # cluster method needs it.
+        self.act_sim_num: Dict[int, torch.Tensor] = {}
+        self.act_sim_cnt: Dict[int, torch.Tensor] = {}
+        # hf-backend act-sim (hybrid-on-hf, e.g. GPT-OSS acceptance runs):
+        # layers whose prefill capture is done this question. The adapter's
+        # target forward gates on wants_prefill_act_sim() and feeds
+        # accumulate_prefill_act_sim(); offload runs never touch these (the
+        # C++ engine path in accumulate_activation_sim is unchanged).
+        self._act_sim_captured: set = set()
+        self._act_sim_hf_logged = False    # one INFO line per process
+
+        # How active experts are partitioned into the K clusters. Defaults to
+        # frequency-slice (the original behaviour); the CLI injects another
+        # method when the YAML asks (A4). Only consulted when K > 1.
+        self.cluster_method: ClusterMethod = (
+            cluster_method or get_cluster_method("freq_slice"))
+
+        # Within-cluster merge weighting: "freq" (∝ activation count, default)
+        # or "uniform" (1/|group|). YAML `cluster.within_weight`; the
+        # AUG_CLUSTER_UNIFORM env still forces uniform as an override (A4).
+        self.within_weight: str = within_weight
 
         # K: number of merged experts cached per layer.
         #   K == 1 → single dense expert (a plain Dict[str, Tensor] cache).
@@ -126,6 +205,11 @@ class ScoreBasedAvgDraft(DraftStrategy):
         self.record_history: bool = record_history
         self.history: List[Dict[str, Any]] = []
         self._cycle_in_question: int = -1
+
+    def prepare(self, adapter, blocks) -> None:
+        """Forward the once-per-layer hook to the cluster method (no-op for
+        freq_slice; used by methods that precompute, e.g. co-occurrence)."""
+        self.cluster_method.prepare(adapter, blocks)
 
     # --- history helpers ------------------------------------------------
     def _encode_score_vec(self, score_vec: torch.Tensor) -> List[Any]:
@@ -193,15 +277,157 @@ class ScoreBasedAvgDraft(DraftStrategy):
     # --- DraftStrategy overrides ---------------------------------------
     def reset(self):
         self.target_score.clear()
+        self.cooccur.clear()           # co-occurrence accumulates per-question
+        self._prefill_seen.clear()     # next capture per layer = new prefill
+        self.act_sim_num.clear()       # activation-similarity accumulates per-question
+        self.act_sim_cnt.clear()
+        self._act_sim_captured.clear() # next question captures prefill anew
         self._cycle_in_question = -1
+        # AUG_DUMP_ACTIVE_SET diagnostic: a new question starts here, so bump
+        # the question id and restart the per-layer cycle counter. This lets
+        # the set-shift analysis compare only consecutive cycles *within* the
+        # same question (the count vector is overwritten — not accumulated —
+        # each cycle, and cleared here between questions).
+        if os.environ.get("AUG_DUMP_ACTIVE_SET"):
+            self._dump_qid = getattr(self, "_dump_qid", -1) + 1
+            self._dump_active_cycle = {}
+        if os.environ.get("AUG_DUMP_PAIRS"):
+            self._pairdump_qid = getattr(self, "_pairdump_qid", -1) + 1
+            self._pairdump_cycle = {}
+        if os.environ.get("AUG_DUMP_CYCLE_SIM"):
+            self._cyclesim_qid = getattr(self, "_cyclesim_qid", -1) + 1
+            self._cyclesim_cycle = {}
 
     def capture(self, layer_idx, router_logits):
         score_vec = self._score_vector_from_logits(router_logits)
         self.target_score[layer_idx] = score_vec.float().detach().cpu()
+        if getattr(self.cluster_method, "needs_cooccur", False):
+            self._accumulate_cooccur(layer_idx, router_logits.softmax(dim=-1))
 
     def capture_softmax(self, layer_idx, softmax):
         score_vec = self._score_vector_from_softmax(softmax)
         self.target_score[layer_idx] = score_vec.float().detach().cpu()
+        if getattr(self.cluster_method, "needs_cooccur", False):
+            self._accumulate_cooccur(layer_idx, softmax)
+
+    def _accumulate_cooccur(self, layer_idx, probs):
+        """Add this forward's [n, n] token-level co-occurrence into the running
+        per-question table. `probs` is the router softmax [seq, n]. Fired on
+        every target forward (prefill + verify) when the cluster method needs
+        co-occurrence; reset() clears the table between questions. Methods with
+        cooccur_scope="decode" (hybrid) skip each layer's FIRST post-reset
+        capture — exactly the prefill forward — so the table reflects only
+        decode-time temporal locality."""
+        if getattr(self.cluster_method, "cooccur_scope", "all") == "decode" \
+                and layer_idx not in self._prefill_seen:
+            self._prefill_seen.add(layer_idx)
+            return
+        scorer = self._cooccur_scorer
+        if scorer is None:
+            top_k = getattr(self, "count_top_k", None)
+            if top_k is None:
+                return          # draft has no native top-k → can't build cooccur
+            from aug_spec.runtime.scorers import make_cooccurrence_scorer
+            scorer = self._cooccur_scorer = make_cooccurrence_scorer(top_k)
+        C = scorer(probs).detach().cpu()
+        cur = self.cooccur.get(layer_idx)
+        self.cooccur[layer_idx] = C if cur is None else cur + C
+
+    def accumulate_activation_sim(self, layer_idx, dispatcher, n) -> None:
+        """Pull this layer's captured per-expert outputs from the C++ engine and
+        fold them into the running act-sim tables. Called from on_verify_layer
+        (post-dispatch) when cluster_method.needs_activation_sim.
+        """
+        captured = dispatcher.get_captured_expert_outputs()
+        if not captured:
+            return
+        self._accumulate_act_sim(layer_idx, captured, n)
+
+    def wants_prefill_act_sim(self, layer_idx) -> bool:
+        """hf-backend act-sim gate: True when the adapter's TARGET forward
+        should recompute this layer's fired-expert outputs and feed
+        accumulate_prefill_act_sim. Only prefill-only cluster methods (hybrid)
+        qualify — per-cycle capture on hf would pay a full extra expert
+        forward every verify, and no current experiment needs it."""
+        cm = self.cluster_method
+        return (getattr(cm, "needs_activation_sim", False)
+                and getattr(cm, "act_sim_prefill_only", False)
+                and layer_idx not in self._act_sim_captured)
+
+    def accumulate_prefill_act_sim(self, layer_idx, captured, n) -> None:
+        """hf-backend act-sim entry: `captured` uses the same tuple format as
+        the C++ engine's get_captured_expert_outputs(). Freezes the layer for
+        the rest of the question (act_sim_prefill_only semantics — without
+        this line every verify would re-gate as "prefill not seen")."""
+        self._act_sim_captured.add(layer_idx)
+        if not self._act_sim_hf_logged:
+            print(f"[act_sim] hf prefill capture engaged (layer {layer_idx}, "
+                  f"{len(captured)} fired experts, n={n})")
+            self._act_sim_hf_logged = True
+        self._accumulate_act_sim(layer_idx, captured, n)
+
+    def _accumulate_act_sim(self, layer_idx, captured, n) -> None:
+        """Accumulate, per co-firing token, the pairwise output metric into
+        act_sim_num[n,n] and the co-fire count into act_sim_cnt[n,n].
+        captured = list of (layer_idx, expert_idx, token_indices[t], output[t,D]).
+        """
+        metric = getattr(self.cluster_method, "metric", "cosine")
+        # token id -> list of (expert, RAW output vec)
+        tok: Dict[int, List] = {}
+        for li, e, tok_idx, out in captured:
+            if int(li) != int(layer_idx):
+                continue
+            out = out.float()
+            for k, t in enumerate(tok_idx.tolist()):
+                tok.setdefault(int(t), []).append((int(e), out[k]))
+        if not tok:
+            return
+        # Build THIS CYCLE's contribution separately first, so we can dump the
+        # per-cycle similarity (for the cross-cycle-drift experiment) before
+        # folding it into the running per-question accumulator. num_c holds the
+        # raw per-pair metric (cosine, or L2 distance); _pair_sim_table converts.
+        num_c = torch.zeros(n, n)
+        cnt_c = torch.zeros(n, n)
+        for members in tok.values():
+            if len(members) < 2:
+                continue
+            es = [e for e, _ in members]
+            V = torch.stack([v for _, v in members])        # [k, D] raw outputs
+            if metric == "l2":
+                M = torch.cdist(V.unsqueeze(0), V.unsqueeze(0)).squeeze(0)  # [k,k]
+            else:
+                U = V / V.norm(dim=1, keepdim=True).clamp_min(1e-8)
+                M = U @ U.t()                               # [k,k] cosine
+            M = M.cpu()
+            idx = torch.tensor(es)
+            num_c[idx[:, None], idx[None, :]] += M
+            cnt_c[idx[:, None], idx[None, :]] += 1.0
+        self._maybe_dump_cycle_sim(layer_idx, num_c, cnt_c)
+        num = self.act_sim_num.get(layer_idx)
+        if num is None:
+            self.act_sim_num[layer_idx] = num_c
+            self.act_sim_cnt[layer_idx] = cnt_c
+        else:
+            num.add_(num_c)
+            self.act_sim_cnt[layer_idx].add_(cnt_c)
+
+    def _pair_sim_table(self, layer_idx):
+        """ctx.pair_sim for this layer from the running num/cnt. cosine →
+        mean cosine (unvisited sentinel -1, the cosine minimum). l2 → NEGATIVE
+        mean distance (unvisited sentinel -inf), so greedy's max = closest
+        outputs and unvisited pairs always rank last. None if no data."""
+        num = self.act_sim_num.get(layer_idx)
+        if num is None:
+            return None
+        cnt = self.act_sim_cnt[layer_idx]
+        nz = cnt > 0
+        if getattr(self.cluster_method, "metric", "cosine") == "l2":
+            sim = torch.full_like(num, float("-inf"))
+            sim[nz] = -(num[nz] / cnt[nz])     # negative mean L2 distance
+        else:
+            sim = torch.full_like(num, -1.0)
+            sim[nz] = num[nz] / cnt[nz]         # mean cosine
+        return sim
 
     def refresh(self, adapter, blocks, draft_cache):
         if not self.target_score:
@@ -210,57 +436,65 @@ class ScoreBasedAvgDraft(DraftStrategy):
         if self.record_history:
             self._cycle_in_question += 1
             self._snapshot_history([li for li, _ in blocks])
+        # merge_during_verify (verify_merge_plan.md P1): the offload-merge engine
+        # already built draft_cache[li] per layer *during* verify (on_verify_layer,
+        # experts still resident → 0 re-fetch). Skip the after-verify rebuild;
+        # telemetry above still runs. No engine / during_verify=False → unchanged.
+        engine = getattr(blocks[0][1], "_merge_engine", None) if blocks else None
+        if engine is not None and getattr(engine, "during_verify", False):
+            return
         for li, score_vec in self.target_score.items():
-            # Drop old cache for this layer first so peak transient VRAM
-            # during the rebuild stays bounded by one layer's worth.
-            draft_cache.pop(li, None)
-            block = layer_to_block[li]
-            n = adapter.num_experts(block)
-            total = float(score_vec.sum().item())
-            if total <= 0:
-                weights = [1.0 / n] * n
+            self._refresh_layer(adapter, layer_to_block[li], li, score_vec,
+                                draft_cache)
+
+    def _refresh_layer(self, adapter, block, li, score_vec, draft_cache,
+                       routed=None):
+        """Build (or rebuild) the merged draft for one layer from its captured
+        count vector. Shared by `refresh` (after-verify, all layers) and the
+        offload-merge engine's `on_verify_layer` (during-verify, one layer)."""
+        # Drop old cache for this layer first so peak transient VRAM during the
+        # rebuild stays bounded by one layer's worth.
+        draft_cache.pop(li, None)
+        n = adapter.num_experts(block)
+        total = float(score_vec.sum().item())
+        if total <= 0:
+            weights = [1.0 / n] * n
+        else:
+            weights = (score_vec.float() / total).tolist()
+        weights = self._postprocess_weights(weights)
+        self._maybe_dump_active_set(li, weights, total)
+        if self.K > 1:
+            # C1 (merged_cache_plan.md): in cache mode the merged-cache policy
+            # builds the layer (adopt-first + slot merges + working-set pins);
+            # otherwise the legacy per-cycle rebuild below.
+            engine = getattr(block, "_merge_engine", None)
+            mc = getattr(engine, "merged_cache", None) if engine else None
+            if mc is not None:
+                draft_cache[li] = mc.build_layer(li, block, weights, self,
+                                                 routed=routed)
             else:
-                weights = (score_vec.float() / total).tolist()
-            weights = self._postprocess_weights(weights)
-            basis = self._get_svd_basis(adapter, li, block)
-            if self.K > 1:
-                draft_cache[li] = self._cluster_and_build(
-                    adapter, block, weights, basis)
-            else:
-                draft_cache[li] = self._build_one(adapter, block, weights, basis)
+                draft_cache[li] = self._cluster_and_build(adapter, block,
+                                                          weights, li)
+        else:
+            draft_cache[li] = self._build_one(adapter, block, weights)
 
-    def _get_svd_basis(self, adapter, layer_idx: int, block):
-        """Return the cached SVD basis for `layer_idx`, building it on first
-        use. Returns None when SVD merging is disabled."""
-        if not self.use_svd_merge:
-            return None
-        basis = self._svd_basis.get(layer_idx)
-        if basis is None:
-            basis = adapter.build_svd_basis(block, rank=self.svd_rank)
-            self._svd_basis[layer_idx] = basis
-        return basis
+    def _build_one(self, adapter, block,
+                   weights: List[float]) -> Dict[str, torch.Tensor]:
+        """Merge `weights` into a single expert via the linear merge entry
+        (`merging/linear.py`); `member_ids` = the non-zero entries, carried so
+        a future cache can key on the member set."""
+        member_ids = [i for i, w in enumerate(weights) if w > 0.0]
+        return linear_merge(adapter, block, member_ids, weights)
 
-    def _build_one(self, adapter, block, weights: List[float],
-                   basis) -> Dict[str, torch.Tensor]:
-        """Merge `weights` into a single expert via the configured method.
-
-        When `basis` is given (SVD enabled) the merge reuses the cached
-        decomposition; otherwise it is a plain weighted average.
-        """
-        if basis is not None:
-            return adapter.build_svd_from_basis(basis, weights)
-        return adapter.build_weighted_avg(block, weights)
-
-    def _cluster_and_build(self, adapter, block, weights: List[float],
-                           basis) -> Dict[str, Any]:
+    def _cluster_and_build(self, adapter, block,
+                           weights: List[float],
+                           layer_idx: int = -1) -> Dict[str, Any]:
         """Partition active experts into K clusters and merge each one.
 
-        Clustering (frequency-slice): active experts are sorted by weight
-        descending and cut into K contiguous slices, so each cluster groups
-        experts of comparable activation frequency. This is a fast,
-        calibration-free proxy — a stronger functional-similarity metric
-        (e.g. gate-vector clustering) can replace `_assign_clusters` later
-        without touching the rest of the pipeline.
+        The partition comes from `self.cluster_method` (default frequency-slice;
+        see `clustering/`). Cross-cluster mass and the within-cluster weighting
+        stay frequency-based here, so swapping the cluster method changes only
+        *which experts group together*, nothing else in the pipeline.
 
         Returns a "multi" cache dict consumed by `adapter._route_multi_expert`::
 
@@ -277,19 +511,40 @@ class ScoreBasedAvgDraft(DraftStrategy):
         """
         n = len(weights)
         active = [i for i, w in enumerate(weights) if w > 0.0]
-        groups = self._assign_clusters(active, weights)
+        ctx = ClusterContext(active=active, weights=weights,
+                             layer_idx=layer_idx,
+                             cooccur=self.cooccur.get(layer_idx),
+                             pair_sim=self._pair_sim_table(layer_idx),
+                             group_cap=self.group_cap)
+        groups = self.cluster_method.assign(ctx, self.K)
+        self._maybe_dump_pairs(layer_idx, active, groups)
+
+        # Within-cluster weighting: "uniform" merges each cluster with EQUAL
+        # weights (1/|group|) instead of frequency-proportional ones. The
+        # partition (cluster_method) and the cross-cluster mass (`masses`) stay
+        # frequency-based — only the within-cluster combine changes. Set via
+        # YAML `cluster.within_weight`; AUG_CLUSTER_UNIFORM env forces it on.
+        uniform_merge = (self.within_weight == "uniform"
+                         or os.environ.get("AUG_CLUSTER_UNIFORM") is not None)
 
         experts: List[Dict[str, torch.Tensor]] = []
         masses: List[float] = []
-        for group in groups:
+        for cluster_idx, group in enumerate(groups):
             group_mass = sum(weights[i] for i in group)
             # Renormalise within the cluster so each merge gets weights summing
             # to 1; the cluster's share of the whole is tracked in `masses`.
             cluster_weights = [0.0] * n
-            for i in group:
-                cluster_weights[i] = weights[i] / group_mass
+            if uniform_merge:
+                w_each = 1.0 / len(group)
+                for i in group:
+                    cluster_weights[i] = w_each
+            else:
+                for i in group:
+                    cluster_weights[i] = weights[i] / group_mass
+            self._maybe_dump_cluster_weights(
+                layer_idx, cluster_idx, group, group_mass, weights)
             experts.append(
-                self._build_one(adapter, block, cluster_weights, basis))
+                self._build_one(adapter, block, cluster_weights))
             masses.append(group_mass)
 
         total = sum(masses)
@@ -301,21 +556,137 @@ class ScoreBasedAvgDraft(DraftStrategy):
             "indices": [groups[k] for k in order],
         }
 
-    def _assign_clusters(self, active: List[int],
-                         weights: List[float]) -> List[List[int]]:
-        """Group active expert indices into at most K clusters.
-
-        Frequency-slice strategy: sort by weight descending, then cut into K
-        contiguous, near-equal-size slices. Returns a list of non-empty
-        index groups (fewer than K only when active experts < K).
-        """
-        ordered = sorted(active, key=lambda i: -weights[i])
-        m = len(ordered)
-        k = min(self.K, m)
-        return [ordered[j * m // k:(j + 1) * m // k] for j in range(k)]
-
     def _postprocess_weights(self, weights: List[float]) -> List[float]:
         """Hook called once per layer per cycle, right before
         `adapter.build_weighted_avg`. Subclasses override to e.g. prune
         low-mass experts. Default = identity passthrough."""
         return weights
+
+    def _maybe_dump_cycle_sim(self, layer_idx: int, num_c, cnt_c) -> None:
+        """Diagnostic-only: when AUG_DUMP_CYCLE_SIM=<path> is set, append one
+        JSONL record per (layer, question, cycle) with THIS cycle's standalone
+        pairwise output-cosine (num_c/cnt_c over only this cycle's tokens, upper
+        triangle, visited pairs). Feeds the cross-cycle similarity-drift
+        analysis: does a pair's per-cycle similarity swing a lot between cycles?
+        No-op when unset."""
+        path = os.environ.get("AUG_DUMP_CYCLE_SIM")
+        if not path:
+            return
+        import json
+        counter = getattr(self, "_cyclesim_cycle", None)
+        if counter is None:
+            counter = self._cyclesim_cycle = {}
+        cyc = counter.get(layer_idx, -1) + 1
+        counter[layer_idx] = cyc
+        ii, jj = torch.triu_indices(cnt_c.shape[0], cnt_c.shape[1], offset=1)
+        c = cnt_c[ii, jj]
+        mask = c > 0
+        if not bool(mask.any()):
+            return
+        I = ii[mask].tolist()
+        J = jj[mask].tolist()
+        V = (num_c[ii, jj][mask] / c[mask]).tolist()
+        rec = {
+            "layer": int(layer_idx),
+            "qid": int(getattr(self, "_cyclesim_qid", 0)),
+            "cycle": int(cyc),
+            "sims": [[int(a), int(b), round(float(v), 5)]
+                     for a, b, v in zip(I, J, V)],
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def _maybe_dump_pairs(self, layer_idx: int, active: List[int],
+                          groups: List[List[int]]) -> None:
+        """Diagnostic-only: when AUG_DUMP_PAIRS=<path> is set, append one JSONL
+        record per (layer, question, cycle) with the active set M and the size-2
+        clusters (pairs) the clustering formed. Feeds the cache-reuse analysis:
+        does a pair {A,B} formed last cycle reappear (both members in M) this
+        cycle? No-op when unset."""
+        path = os.environ.get("AUG_DUMP_PAIRS")
+        if not path:
+            return
+        import json
+        counter = getattr(self, "_pairdump_cycle", None)
+        if counter is None:
+            counter = self._pairdump_cycle = {}
+        cyc = counter.get(layer_idx, -1) + 1
+        counter[layer_idx] = cyc
+        rec = {
+            "layer": int(layer_idx),
+            "qid": int(getattr(self, "_pairdump_qid", 0)),
+            "cycle": int(cyc),
+            "active": sorted(int(x) for x in active),
+            "pairs": [sorted(int(x) for x in g) for g in groups if len(g) == 2],
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def _maybe_dump_active_set(self, layer_idx: int, weights: List[float],
+                               total: float) -> None:
+        """Diagnostic-only: when AUG_DUMP_ACTIVE_SET=<path> is set, append one
+        JSONL record per (layer, question, cycle) listing the *selected* expert
+        ids for that cycle (post top-M cutoff, i.e. weight > 0). Feeds the
+        co-occurrence and cycle-to-cycle set-shift analyses. `degenerate` flags
+        the all-zero-count fallback (uniform over every expert), which the
+        analysis drops. No-op when the env var is unset.
+        """
+        path = os.environ.get("AUG_DUMP_ACTIVE_SET")
+        if not path:
+            return
+        import json
+        counter = getattr(self, "_dump_active_cycle", None)
+        if counter is None:
+            counter = self._dump_active_cycle = {}
+        cyc = counter.get(layer_idx, -1) + 1
+        counter[layer_idx] = cyc
+        active = [i for i, w in enumerate(weights) if w > 0.0]
+        rec = {
+            "layer": int(layer_idx),
+            "qid": int(getattr(self, "_dump_qid", 0)),
+            "cycle": int(cyc),
+            "n": len(weights),
+            "active": active,
+            "degenerate": total <= 0,
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def _maybe_dump_cluster_weights(self, layer_idx: int, cluster_idx: int,
+                                    group: List[int], group_mass: float,
+                                    weights: List[float]) -> None:
+        """Diagnostic-only: when AUG_DUMP_CLUSTER_WEIGHTS=<path> is set, append
+        one JSONL record per merged cluster capturing the *frequency-based*
+        within-cluster weights (weights[i] / group_mass). This is exactly the
+        non-uniform merge weighting; comparing it to the uniform reference
+        (1/|group|) quantifies how far apart the within-cluster weights are.
+        No-op (and zero overhead beyond an env lookup) when unset, so it never
+        affects normal runs.
+        """
+        path = os.environ.get("AUG_DUMP_CLUSTER_WEIGHTS")
+        if not path:
+            return
+        import json
+        # Per-layer call counter so records from successive refresh cycles of
+        # the same layer stay distinguishable. cluster 0 of a layer marks a new
+        # cycle for that layer.
+        counter = getattr(self, "_dump_cycle_counter", None)
+        if counter is None:
+            counter = self._dump_cycle_counter = {}
+        if cluster_idx == 0:
+            counter[layer_idx] = counter.get(layer_idx, -1) + 1
+        size = len(group)
+        if group_mass > 0:
+            w = sorted((weights[i] / group_mass for i in group), reverse=True)
+        else:
+            w = [1.0 / size] * size if size else []
+        rec = {
+            "layer": int(layer_idx),
+            "cycle": int(counter.get(layer_idx, 0)),
+            "cluster": int(cluster_idx),
+            "size": size,
+            "group_mass": float(group_mass),
+            "weights": [float(x) for x in w],
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")

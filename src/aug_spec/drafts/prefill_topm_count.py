@@ -20,22 +20,24 @@ from __future__ import annotations
 from typing import List, Optional
 
 from .prefill_count import PrefillCountDraft
-from .topm_count import keep_top_m
+from .topm_count import keep_top_m, note_topm_stats
 
 
 class PrefillTopMCountDraft(PrefillCountDraft):
     """Prefill-only count merge with a fixed top-M cutoff."""
 
     def __init__(self, count_top_k: int, M: Optional[int] = None,
-                 use_svd_merge: bool = False, svd_rank: int = 256,
                  K: int = 1, draft_top_k: Optional[int] = None):
         super().__init__(count_top_k=count_top_k,
-                         use_svd_merge=use_svd_merge, svd_rank=svd_rank,
                          K=K, draft_top_k=draft_top_k)
         if M is not None and M < 1:
             raise ValueError(f"M must be >= 1, got {M!r}")
         self.M = M
+        self.topm_stats = {"n": None, "m": None, "calls": 0,
+                           "sum_active": 0, "sum_dropped": 0,
+                           "filled_calls": 0}
 
     def _postprocess_weights(self, weights: List[float]) -> List[float]:
         m = self.M if self.M is not None else self.count_top_k
+        note_topm_stats(self.topm_stats, weights, m)
         return keep_top_m(weights, m)

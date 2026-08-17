@@ -1,0 +1,28 @@
+# md1 series (2026-07-21): DeepSeek-MoE-16B-base Table-1 rows under the m1
+# protocol - T=3, questions_per_cat=all (560 q), mnt=512, B=1, HF BACKEND
+# (trust_remote_code family; no offload port). Replaces the GPT-OSS block.
+# Budget: 12.5% of 64 routed experts -> 8 per layer (64->8). The 2 shared
+# experts are dense weights outside the budget, active in both phases for
+# every method. Model picked over -chat by the dsm candidate eval
+# (deepseek_plan.md: base 0.6970 vs chat 0.3737 on Ours).
+# Prune/Speed: draft runs the first 4/28 decoder layers = dense layer 0 +
+# MoE layers 1-3 -> 3/27 MoE layers (~11.1%, the round(12.5% x 27)=3 budget,
+# matching Draft&Verify's kept count).
+model:
+  id: deepseek-ai/deepseek-moe-16b-base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: speed
+  args:
+    num_layers: 4
+run:
+  T: 3
+  questions_per_cat: all
+  max_new_tokens: 512
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: md1_speed
+  dir: output/md1_speed

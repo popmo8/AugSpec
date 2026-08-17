@@ -1,0 +1,33 @@
+# hf-backend smoke for the md1 (DeepSeek Table-1) run - qpc=1, mnt=64.
+# Merge/Ours: topm_count M16/K8 (M=2K) + hybrid a75, same method definition
+# as m1_ours/dsm_base_ours; hf act-sim prefill capture lives in the deepseek
+# adapter (check the [act_sim] engage line in the log).
+model:
+  id: deepseek-ai/deepseek-moe-16b-base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: topm_count
+  args:
+    M: 16
+    K: 8
+    draft_top_k: 6
+    record_history: false
+cluster:
+  name: hybrid
+  alpha: 0.75
+  metric: l2
+  norm: rank
+  cooccur_norm: raw
+  cooccur_scope: decode
+  within_weight: uniform
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: md1_smoke_ours
+  dir: output/md1_smoke_ours

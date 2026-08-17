@@ -10,12 +10,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .base import (
-    MoEAdapter,
-    _svd_decompose,
-    _svd_remerge,
-    _topk_substitute_forward,
-)
+from aug_spec.kernels.bmm import stack_swiglu_weights
+
+from .base import MoEAdapter
 
 
 class MixtralAdapter(MoEAdapter):
@@ -63,32 +60,16 @@ class MixtralAdapter(MoEAdapter):
         del w1_sum, w2_sum, w3_sum
         return out
 
-    def build_svd_basis(self, block, rank=256, store_dtype=torch.bfloat16):
-        dtype = block.experts[0].w1.weight.dtype
-        return {
-            "dtype": dtype,
-            "w1": _svd_decompose([e.w1.weight.float() for e in block.experts],
-                                 rank, store_dtype),
-            "w2": _svd_decompose([e.w2.weight.float() for e in block.experts],
-                                 rank, store_dtype),
-            "w3": _svd_decompose([e.w3.weight.float() for e in block.experts],
-                                 rank, store_dtype),
-        }
-
-    def build_svd_from_basis(self, basis, weights):
-        dtype = basis["dtype"]
-        return {
-            "w1": _svd_remerge(basis["w1"], weights).to(dtype),
-            "w2": _svd_remerge(basis["w2"], weights).to(dtype),
-            "w3": _svd_remerge(basis["w3"], weights).to(dtype),
-        }
-
     def _run_dense_expert(self, avg, hs_flat):
         # Mixtral expert: SiLU(w1 · h) ⊙ (w3 · h) → w2(...).
         gate = F.linear(hs_flat, avg["w1"])
         up = F.linear(hs_flat, avg["w3"])
         hidden = F.silu(gate) * up
         return F.linear(hidden, avg["w2"])
+
+    def _swiglu_stack(self, cache, experts):
+        # gate=w1, up=w3, down=w2, stacked + transposed for bmm.
+        return stack_swiglu_weights(cache, experts, "w1", "w3", "w2")
 
     def _standard_routing(self, block, hs_flat, gate_logits,
                           batch_size, sequence_length, hidden_dim):
@@ -129,12 +110,19 @@ class MixtralAdapter(MoEAdapter):
                     avg = controller.draft.lazy_build(layer_idx, block, adapter)
                     if avg is not None:
                         controller.draft_cache[layer_idx] = avg
+                # C-BOOT: see qwen3.py — missing draft cache under
+                # run.prefill_warmup is a bug; fail fast, don't fall back.
+                if avg is None and getattr(controller, "prefill_warmup", False):
+                    raise RuntimeError(
+                        f"draft cache missing for MoE layer {layer_idx} in "
+                        f"draft phase despite run.prefill_warmup=true "
+                        f"(merged_cache_plan.md §2.4)")
                 if avg is not None:
                     if avg.get("kind") == "multi":
                         top_k = controller.draft.draft_top_k or block.top_k
                         gate_probs = router_logits.softmax(dim=-1)
                         out = adapter._route_multi_expert(
-                            avg, gate_probs, hs_flat, top_k)
+                            avg, gate_probs, hs_flat, top_k, block)
                     else:
                         out = adapter._run_dense_expert(avg, hs_flat)
                     return out.reshape(
@@ -177,7 +165,10 @@ class MixtralAdapter(MoEAdapter):
         return fwd
 
     def make_substitute_forward(self, controller, layer_idx, block):
-        return _topk_substitute_forward(controller, layer_idx, block)
+        # Lazy import: the SpecMoE forward lives in drafts/specmoe.py (A5);
+        # importing it at module top would cycle (adapters <-> drafts).
+        from aug_spec.drafts.specmoe import topk_substitute_forward
+        return topk_substitute_forward(controller, layer_idx, block)
 
     def expert_flat_weights(self, block):
         return [

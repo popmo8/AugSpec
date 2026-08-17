@@ -240,8 +240,19 @@ struct MoEMLP : public torch::nn::Module {
 
   void SetTensorsFromIds(const std::vector<std::uint32_t>& tensor_ids);
 
+  // aug_spec: load the expert weights from explicit GPU tensors (in the same
+  // order SetTensorsFromIds expects) instead of fetching by tensor id. Lets a
+  // merged dense draft run through the identical MoEMLP::forward kernel that
+  // the archer dispatch uses — same engine, no tensor-index registration.
+  void SetTensorsDirect(const std::vector<torch::Tensor>& tensors);
+
  private:
   void ForwardHelper(cudaStream_t stream);
+  // Shared param_/buffer_ allocation + device-to-device copy into param_,
+  // driven by raw (ptr, byte-size) sources and their shapes.
+  void SetTensorsFromPtrs(
+      const std::vector<std::tuple<void*, int64_t>>& tensor_ptrs,
+      const std::vector<std::vector<int64_t>>& tensor_shapes);
 
  private:
   std::vector<torch::Tensor> buffer_;

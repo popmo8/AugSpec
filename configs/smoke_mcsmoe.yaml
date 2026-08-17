@@ -1,0 +1,21 @@
+# MC-SMoE smoke: mc_smoe draft (permutation-aligned static merge) on hf with
+# the real adaptive K=16 spec + humaneval. qpc=1, mnt=64 — correctness only
+# (incl. the one-time prepare-phase Hungarian alignment, ~5k solves).
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: mc_smoe
+  args:
+    spec_path: output/mc_smoe/Qwen3-30B-A3B-Base_K16.json
+    draft_top_k: 8
+
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+
+output: {label: smoke_mcsmoe, dir: output/smoke_mcsmoe}

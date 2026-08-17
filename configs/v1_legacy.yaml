@@ -1,0 +1,5 @@
+# V1 等價驗收 — legacy HF assisted 路徑（batch_spec_plan.md §6 V1）。
+model: {id: Qwen/Qwen3-30B-A3B-Base, dtype: bfloat16, device_map: auto}
+draft: {name: topm_count, args: {M: 32, K: 16, draft_top_k: 8}}
+run: {T: 5, questions_per_cat: 2, max_new_tokens: 64, humaneval: true, mt_bench_pooled: true}
+output: {label: v1_legacy, dir: output/v1_legacy}

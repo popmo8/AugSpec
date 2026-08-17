@@ -1,0 +1,8 @@
+# Table 1 — GPT-OSS Enumerate (NAEE) row (hf acceptance; gptoss_acceptance_plan.md)。
+# 精確枚舉 C(32,4)=35,960/層(softmax-after-topk 重路由,G4);吃 D1 產物。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: static_mask
+  args: {spec_path: output/naee/gpt-oss-20b_r4.json}
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, humaneval: true, mt_bench_pooled: true}
+output: {label: t1_gptoss_enum, dir: output/t1_gptoss_enum}

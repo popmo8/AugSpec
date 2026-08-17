@@ -1,0 +1,20 @@
+# hf-backend smoke for the md1 (DeepSeek Table-1) run - qpc=1, mnt=64.
+# Prune/Random: keep 8 of 64 routed experts per layer, drawn once per run.
+model:
+  id: deepseek-ai/deepseek-moe-16b-base
+  dtype: bfloat16
+  device_map: auto
+draft:
+  name: random_mask
+  args:
+    seed: 0
+    num_keep: 8
+run:
+  T: 3
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+  mt_bench_pooled: true
+output:
+  label: md1_smoke_randmask
+  dir: output/md1_smoke_randmask

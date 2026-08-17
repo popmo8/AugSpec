@@ -21,6 +21,20 @@ from typing import List, Optional
 from .count import CountDraft
 
 
+def note_topm_stats(stats: dict, weights: List[float], m: int) -> None:
+    """Accumulate M-saturation stats (M-sweep ablation, 2026-07-25): how many
+    experts carried nonzero count mass before the top-M cutoff (`active`),
+    whether M was saturated (active >= m), and how many active experts the
+    cutoff dropped. One call per (layer, rebuild)."""
+    active = sum(1 for w in weights if w > 0.0)
+    stats["n"] = len(weights)
+    stats["m"] = m
+    stats["calls"] += 1
+    stats["sum_active"] += active
+    stats["sum_dropped"] += max(0, active - m)
+    stats["filled_calls"] += 1 if active >= m else 0
+
+
 def keep_top_m(weights: List[float], m: int) -> List[float]:
     """Keep the top-`m` entries of `weights` by descending value, zero the
     rest, and renormalise. Ties are broken by ascending index for
@@ -56,20 +70,20 @@ class TopMCountDraft(CountDraft):
     def __init__(self, count_top_k: int,
                  M: Optional[int] = None,
                  record_history: bool = False,
-                 use_svd_merge: bool = False,
-                 svd_rank: int = 256,
                  K: int = 1,
                  draft_top_k: Optional[int] = None):
         super().__init__(count_top_k=count_top_k,
                          record_history=record_history,
-                         use_svd_merge=use_svd_merge,
-                         svd_rank=svd_rank,
                          K=K,
                          draft_top_k=draft_top_k)
         if M is not None and M < 1:
             raise ValueError(f"M must be >= 1, got {M!r}")
         self.M = M
+        self.topm_stats = {"n": None, "m": None, "calls": 0,
+                           "sum_active": 0, "sum_dropped": 0,
+                           "filled_calls": 0}
 
     def _postprocess_weights(self, weights: List[float]) -> List[float]:
         m = self.M if self.M is not None else self.count_top_k
+        note_topm_stats(self.topm_stats, weights, m)
         return keep_top_m(weights, m)

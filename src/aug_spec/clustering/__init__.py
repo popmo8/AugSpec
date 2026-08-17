@@ -1,0 +1,48 @@
+"""Cluster-method registry.
+
+Add a method: drop a `ClusterMethod` subclass module and register it here.
+Selected by `cluster.name` in the YAML (wired in A4); defaults to freq_slice.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Type
+
+from .activation_sim import ActivationSimCluster
+from .base import ClusterContext, ClusterMethod
+from .cooccur import CooccurPairCluster
+from .freq_slice import FreqSliceCluster
+from .hybrid import HybridRelationCluster
+from .random import RandomCluster
+from .weight_sim import WeightSimCluster
+
+
+_REGISTRY: Dict[str, Type[ClusterMethod]] = {
+    "freq_slice": FreqSliceCluster,
+    "random": RandomCluster,
+    "cooccur_pair": CooccurPairCluster,
+    "activation_similarity": ActivationSimCluster,
+    "weight_similarity": WeightSimCluster,
+    "hybrid": HybridRelationCluster,
+}
+
+
+def get_cluster_method(name: str = "freq_slice", **kwargs: Any) -> ClusterMethod:
+    """Instantiate a cluster method by registered name with **kwargs."""
+    if name not in _REGISTRY:
+        known = ", ".join(sorted(_REGISTRY))
+        raise KeyError(f"unknown cluster method {name!r}; known: {known}")
+    return _REGISTRY[name](**kwargs)
+
+
+__all__ = [
+    "ClusterContext",
+    "ClusterMethod",
+    "FreqSliceCluster",
+    "RandomCluster",
+    "CooccurPairCluster",
+    "ActivationSimCluster",
+    "WeightSimCluster",
+    "HybridRelationCluster",
+    "get_cluster_method",
+]

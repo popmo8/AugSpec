@@ -10,15 +10,27 @@ adding a YAML, not a Python file**.
 ```yaml
 model:
   id: <huggingface model id>            # REQUIRED
+  backend: hf | offload                 # default: hf
   dtype: bfloat16 | float16 | float32   # default: bfloat16
-  device_map: auto | "cuda:0" | {…}     # default: auto
+  device_map: auto | "cuda:0" | {…}     # default: auto  (hf backend)
   trust_remote_code: true | false       # default: true
   adapter: mixtral | gptoss | qwen3_moe # default: auto-detect from config.model_type
+  offload:                              # backend: offload only — see "model.offload"
+    path: <expert dir>                  # REQUIRED for offload
+    vram_budget_ratio: 0.2              # usable VRAM / model VRAM (overrides device_memory_ratio)
+    merge_offload: true                 # GPU resident-merge via archer dispatcher
+    merge_during_verify: true           # per-layer merge during verify (vs after)
+    # merged_backend: engine_bmm        # engine_bmm (default) | dispatch | bmm  (A4)
 
 draft:
-  name: uniform | count | pruned_count | topm_count | prefill_count | prefill_topm_count | softmax | random_mask   # REQUIRED
+  name: uniform | count | pruned_count | topm_count | prefill_count | prefill_topm_count | softmax | random_mask | random_merge | specmoe | speed | draft_verify | static_mask | static_merge | mc_smoe | moe_caching (alias none) | moe_precache | moe_ondemand   # REQUIRED
   args:
     # strategy-specific — see "Draft strategies" below
+  # early_pin: 0                        # default: 0  — SpecMoE early-pin stage 0|1|2 (A4)
+
+cluster:                                # averaged-draft family with K>1 — see "cluster"
+  name: freq_slice                      # default: freq_slice  (only method in registry today)
+  within_weight: freq                   # default: freq  — freq | uniform  (A4)
 
 run:
   T: 3                                  # default: 3      — speculative tokens per cycle
@@ -26,6 +38,7 @@ run:
   max_new_tokens: 512                   # default: 512    — generation budget per question
   seed: 0                               # default: 0      — RNG seed for question sampling
   warmup: true                          # default: true   — one tiny generate() before timed eval
+  prefill_warmup: true                  # default: true   — C-BOOT empty first round (false = ablation)
   emit_tokens_csv: false                # default: false  — per-cycle CSV; ~100 MB / run when on
   spec_bench_cache: data/spec_bench     # default: <cwd>/data/spec_bench
   reasoning_effort: low                 # GPT-OSS only — injected into chat template
@@ -45,10 +58,34 @@ source of truth.
 | key | type | default | notes |
 |---|---|---|---|
 | `id` | str | — | HuggingFace repo id passed to `from_pretrained`. |
+| `backend` | str | `hf` | `hf` (single GPU/sharded copy) or `offload` (moe_infinity expert offloading; needs `model.offload`). |
 | `dtype` | str | `bfloat16` | One of `bfloat16` / `float16` / `float32`. |
-| `device_map` | str / dict | `auto` | Passed straight to `from_pretrained`. `auto` shards across visible GPUs. |
+| `device_map` | str / dict | `auto` | Passed straight to `from_pretrained` (hf backend). `auto` shards across visible GPUs. |
 | `trust_remote_code` | bool | `true` | Required for models with custom code (DeepSeek, GPT-OSS, …). |
 | `adapter` | str | (auto) | Override the auto-detected adapter. Useful if you fork a model and rename `config.model_type`. |
+
+## `model.offload` (backend: offload only)
+
+Experts live on host RAM and stream into a VRAM budget; non-expert layers stay
+on GPU. Only read when `model.backend: offload`.
+
+| key | type | default | notes |
+|---|---|---|---|
+| `path` | str | — | **Required.** Directory of pre-extracted expert weights. |
+| `vram_budget_ratio` | float | (unset) | Usable VRAM as a fraction of the full-model footprint (GPU-independent; thesis 0.2×). Overrides `device_memory_ratio` when set. |
+| `device_memory_ratio` | float | `0.15` | Raw archer pool / GPU-size escape hatch; used only when `vram_budget_ratio` is unset. |
+| `vram_guard` | bool | `true` | Per-cycle warn when VRAM exceeds budget. |
+| `merge_offload` | bool | `false` | GPU resident-merge via the archer dispatcher (alias: `cpp_merge`). |
+| `merge_during_verify` | bool | `false` | Merge each layer *during* verify (experts still resident → 0 re-fetch) vs an after-verify refresh. |
+| `flush_on_draft_end` | bool | `false` | Phase-exclusive flush (archer@draft-start, merged@draft-end). |
+| `merge_overlap` | bool | `false` | Merge on a side stream, overlap with next-layer fetch. |
+| `merged_backend` | str | `engine_bmm` | Merged-expert draft kernel: `engine_bmm` (C++ DispatchBmm) / `dispatch` (per-expert MoEMLP) / `bmm` (Python). **A4** — was `AUG_MERGED_BACKEND`. |
+
+Deprecated: `no_overload` (and env `AUG_NO_OVERLOAD`). The C++ "overload"
+path was removed in 2026-07 (`remove_overload_plan.md`), so pin-aware
+evict-on-full is now the only behaviour — what `no_overload: true` used to
+select. The key is accepted-but-ignored (a deprecation line is printed) so
+older YAMLs keep loading; don't write it in new configs.
 
 ## `draft`
 
@@ -114,6 +151,8 @@ draft:
   args:
     count_top_k: 2                   # same default rule as `count`
     M: 2                             # default: same value as count_top_k
+    K: 16                            # default: 1  — merged experts kept per layer
+    draft_top_k: 8                   # default: native top-k  — clusters the draft runs
     record_history: false
 ```
 
@@ -121,7 +160,15 @@ draft:
 |---|---|---|
 | `count_top_k` | int | `adapter.default_count_top_k(model)` |
 | `M` | int | `count_top_k` |
+| `K` | int | `1` | number of cluster-merged experts cached per layer (mini-MoE). `K=1` = single dense expert. |
+| `draft_top_k` | int | native top-k | how many of the `K` clusters the draft forward runs (only when `K>1`). |
 | `record_history` | bool | `false` |
+
+`K` / `draft_top_k` are shared by the whole averaged-draft family (`count`,
+`softmax`, `prefill_*` …), not just `topm_count`. When `K>1`, the active
+experts are partitioned into `K` clusters and each is merged separately — the
+partition method and within-cluster weighting are set in the top-level
+[`cluster`](#cluster) section.
 
 Same as `count`, but keeps exactly the top-`M` experts by vote count
 each cycle (others zeroed, remainder renormalised). Differs from
@@ -188,19 +235,195 @@ require all experts in GPU at build time (any expert with non-zero
 softmax mass gets pulled in) — fine on full-GPU backend, see
 [../PROGRESS.md](../PROGRESS.md) for the offloading caveat.
 
-#### `random_mask` — single random expert per layer per cycle (baseline)
+#### `random_mask` — `num_keep` random experts per layer, fixed for the run
 
 ```yaml
 draft:
   name: random_mask
   args:
-    seed: 42               # REQUIRED — different seeds yield different sweeps
-    num_experts: 8         # optional — auto-defaults to adapter.num_experts(first block)
+    seed: 42               # REQUIRED — masks are reproducible per seed
+    num_keep: 16           # experts kept per layer (default 1)
+    num_experts: 128       # optional — auto-defaults to adapter.num_experts(first block)
+    per_cycle: false       # true = legacy: redraw the mask every cycle
 ```
 
-Picks one uniformly random expert per layer at the start of each
-cycle. Sweep `seed` across 42 / 123 / 456 etc. for a stable
-randomness baseline.
+The Table-1 "Random (prune)" baseline: the kept set is drawn ONCE per run
+(seeded) and stays fixed for every question and cycle — the "random"
+policy of the {random, static, dynamic} axis (only SpecMoE and the
+count-merge drafts are dynamic). `per_cycle: true` restores the
+historical single-expert-per-cycle behaviour.
+
+#### `random_merge` — K random-group merged experts, fixed for the run
+
+```yaml
+draft:
+  name: random_merge
+  args:
+    K: 16                  # merged experts per layer
+    draft_top_k: 8         # clusters activated per token (default: native top-k)
+    seed: 0
+```
+
+The Table-1 "Random (merge)" baseline: ALL n experts are partitioned into
+K random balanced groups once per run (seeded), each group merged with
+uniform weights (1/|group|), frozen for the whole run. Routing uses the
+same gate-remap path as the dynamic merge drafts. The `cluster` section
+is ignored — the partition is the draft's own.
+
+#### `static_mask` — offline-searched kept-set mask (Enumerate/NAEE baseline)
+
+```yaml
+draft:
+  name: static_mask
+  args:
+    spec_path: output/naee/Qwen3-30B-A3B-Base_r16.json   # REQUIRED
+```
+
+The Table-1 "Enumerate" baseline (prune–static): loads the kept-set spec
+searched offline by `scripts/search_naee.py` (min reconstruction loss over
+calibration tokens; exact enumeration when C(n, r) is small, seeded
+sampling otherwise — the Qwen3 row is "sampled") and freezes each layer's
+boolean mask for the whole run. Same masked-forward mechanics as
+`random_mask`.
+
+#### `static_merge` — offline-clustered merged experts (HC-SMoE baseline)
+
+```yaml
+draft:
+  name: static_merge
+  args:
+    spec_path: output/hc_smoe/Qwen3-30B-A3B-Base_K16.json   # REQUIRED
+    draft_top_k: 8         # clusters activated per token (default: native top-k)
+```
+
+The Table-1 "HC-SMoE" baseline (merge–static): loads the grouping spec
+built offline by `scripts/build_hc_smoe.py` (average-linkage clustering on
+calibration expert outputs from `scripts/collect_calibration.py`), merges
+each group frequency-weighted ONCE, and stays frozen for the whole run.
+The `cluster` section is ignored — the partition lives in the spec file.
+
+#### `mc_smoe` — permutation-aligned merged experts (MC-SMoE baseline)
+
+```yaml
+draft:
+  name: mc_smoe
+  args:
+    spec_path: output/mc_smoe/Qwen3-30B-A3B-Base_K16.json   # REQUIRED
+    draft_top_k: 8         # clusters activated per token (default: native top-k)
+```
+
+The Table-1 "MC-SMoE" baseline (merge–static; M-SMoE, Li et al. ICLR
+2024). Same frozen static-merge machinery as `static_merge`, but the spec
+comes from `scripts/build_mc_smoe.py` (dominant experts by adaptive
+layer-wise frequency — the per-layer group count VARIES, K is the
+average — grouping by router-logits cosine) and, before each group's
+frequency-weighted average, every member is neuron-permutation-aligned to
+the group's dominant expert (Hungarian weight matching, done once in
+`prepare()` — a few minutes of one-time cost at run start). SwiGLU expert
+families only (qwen3/mixtral); merging stage only (no low-rank
+compression / KD — no zero-shot counterpart under the expert-count
+budget).
+
+#### `speed` — early-exit layer-skip draft (Speed baseline)
+
+```yaml
+draft:
+  name: speed
+  args:
+    num_layers: 6          # REQUIRED: leading decoder layers the draft runs
+```
+
+The Table-1 "Speed" baseline (prune, depth axis; SPEED, Hooper et al.
+NeurIPS-W 2023). The draft forward runs only the first `num_layers`
+decoder layers — every later layer is identity-skipped during the draft
+phase — and the model's own final norm + lm_head classify the early
+hidden state. Training-free adaptation (the original fine-tunes with a
+weighted early-exit loss, which we cannot do to the frozen target).
+Budget matching: `num_layers: 6` of Qwen3's 48 = 12.5% of expert memory,
+the same draft budget as the width-axis rows (SpecMoE's 16/128 per
+layer). The MoE blocks in the executed layers run standard full routing
+in both phases; verify runs all layers as usual. Requires a
+`model.model.layers`-style decoder (Qwen3-family). The `cluster` section
+is ignored.
+
+#### `draft_verify` — optimised sublayer-skip draft (Draft&Verify baseline)
+
+```yaml
+draft:
+  name: draft_verify        # no args needed — fully automatic by default
+  # args:                   # optional overrides:
+  #   num_keep: 6           #   kept-MoE-layer count (default: 12.5% budget)
+  #   keep_frac: 0.125      #   ...or override the budget fraction itself
+  #   spec_path: output/draft_verify/Qwen3-30B-A3B-Base_L6.json  # explicit spec
+  #   mlp_keep: [0, 9, 18, 27, 36, 45]   # inline keep-set (mechanism smokes)
+  #   attn_skip: []                      # attention sublayers to skip
+```
+
+The Table-1 "Draft&Verify" baseline (prune, layer-skip; Zhang et al.,
+ACL 2024). Sublayer-granular sibling of `speed`: instead of a depth
+prefix, the draft phase skips a *selected* set of intermediate MoE
+sublayers (attention is kept everywhere by default — it carries no
+expert memory, which only favours the baseline); verify runs the full
+model. The kept set comes from the paper's Bayesian-optimisation search
+(objective adapted to the acceptance-only Table 1: greedy draft/target
+token agreement on C4 dev continuations, under the fixed kept-layer
+budget — Qwen3 6/48 = 12.5% expert memory).
+
+**Auto mode (default)**: with no `spec_path`/`mlp_keep`, the run derives
+`num_keep` from the model's MoE layer count (12.5%), resolves
+`output/draft_verify/<model tag>_L<num_keep>.json`, and — if the file is
+missing — runs the BO search in-run at startup and saves it there
+(subsequent runs on the same model just read the file). Works on any
+backend/model the draft supports; on the offload backend the in-run
+search is fetch-bound, so prefer the offline route there:
+`sbatch scripts/run_search_dv.sh <model-id>`. `spec_path` and `mlp_keep`
+remain as explicit overrides (mutually exclusive). `attn_skip` must not
+contain layer 0 (HF cache-length bookkeeping reads layer 0). Requires a
+`model.model.layers`-style decoder (Qwen3-family). The `cluster` section
+is ignored.
+
+#### `none` — non-speculative baseline (e.g. MoE-Caching)
+
+```yaml
+draft:
+  name: none
+```
+
+No draft, no controller, no forward swaps: plain target-only `generate`.
+MAT/AccR come out zero; TPS is the meaningful output. With
+`backend: offload` the archer pool gets the full VRAM budget (no merged
+reserve) — this is the MoE-Caching row of Table 2 (the engine's LFU
+expert cache under the same total budget).
+
+## `cluster`
+
+Only relevant to the averaged-draft family with `draft.args.K > 1`: it sets how
+the active experts are partitioned into the `K` clusters and how each cluster is
+merged. Ignored when `K=1` (single dense expert) or for non-averaged drafts.
+
+| key | type | default | notes |
+|---|---|---|---|
+| `name` | str | `freq_slice` | `ClusterMethod` registry key: `freq_slice` (sort active experts by frequency, cut into `K` contiguous slices), `random`, `cooccur_pair`, `activation_similarity`, `weight_similarity`, `hybrid` (see below). |
+| `within_weight` | str | `freq` | Within-cluster merge weighting: `freq` (∝ activation count) or `uniform` (1/\|group\|). **A4** — was `AUG_CLUSTER_UNIFORM`. The partition and cross-cluster mass stay frequency-based either way; only the within-cluster combine changes. |
+
+Method-specific keys (everything except `name` / `within_weight` is forwarded
+to the method's constructor):
+
+| key | applies to | default | notes |
+|---|---|---|---|
+| `metric` | `activation_similarity`, `weight_similarity`, `hybrid` | `cosine` (`l2` for hybrid) | Pairwise similarity: output cosine, or negative L2 distance. |
+| `cache` | `weight_similarity` | (none) | Path to persist the static weight-sim tables. |
+| `seed` | `random` | `0` | Partition RNG seed. |
+| `alpha` | `hybrid` | `0.5` | Weight of the act-sim map: `R = alpha*N(actsim) + (1-alpha)*N(cooccur)`. `1.0` = prefill-only act-sim, `0.0` = pure co-occur. |
+| `norm` | `hybrid` | `rank` | Per-layer normalisation onto [0,1] before blending: `rank` (scale-free, robust to the act-sim L2 long tail) or `minmax` (ablation). Unobserved pairs → −1 (rank last). |
+| `cooccur_norm` | `hybrid` | `cosine` | `cosine` divides counts by the diagonal (removes hot-expert bias); `raw` keeps plain counts (`alpha: 0` + `raw` ≡ `cooccur_pair`). |
+| `cooccur_scope` | `hybrid` | `decode` | `decode` skips the prefill forward's contribution to the co-occur table; `all` accumulates prefill + decode. |
+
+`hybrid` collects act-sim **during prefill only** (the engine disarms the C++
+expert-output capture at the first draft start and re-arms it per question),
+so unlike `activation_similarity` the decode cycles pay no capture latency.
+Requires `merge_offload: true` + `merge_during_verify: true` (the capture is
+accumulated in the engine's `on_verify_layer` hook).
 
 ## `run`
 
@@ -211,8 +434,12 @@ randomness baseline.
 | `max_new_tokens` | int | `512` | Per-question generation budget. |
 | `seed` | int | `0` | RNG for per-category sampling. |
 | `warmup` | bool | `true` | Run one tiny `generate()` before timed eval to amortize compile. Disable in smoke tests. |
+| `prefill_warmup` | bool | `true` | **C-BOOT** (merged_cache_plan.md §2.4): the first candidate round of every question returns zero candidates, so the target does a pure prefill that captures routing stats and builds the draft state *before* the first real draft — the first-cycle standard-routing fallback (and its ~47GB/question draft fetch) never triggers, and reaching it raises. `false` = paper ablation (legacy draft-first + first-cycle fallback). Applies to every method (loop-level). Distinct from `warmup` above. |
 | `emit_tokens_csv` | bool | `false` | Per-cycle per-position dump. Useful for offline analysis; ~100 MB / full run. |
 | `spec_bench_cache` | str | `<cwd>/data/spec_bench` | Override where `question.jsonl` is downloaded / loaded. |
+| `skip_categories` | list | `[]` | Drop whole categories before sampling; `mt_bench` expands to its 8 sub-categories. |
+| `mt_bench_pooled` | bool | `false` | Sample mt_bench's 8 sub-categories as ONE pool: the whole mt_bench subtask contributes `questions_per_cat` questions total (default: qpc PER sub-category, up to 8×qpc). Aggregation unchanged. |
+| `humaneval` | bool | `false` | Append HumanEval (164 problems, `questions_per_cat` sampled) as its own `humaneval` category — the paper tables' Coding column. Prompted as raw completion (no chat template). Category name is deliberately NOT `coding` (that is an mt_bench sub-category). Cached at `<spec_bench_cache>/../humaneval/`. |
 | `reasoning_effort` | str | (none) | **GPT-OSS only** — injected into the chat template by `GptOssAdapter.post_load`. |
 
 ## `output`
@@ -222,37 +449,57 @@ randomness baseline.
 | `dir` | str | `output/<config-stem>` | Where summary CSV/JSON go. Relative paths are resolved against the cwd `aug_spec` is invoked from. |
 | `label` | str | `<config-stem>` | Free-text tag printed in stdout headers and final table. |
 
+## Environment overrides
+
+The goal is "one YAML fully describes one run". The knobs below have YAML
+fields (above); their `AUG_*` env vars remain only as **overrides** — when set,
+the env value wins over the YAML. Handy for a one-off A/B without editing the
+config.
+
+| env var | overrides | values |
+|---|---|---|
+| `AUG_MERGED_BACKEND` | `model.offload.merged_backend` | `engine_bmm` / `dispatch` / `bmm` |
+| `AUG_EARLY_PIN` | `draft.early_pin` | `0` / `1` / `2` |
+| `AUG_CLUSTER_UNIFORM` | `cluster.within_weight` | set (any value) = force `uniform` |
+
+Diagnostics / ops are **env-only** (deliberately not in YAML — they are
+analysis side-channels, not part of a run's definition):
+
+| env var | effect |
+|---|---|
+| `AUG_PROFILE` | set = print the engine's per-cycle timing breakdown at the end. |
+| `AUG_DUMP_CLUSTER_WEIGHTS=<path>` | append per-cluster within-cluster weights as JSONL. |
+| `AUG_DUMP_ACTIVE_SET=<path>` | append the per-(layer,question,cycle) selected expert set as JSONL. |
+
 ## Existing configs
 
-| file | model | draft | notes |
-|---|---|---|---|
-| `_smoke.yaml` | Mixtral-8x7B | count | 1 q/cat × 32 tokens — end-to-end sanity check only |
-| `mixtral_count.yaml` | Mixtral-8x7B | count | main thesis draft strategy on Mixtral |
-| `mixtral_uniform.yaml` | Mixtral-8x7B | uniform | uniform baseline |
-| `mixtral_softmax.yaml` | Mixtral-8x7B | softmax | softmax-weighted variant |
-| `mixtral_random.yaml` | Mixtral-8x7B | random_mask | random expert baseline (`seed: 42`) |
-| `mixtral_topm_count.yaml` | Mixtral-8x7B | topm_count | bounded fetch: keep top-M = count_top_k experts |
-| `mixtral_prefill_count.yaml` | Mixtral-8x7B | prefill_count | build merged once on prefill, frozen for decoding |
-| `mixtral_prefill_topm_count.yaml` | Mixtral-8x7B | prefill_topm_count | prefill-only + top-M cutoff |
-| `gptoss_count.yaml` | GPT-OSS-20B | count | with `reasoning_effort: low` |
-| `gptoss_pruned_count.yaml` | GPT-OSS-20B | pruned_count | long-tail pruning at 0.9 |
-| `gptoss_topm_count.yaml` | GPT-OSS-20B | topm_count | bounded fetch variant |
-| `gptoss_prefill_count.yaml` | GPT-OSS-20B | prefill_count | frozen-after-prefill variant |
-| `gptoss_prefill_topm_count.yaml` | GPT-OSS-20B | prefill_topm_count | prefill-only + top-M cutoff |
-| `qwen3_count.yaml` | Qwen3-30B-A3B-Base | count | |
-| `qwen3_pruned_count.yaml` | Qwen3-30B-A3B-Base | pruned_count | pruning matters more here (128 experts × top-8) |
-| `qwen3_topm_count.yaml` | Qwen3-30B-A3B-Base | topm_count | bounded fetch; M defaults to 8 |
-| `qwen3_prefill_count.yaml` | Qwen3-30B-A3B-Base | prefill_count | frozen-after-prefill variant |
-| `qwen3_prefill_topm_count.yaml` | Qwen3-30B-A3B-Base | prefill_topm_count | prefill-only + top-M cutoff |
+The work is now Qwen3-30B-A3B-Base centric (the Mixtral / GPT-OSS configs were
+retired). A few canonical entry points:
+
+| file | draft | notes |
+|---|---|---|
+| `qwen3_count.yaml` | count | plain count-weighted merge baseline (hf backend) |
+| `qwen3_pruned_count.yaml` | pruned_count | long-tail pruning (matters at 128 experts × top-8) |
+| `qwen3_topm_count.yaml` | topm_count | bounded fetch; M defaults to 8 |
+| `qwen3_topm_count_k16.yaml` | topm_count | + `K=16` cluster mini-MoE |
+| `qwen3_prefill_topm_count.yaml` | prefill_topm_count | prefill-only + top-M cutoff |
+| `q5_512_tm_on.yaml` | topm_count | **offload + K=16 cluster reference**; self-contained A4 knobs (`cluster`; its `no_overload` is now a deprecated no-op) |
+| `q5_512_tm_unif.yaml` | topm_count | as `q5_512_tm_on` but `cluster.within_weight: uniform` (ablation) |
+| `base_specmoe_offload.yaml` / `base_topm_offload.yaml` | specmoe / topm_count | offload baselines |
+
+Beyond these, most files are experiment-specific families — `cmp_*`
+(backend/kernel A/B), `exp_*` / `p1_*` / `p4_*` (ablations), `prof_*`
+(profiling), `q5_*` / `q1_*` (the merged-expert clustering study). Each is one
+self-describing YAML; open it and read the header comment.
 
 ## Adding a new config
 
 ```bash
-cp configs/mixtral_count.yaml configs/mixtral_count_T5.yaml
+cp configs/qwen3_topm_count.yaml configs/qwen3_topm_count_T5.yaml
 # edit run.T: 3 → 5
-aug_spec run --config configs/mixtral_count_T5.yaml
+aug_spec run --config configs/qwen3_topm_count_T5.yaml
 # or under SLURM:
-sbatch scripts/run.sh configs/mixtral_count_T5.yaml
+sbatch scripts/run.sh configs/qwen3_topm_count_T5.yaml
 ```
 
 If you find yourself needing a knob that isn't in this doc:

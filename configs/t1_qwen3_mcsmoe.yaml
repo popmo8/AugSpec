@@ -1,0 +1,8 @@
+# Table 1 — Qwen3 MC-SMoE row (adaptive dominant K=16 avg, router-logits
+# grouping, permutation-aligned freq-weighted merge). t1 protocol.
+model: {id: Qwen/Qwen3-30B-A3B-Base, dtype: bfloat16, device_map: auto}
+draft:
+  name: mc_smoe
+  args: {spec_path: output/mc_smoe/Qwen3-30B-A3B-Base_K16.json, draft_top_k: 8}
+run: {T: 5, questions_per_cat: 15, max_new_tokens: 512, humaneval: true, mt_bench_pooled: true}
+output: {label: t1_qwen3_mcsmoe, dir: output/t1_qwen3_mcsmoe}

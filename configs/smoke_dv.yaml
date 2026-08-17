@@ -1,0 +1,21 @@
+# Draft&Verify smoke — self-speculative sublayer-skip draft(draft 相位跳
+# 選定的中間 MoE sublayer,attention 全保留;verify 全層照跑)。這裡用內嵌
+# 均勻分佈 keep-set 驗機制,不等 BO search(t1 正式 run 用 spec_path)。
+# offload 端到端 liveness:qpc=1 / mnt=64 / skip mt_bench,非 AccR run。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+draft:
+  name: draft_verify
+  args: {mlp_keep: [0, 9, 18, 27, 36, 45]}
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 64
+  prefill_warmup: true
+  skip_categories: [mt_bench]
+output: {label: smoke_dv, dir: output/smoke_dv}

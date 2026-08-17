@@ -1,0 +1,16 @@
+======================================================================
+C1 — get_resident_expert_weights 正確性驗證
+======================================================================
+  MoE layers=48  experts/layer=128
+  掃到 resident expert 數: 34（取樣前 8 顆驗證）
+  L47 E11: OK  order=['gate_proj', 'up_proj', 'down_proj']
+  L47 E15: OK  order=['gate_proj', 'up_proj', 'down_proj']
+  L47 E21: OK  order=['gate_proj', 'up_proj', 'down_proj']
+  L47 E26: OK  order=['gate_proj', 'up_proj', 'down_proj']
+  L47 E27: OK  order=['gate_proj', 'up_proj', 'down_proj']
+  L47 E31: OK  order=['gate_proj', 'up_proj', 'down_proj']
+  L47 E32: OK  order=['gate_proj', 'up_proj', 'down_proj']
+  L47 E34: OK  order=['gate_proj', 'up_proj', 'down_proj']
+
+  推定 tensor_ids 順序 = ['gate_proj', 'up_proj', 'down_proj']
+RESULT: PASS

@@ -1,0 +1,41 @@
+%% MergeSpec method overview — Mermaid equivalent of paper/fig_method.svg
+%% Render: mermaid.live, or `mmdc -i fig_method.mmd -o fig_method.pdf`
+flowchart LR
+
+  %% ─────────── Draft Phase ───────────
+  subgraph DRAFT["Draft Phase"]
+    direction LR
+    A["<b>A</b> · activation-similarity map<br/>prefill, frozen ❄"]:::blue
+    C["<b>C</b> · co-occurrence map<br/>decode, live ↻"]:::teal
+    R["Expert Relation Map<br/>R = λ·N(A) + (1−λ)·N(C)"]:::mix
+    CL["Cluster — pair top-M experts<br/>of the last verification<br/>PAIR {E1,E3} · PAIR {E2,E5} · SINGLETON {E4}"]:::plain
+    MG["Merge in weight space<br/>Ê₁ · Ê₂ · E4"]:::plain
+    CACHE["<b>Merged-Expert Cache</b> · GPU · K slots<br/>hit → reuse in place ↻<br/>miss → fetch members, merge, insert"]:::amber
+    A --> R
+    C --> R
+    R --> CL --> MG --> CACHE
+  end
+
+  CPU[("CPU · all expert weights")]:::gray
+  CPU -->|"fetch on miss"| CACHE
+
+  %% ─────────── Verification Phase ───────────
+  subgraph VERIFY["Verification Phase"]
+    direction TB
+    TGT["Full target MoE<br/>E1 … E6"]:::plain
+    ACC["accept aₛ &nbsp; ✓ ✓ ✗"]:::plain
+    TGT --> ACC
+  end
+
+  CACHE ==>|"γ draft tokens"| TGT
+  ACC -->|"accepted tokens · routing → M, C · next cycle"| C
+
+  %% ─────────── styling ───────────
+  classDef blue  fill:#dbe8f7,stroke:#2b6cb0,color:#1a3b5c;
+  classDef teal  fill:#d2ece7,stroke:#0f766e,color:#0b4a44;
+  classDef mix   fill:#dcdaf0,stroke:#5548a8,color:#33296b;
+  classDef amber fill:#fff3d6,stroke:#b45309,color:#7a3d06;
+  classDef gray  fill:#eceef1,stroke:#666666,color:#333333;
+  classDef plain fill:#ffffff,stroke:#888888,color:#222222;
+  style DRAFT  fill:#fbfcfe,stroke:#9aa4b2,stroke-dasharray:6 4;
+  style VERIFY fill:#fbfcfe,stroke:#9aa4b2,stroke-dasharray:6 4;

@@ -1,0 +1,43 @@
+# m1_ours 補跑 (summarization 單獨, 2026-07-18): 兩次 wedge 後改單-subtask 平行跑,
+# 縮小曝險。合併規則見 m1_ours_part2.yaml 註解。
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+    merge_offload: true
+    merge_during_verify: true
+    merge_overlap: true
+draft:
+  name: topm_count
+  args:
+    M: 32
+    K: 16
+    draft_top_k: 8
+    record_history: false
+cluster:
+  name: hybrid
+  alpha: 0.75
+  metric: l2
+  norm: rank
+  cooccur_norm: raw
+  cooccur_scope: decode
+  within_weight: uniform
+run:
+  T: 3
+  questions_per_cat: all
+  max_new_tokens: 512
+  prefill_warmup: true
+  humaneval: false
+  mt_bench_pooled: true
+  skip_categories:
+  - mt_bench
+  - qa
+  - math_reasoning
+  - translation
+  - rag
+output:
+  label: m1_ours_sum
+  dir: output/m1_ours_sum

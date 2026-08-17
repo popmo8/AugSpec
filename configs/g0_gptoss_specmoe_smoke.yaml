@@ -1,0 +1,16 @@
+# G0 smoke — GPT-OSS SpecMoE 列(hf acceptance)。驗 G2 substitute forward 的
+# GPU 路徑;同時是「系統性問題 vs merge 難度」的診斷:SpecMoE 用真 expert
+# (kept-4 + L2 substitution),若 AccR 也 ~0.05 => 系統性(KV/協議);若明顯高
+# => merged draft 在 gpt-oss 平坦 routing 下本來就難(Ours smoke 0.047 的解讀)。
+model: {id: openai/gpt-oss-20b, dtype: bfloat16, device_map: auto}
+draft:
+  name: specmoe
+  args: {N: 4, route_top_k: 4}
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 128
+  prefill_warmup: true
+  humaneval: true
+  mt_bench_pooled: true
+output: {label: g0_gptoss_specmoe_smoke, dir: output/g0_gptoss_specmoe_smoke}

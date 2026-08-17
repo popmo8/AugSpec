@@ -1,0 +1,28 @@
+# remove_overload_plan.md §4-4 guard A/B — identical to q15_specmoe_ep2.yaml
+# but (a) no offload.no_overload key (the behaviour is built-in after the
+# overload-path removal) and (b) a fresh output dir so the job-254248 baseline
+# in output/q15_specmoe_ep2 stays intact for comparison.
+# Expect: TPS ~4.1 / AccR ~0.486 / draft_fetch ~0.95TB within run-to-run noise.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+    vram_budget_ratio: 0.2
+draft:
+  name: specmoe
+  args:
+    N: 16
+    route_top_k: 8
+    pin: true
+  early_pin: 2
+run:
+  T: 5
+  questions_per_cat: 5
+  max_new_tokens: 512
+  skip_categories:
+  - mt_bench
+output:
+  label: q15_specmoe_ep2_rmov
+  dir: output/q15_specmoe_ep2_rmov

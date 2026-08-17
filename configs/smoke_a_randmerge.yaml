@@ -1,0 +1,18 @@
+# A2/A4 smoke (baseline_tables_plan.md): random_merge K=16 on hf +
+# humaneval category. qpc=1, mnt=64 — correctness only, numbers meaningless.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  dtype: bfloat16
+  device_map: auto
+
+draft:
+  name: random_merge
+  args: {K: 16, draft_top_k: 8, seed: 0}
+
+run:
+  T: 5
+  questions_per_cat: 1
+  max_new_tokens: 64
+  humaneval: true
+
+output: {label: smoke_a_randmerge, dir: output/smoke_a_randmerge}

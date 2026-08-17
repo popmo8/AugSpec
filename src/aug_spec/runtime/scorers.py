@@ -37,6 +37,29 @@ def make_count_scorer(count_top_k: int) -> Scorer:
     return fn
 
 
+def make_cooccurrence_scorer(top_k: int) -> Scorer:
+    """Pairwise co-occurrence scorer.
+
+    At every position pick the top-`top_k` experts; return an ``[n, n]`` matrix
+    whose entry (i, j) counts positions whose top-k contained BOTH i and j
+    (diagonal = per-expert count). Symmetric. Unlike the count scorer (a 1-D
+    vote tally), this captures *which experts fire together on the same token* —
+    the signal co-occurrence clustering merges on. Drafts accumulate it across
+    the whole question (prefill + decode).
+    """
+    assert top_k >= 1, f"top_k={top_k} must be >= 1"
+
+    def fn(scores: torch.Tensor) -> torch.Tensor:
+        n = scores.shape[-1]
+        top = torch.topk(scores, k=min(top_k, n), dim=-1).indices   # [seq, k]
+        oneh = torch.zeros(scores.shape[0], n,
+                           device=scores.device, dtype=torch.float)
+        oneh.scatter_(1, top, 1.0)
+        return oneh.t() @ oneh                                      # [n, n]
+
+    return fn
+
+
 def make_softmax_scorer(
     weights: Tuple[float, ...] = (0.5, 0.3, 0.2),
 ) -> Scorer:

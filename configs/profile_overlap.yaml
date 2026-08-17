@@ -1,0 +1,18 @@
+# Diagnostic config for scripts/profile_expert_overlap.py — small sample to
+# characterise prefill-hot vs decode-hot expert overlap. Not a benchmark.
+model:
+  id: Qwen/Qwen3-30B-A3B-Base
+  backend: offload
+  dtype: bfloat16
+  offload:
+    path: /work/morrisliu07/aug_spec/moe_infinity/offload_output/Qwen3-30B-A3B-Base
+draft:
+  name: moe_precache
+  args:
+    pin_fraction: 0.10
+run:
+  questions_per_cat: 3
+  max_new_tokens: 128
+  humaneval: true
+  mt_bench_pooled: true
+output: {label: profile_overlap, dir: output/profile_overlap}

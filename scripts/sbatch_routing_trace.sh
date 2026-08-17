@@ -1,0 +1,15 @@
+#!/bin/bash
+#SBATCH --job-name=routing_trace
+#SBATCH --partition=normal2
+#SBATCH --account=MST114471
+#SBATCH --time=04:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH -o /work/morrisliu07/job_log/%x_%j.log
+#SBATCH -e /work/morrisliu07/job_err/%x_%j.err
+export HF_HOME=/work/morrisliu07/.cache/huggingface
+export HF_HUB_OFFLINE=1
+cd /work/morrisliu07/aug_spec
+exec .venv/bin/python -u scripts/routing_trace.py --qpc 15 --mnt 512
